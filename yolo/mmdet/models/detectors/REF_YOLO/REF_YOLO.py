@@ -15,7 +15,7 @@ import scipy.stats as stats
 from mmdet.core import bbox2result
 from ...builder import DETECTORS, build_backbone, build_head, build_neck, build_shared_head, build_loss
 from ..base import BaseDetector
-from torchmetrics.functional import structural_similarity_index_measure as ssim
+from torchmetrics.functional.image import structural_similarity_index_measure as ssim
 
 # hook gradient
 # grads = {}

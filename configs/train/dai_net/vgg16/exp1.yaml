@@ -1,0 +1,36 @@
+architecture: dai_net
+num_exp: exp1
+
+batch_size: 4
+
+lr: 5.0e-4
+momentum: 0.9
+weight_decay: 5.0e-4
+gamma: 0.1             # LR decay multiplier applied at each lr_steps milestone
+
+# Training schedule (override data/config.py defaults)
+epochs:    100
+max_steps: 150000      # early-stop iteration count
+lr_steps:  [20000, 25000, 30000]
+
+cuda: true
+multigpu: true
+num_workers: 2
+local_rank: 0          
+
+train_file: ./dataset/source_train.txt
+val_file:   ./dataset/source_val.txt
+nc: 3
+source_folder: /mnt/Nhan/data/images/source
+target_folder: /mnt/Nhan/data/images/target
+
+save_folder: weights/
+charts_dir:  ./charts
+# resume: false      → fresh run
+# resume: true       → auto-load <save_folder>/<architecture>/<backbone>/last_model.pth
+# resume: /some/path → explicit checkpoint
+resume: true
+
+viz_num_samples: 6
+viz_every_iters: 500
+viz_full_every_epochs: 1

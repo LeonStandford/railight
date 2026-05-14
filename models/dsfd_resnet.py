@@ -421,5 +421,5 @@ def build_net_resnet(phase, num_classes=2, net_name='resnet50'):
 
 if __name__ == '__main__':
     inputs = Variable(torch.randn(1, 3, 640, 640))
-    net = build_net('train', 2, 101)
+    net = build_net_resnet('train', 2, 'resnet101')
     out = net(inputs)
