@@ -124,7 +124,7 @@ class DSFD(nn.Module):
 
     def _upsample_prod(self, x, y):
         _, _, H, W = y.size()
-        return F.upsample(x, size=(H, W), mode='bilinear') * y
+        return F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False) * y
 
     def enh_forward(self, x):
 
@@ -135,6 +135,51 @@ class DSFD(nn.Module):
         R = self.ref(x)
 
         return R
+
+    def extract_features(self, x_source, x_target,
+                         I_source, I_target):
+        """Pull intermediate VGG features for source vs target and return
+        a symmetric KL divergence loss between them.
+
+        Used for unsupervised domain adaptation between labeled source
+        and unlabeled real-night target images. The loss pushes the
+        backbone to produce domain-invariant representations.
+
+        Returns:
+            f_source_pool, f_target_pool, loss_kl_st
+        """
+        # VGG up to conv4_3 (k=4) — same depth as where mutual KL is taken
+        # in forward(). We fork a copy so we don't disturb the gradient
+        # graph of the main detection forward.
+        f_source = x_source
+        for k in range(5):
+            f_source = self.vgg[k](f_source)
+        f_target = x_target
+        for k in range(5):
+            f_target = self.vgg[k](f_target)
+
+        # Reflectance interchange across domains (cross-domain composites).
+        x_source_swap = (I_source * self.ref(f_target)).detach()
+        x_target_swap = (I_target * self.ref(f_source)).detach()
+        for k in range(5):
+            x_source_swap = self.vgg[k](x_source_swap)
+        for k in range(5):
+            x_target_swap = self.vgg[k](x_target_swap)
+
+        # Pool to per-channel descriptors for KL.
+        f_source_pool = f_source.flatten(start_dim=2).mean(dim=-1)
+        f_target_pool = f_target.flatten(start_dim=2).mean(dim=-1)
+        x_source_swap_pool = x_source_swap.flatten(start_dim=2).mean(dim=-1)
+        x_target_swap_pool = x_target_swap.flatten(start_dim=2).mean(dim=-1)
+
+        # Symmetric KL: align source<->target, plus cross-domain swaps.
+        loss_kl_st = cfg.WEIGHT.MC * (
+            self.KL(f_source_pool, f_target_pool)
+            + self.KL(f_target_pool, f_source_pool)
+            + self.KL(x_source_swap_pool, x_target_swap_pool)
+            + self.KL(x_target_swap_pool, x_source_swap_pool)
+        )
+        return f_source_pool, f_target_pool, loss_kl_st
 
     def test_forward(self, x):
         size = x.size()[2:]
@@ -240,10 +285,12 @@ class DSFD(nn.Module):
                                for o in conf_pal2], 1)
 
         priorbox = PriorBox(size, features_maps, cfg, pal=1)
-        self.priors_pal1 = Variable(priorbox.forward(), volatile=True)
+        with torch.no_grad():
+            self.priors_pal1 = priorbox.forward()
 
         priorbox = PriorBox(size, features_maps, cfg, pal=2)
-        self.priors_pal2 = Variable(priorbox.forward(), volatile=True)
+        with torch.no_grad():
+            self.priors_pal2 = priorbox.forward()
 
         if self.phase == 'test':
             output = self.detect.forward(
@@ -398,10 +445,12 @@ class DSFD(nn.Module):
                                for o in conf_pal2], 1)
 
         priorbox = PriorBox(size, features_maps, cfg, pal=1)
-        self.priors_pal1 = Variable(priorbox.forward(), volatile=True)
+        with torch.no_grad():
+            self.priors_pal1 = priorbox.forward()
 
         priorbox = PriorBox(size, features_maps, cfg, pal=2)
-        self.priors_pal2 = Variable(priorbox.forward(), volatile=True)
+        with torch.no_grad():
+            self.priors_pal2 = priorbox.forward()
 
         if self.phase == 'test':
             output = self.detect.forward(
@@ -438,7 +487,7 @@ class DSFD(nn.Module):
         return epoch
 
     def xavier(self, param):
-        init.xavier_uniform(param)
+        init.xavier_uniform_(param)
 
     def weights_init(self, m):
         if isinstance(m, nn.Conv2d):
@@ -558,6 +607,6 @@ class DistillKL(nn.Module):
     def forward(self, y_s, y_t):
         p_s = F.log_softmax(y_s / self.T, dim=1)
         p_t = F.softmax(y_t / self.T, dim=1)
-        loss = F.kl_div(p_s, p_t, size_average=False) * (self.T ** 2) / y_s.shape[0]
+        loss = F.kl_div(p_s, p_t, reduction='sum') * (self.T ** 2) / y_s.shape[0]
         return loss
 

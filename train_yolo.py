@@ -81,9 +81,12 @@ class Tee:
 def setup_logging(args: argparse.Namespace, rank0: bool) -> Optional[str]:
     if not rank0:
         return None
-    os.makedirs('logs', exist_ok=True)
+    architecture = 'yolo26'
+    backbone = 'csp'
+    log_dir = os.path.join('logs', architecture, backbone)
+    os.makedirs(log_dir, exist_ok=True)
     ts = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-    path = os.path.join('logs', f'{ts}_yolo26{args.scale}_{args.num_exp}.log')
+    path = os.path.join(log_dir, f'{ts}_yolo26{args.scale}_{args.num_exp}.log')
     fh = open(path, 'a', buffering=1)
     fh.write(
         f'# YOLO26{args.scale} training log — '

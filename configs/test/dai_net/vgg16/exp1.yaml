@@ -1,0 +1,31 @@
+# DAI-Net evaluation / Grad-CAM config.
+# Path convention: configs/test/<architecture>/<backbone>/<num_exp>.yaml
+
+architecture: dai_net   # → charts/test/<arch>/<backbone>/<num_exp>/
+num_exp: exp1
+
+# ── Checkpoint to evaluate ────────────────────────────────────────────
+# Points at the file produced by training (best F1 by default).
+weights: weights/dai_net/vgg16/best_model.pth
+
+# ── Compute ───────────────────────────────────────────────────────────
+cuda: true
+
+# ── Dataset ───────────────────────────────────────────────────────────
+val_file: ./dataset/source_val.txt
+nc: 3
+source_folder: /media/caotulab/303A225B3A221DFA/Nhan/data/images/source
+target_folder: /media/caotulab/303A225B3A221DFA/Nhan/data/images/target
+
+# ── I/O ───────────────────────────────────────────────────────────────
+charts_dir: ./charts    # final dir: <charts_dir>/test/<architecture>/<backbone>/<num_exp>/
+mode_name: test
+
+# ── Grad-CAM (utils/visualize.py main) ────────────────────────────────
+day_folder: ''          # leave empty to sample from WIDER val automatically
+num_pairs: 3            # number of source/target image pairs to render
+target_layer_idx: 22    # vgg[22] — the layer to extract activations from
+forward_end_idx: 30     # forward up to vgg[30-1] for feature energy
+
+# ── Visualisation ─────────────────────────────────────────────────────
+viz_num_samples: 6

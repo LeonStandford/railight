@@ -12,11 +12,11 @@ import random
 from utils.augmentations import preprocess
 
 
-class WIDERDetection(data.Dataset):
-    """docstring for WIDERDetection"""
+class SourceDomainDetection(data.Dataset):
+    """Source-domain (well-lit) detection dataset in DAI-Net annotation format."""
 
     def __init__(self, list_file, mode='train'):
-        super(WIDERDetection, self).__init__()
+        super(SourceDomainDetection, self).__init__()
         self.mode = mode
         self.fnames = []
         self.boxes = []
@@ -126,6 +126,6 @@ def detection_collate(batch):
 
 if __name__ == '__main__':
     from config import cfg
-    dataset = WIDERDetection(cfg.FACE.TRAIN_FILE)
+    dataset = SourceDomainDetection(cfg.FACE.TRAIN_FILE)
     #for i in range(len(dataset)):
     dataset.pull_item(14)

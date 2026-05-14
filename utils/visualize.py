@@ -13,6 +13,7 @@ Produced charts (chart titles embed method + config so each figure stands alone)
 """
 from __future__ import annotations
 
+import math
 import os
 from typing import (
     Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union,
@@ -27,19 +28,78 @@ from matplotlib.patches import Rectangle
 import numpy as np
 
 
+matplotlib.rcParams.update({
+    'font.family': 'DejaVu Sans',
+    'font.size': 10,
+    'axes.titlesize': 12,
+    'axes.labelsize': 11,
+    'xtick.labelsize': 9,
+    'ytick.labelsize': 9,
+    'legend.fontsize': 9,
+    'legend.framealpha': 0.8,
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'axes.grid': True,
+    'grid.alpha': 0.3,
+    'grid.linestyle': '--',
+    'figure.facecolor': 'white',
+    'axes.facecolor': '#F9F9F9',
+})
+
+
 Point = Tuple[float, float]
 History = Dict[str, List[Point]]
 Config = Optional[Dict[str, Any]]
 
 
-_DPI = 150
+_DPI = 200
 _BLUE = 'tab:blue'
 _RED = 'tab:red'
+_TAB_COLORS = list(plt.get_cmap('tab10').colors)
 
 
-def make_charts_dir(charts_root: str, mode: str, backbone: str,
+_PRETTY_LOSS_NAME: Dict[str, str] = {
+    'total': 'Loss',
+    'pal1_loc': 'Pal1 Loc',
+    'pal1_conf': 'Pal1 Conf',
+    'pal2_loc': 'Pal2 Loc',
+    'pal2_conf': 'Pal2 Conf',
+    'enhance': 'Enhance',
+    'enhance_l1ssim': 'Enhance L1+SSIM',
+    'mutual': 'Mutual',
+    'train_loss_epoch': 'Train Loss (epoch)',
+    'val_loss': 'Val Loss',
+}
+
+_LOSS_ORDER: Tuple[str, ...] = (
+    'total', 'pal1_loc', 'pal1_conf', 'pal2_loc', 'pal2_conf',
+    'enhance', 'enhance_l1ssim', 'mutual',
+)
+_EPOCH_KEYS = frozenset({'train_loss_epoch', 'val_loss'})
+
+
+def _run_tag(method: str, config: Config) -> str:
+    """Compact identifier used in chart titles (e.g. "DAI-Net | (dark) | Exp exp1")."""
+    parts: List[str] = []
+    if method:
+        parts.append(str(method))
+    if config:
+        bb = config.get('backbone')
+        if bb:
+            parts.append(f'({bb})')
+        exp = config.get('exp') or config.get('num_exp')
+        if exp:
+            parts.append(f'Exp {exp}')
+    return ' | '.join(parts)
+
+
+def make_charts_dir(charts_root: str, mode: str,
+                    architecture: str, backbone: str,
                     num_exp: str) -> str:
-    out = os.path.join(str(charts_root), str(mode), str(backbone), str(num_exp))
+    out = os.path.join(
+        str(charts_root), str(mode),
+        str(architecture), str(backbone), str(num_exp),
+    )
     os.makedirs(out, exist_ok=True)
     return out
 
@@ -60,7 +120,7 @@ def _compose_title(method: str, subject: str, config: Config) -> str:
 
 def _save(fig: Figure, path: str) -> str:
     fig.tight_layout()
-    fig.savefig(path, dpi=_DPI, bbox_inches='tight')
+    fig.savefig(path, dpi=_DPI, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     return path
 
@@ -69,37 +129,66 @@ def plot_losses(history: History, out_dir: str,
                 method: str = 'DAI-Net',
                 config: Config = None,
                 x_key: str = 'iter') -> Optional[str]:
+    """Polished loss grid — one subplot per metric, val_loss / train epoch last."""
     if not history:
         return None
 
-    names = sorted(history.keys())
-    n = len(names)
-    ncols = min(3, n)
-    nrows = int(np.ceil(n / ncols))
+    # Keep only series with data, in a stable & meaningful order.
+    iter_keys = [k for k in _LOSS_ORDER if k in history and history[k]]
+    extra_iter = sorted(
+        k for k, v in history.items()
+        if v and k not in iter_keys and k not in _EPOCH_KEYS
+    )
+    epoch_keys = [k for k in ('train_loss_epoch', 'val_loss')
+                  if k in history and history[k]]
+    ordered = iter_keys + extra_iter + epoch_keys
+    if not ordered:
+        return None
+
+    n = len(ordered)
+    ncols = min(4, n)
+    nrows = math.ceil(n / ncols)
+    run_tag = _run_tag(method, config)
+    # Wrap long run_tag onto multiple lines inside each subplot title so it
+    # never overflows horizontally into the neighbouring subplot.
+    run_tag_lines = run_tag.split(' | ') if run_tag else []
 
     fig, axes = plt.subplots(
-        nrows, ncols, figsize=(5 * ncols, 3.2 * nrows), squeeze=False,
+        nrows, ncols,
+        figsize=(6 * ncols, 5 * nrows),
+        squeeze=False,
     )
-    fig.suptitle(_compose_title(method, 'loss curves', config), fontsize=12)
+    axes_flat = axes.flatten()
 
-    for k, name in enumerate(names):
-        ax = axes[k // ncols][k % ncols]
-        pts = history[name]
-        if not pts:
-            ax.set_visible(False)
-            continue
+    for i, key in enumerate(ordered):
+        ax = axes_flat[i]
+        pts = history[key]
         xs, ys = zip(*pts)
-        ax.plot(xs, ys, color=_BLUE, linewidth=1.4)
-        ax.set_title(name, fontsize=10)
-        ax.set_xlabel(x_key)
-        ax.set_ylabel('value')
-        ax.grid(True, linestyle='--', alpha=0.4)
+        color = _TAB_COLORS[i % len(_TAB_COLORS)]
+        is_epoch = key in _EPOCH_KEYS
+        marker = 's' if is_epoch else 'o'
+        markersize = 4 if is_epoch else 3
+        ax.plot(xs, ys, color=color, linewidth=2.0,
+                marker=marker, markersize=markersize)
+        short = _PRETTY_LOSS_NAME.get(key, key.replace('_', ' ').title())
+        title_lines = [short] + run_tag_lines
+        ax.set_title('\n'.join(title_lines),
+                     fontweight='bold', fontsize=11, pad=10)
+        ax.set_xlabel('Epoch' if is_epoch else 'Iteration', fontweight='bold')
+        ylabel = 'Loss' if key == 'val_loss' else 'Value'
+        ax.set_ylabel(ylabel, fontweight='bold')
 
-    for k in range(n, nrows * ncols):
-        axes[k // ncols][k % ncols].set_visible(False)
+    for i in range(n, len(axes_flat)):
+        axes_flat[i].set_visible(False)
 
-    fig.subplots_adjust(top=0.88)
-    return _save(fig, os.path.join(out_dir, 'losses.png'))
+    if run_tag:
+        fig.suptitle(f'Loss Components — {run_tag}',
+                     fontsize=14, fontweight='bold', y=1.005)
+    fig.tight_layout(h_pad=2.5, w_pad=1.5, rect=(0, 0, 1, 0.985))
+    fig.savefig(os.path.join(out_dir, 'losses.png'),
+                dpi=_DPI, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    return os.path.join(out_dir, 'losses.png')
 
 
 def plot_train_vs_val(train_pts: Sequence[Point],
@@ -110,27 +199,33 @@ def plot_train_vs_val(train_pts: Sequence[Point],
                       fname: str = 'train_vs_val.png') -> Optional[str]:
     if not train_pts and not val_pts:
         return None
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.set_facecolor('#ECECEC')
     if train_pts:
         xs, ys = zip(*train_pts)
-        ax.plot(xs, ys, color=_BLUE, linewidth=1.8, marker='o', markersize=4,
-                label='train (mean total / epoch)')
+        ax.plot(xs, ys, color=_BLUE, linewidth=2.0, marker='o', markersize=5,
+                label='train (pal2 det / epoch)')
     if val_pts:
         xs, ys = zip(*val_pts)
-        ax.plot(xs, ys, color=_RED, linewidth=1.8, marker='s', markersize=4,
+        ax.plot(xs, ys, color=_RED, linewidth=2.0, marker='s', markersize=5,
                 label='val (target proxy_loss)')
-    ax.set_xlabel('epoch')
-    ax.set_ylabel('loss')
-    ax.set_title(_compose_title(method, 'train vs val', config), fontsize=11)
-    ax.grid(True, linestyle='--', alpha=0.4)
-    ax.legend(loc='best')
+    ax.set_xlabel('Epoch', fontweight='bold')
+    ax.set_ylabel('Loss', fontweight='bold')
+    run_tag = _run_tag(method, config)
+    title = 'Train vs Val'
+    if run_tag:
+        title = f'{title}\n{run_tag}'
+    ax.set_title(title, fontweight='bold', fontsize=13, pad=10)
+    ax.grid(True, linestyle='--', alpha=0.5, color='white', linewidth=1.2)
+    ax.set_axisbelow(True)
+    ax.legend(loc='best', framealpha=0.9)
     return _save(fig, os.path.join(out_dir, fname))
 
 
 def plot_confusion_matrix(cm: np.ndarray, out_dir: str,
                           method: str = 'DAI-Net',
                           config: Config = None,
-                          classes: Sequence[str] = ('background', 'face'),
+                          classes: Sequence[str] = ('object', 'background'),
                           normalize: bool = True) -> str:
     cm = np.asarray(cm, dtype=np.float64)
     if normalize:
@@ -140,7 +235,8 @@ def plot_confusion_matrix(cm: np.ndarray, out_dir: str,
     else:
         cm_disp = cm
 
-    fig, ax = plt.subplots(figsize=(5.5, 5))
+    side = max(5.5, 1.2 * len(classes) + 3.0)
+    fig, ax = plt.subplots(figsize=(side, side))
     vmax = 1 if normalize else cm_disp.max()
     im = ax.imshow(cm_disp, cmap='Blues', vmin=0, vmax=vmax)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -152,7 +248,7 @@ def plot_confusion_matrix(cm: np.ndarray, out_dir: str,
 
     ax.set_xticks(range(len(classes)))
     ax.set_yticks(range(len(classes)))
-    ax.set_xticklabels(classes)
+    ax.set_xticklabels(classes, rotation=30, ha='right')
     ax.set_yticklabels(classes)
     ax.set_xlabel('Predicted')
     ax.set_ylabel('Ground truth')
@@ -305,21 +401,36 @@ def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 def evaluate_detections(per_image: Iterable[Dict[str, Any]],
                         iou_thr: float = 0.5,
                         score_thr_cm: float = 0.5,
+                        num_classes: int = 1,
                         ) -> Tuple[np.ndarray, np.ndarray, int, np.ndarray]:
     """Match predictions to GT for PR / confusion-matrix charts.
 
-    Each `per_image` item has keys: 'pred_boxes', 'pred_scores', 'gt_boxes'.
-    Returns (scores, matched, n_gt, cm) where cm = [[TN=0, FP],[FN, TP]].
+    Each `per_image` item has keys: 'pred_boxes', 'pred_scores', 'gt_boxes',
+    and optionally 'pred_labels' / 'gt_labels' (1-indexed; 1..num_classes).
+
+    Returns (scores, matched, n_gt, cm). The CM has shape
+    (num_classes+1, num_classes+1) where row/col i (0..nc-1) is foreground
+    class i and row/col nc is background.
+        - cm[gt, pred]: GT of class `gt` predicted as class `pred`
+        - cm[gt, nc]:   missed detection (FN) for class `gt`
+        - cm[nc, pred]: false positive of class `pred` (no matching GT)
     """
+    nc = max(int(num_classes), 1)
+    cm = np.zeros((nc + 1, nc + 1), dtype=np.int64)
     all_scores: List[float] = []
     all_matched: List[int] = []
-    tp = fp = fn = 0
     n_gt_total = 0
 
     for item in per_image:
         pb = np.asarray(item.get('pred_boxes', []), dtype=np.float32)
         ps = np.asarray(item.get('pred_scores', []), dtype=np.float32)
         gb = np.asarray(item.get('gt_boxes', []), dtype=np.float32)
+        pl = np.asarray(item.get('pred_labels',
+                                 np.ones(len(pb), dtype=np.int32)),
+                        dtype=np.int32)
+        gl = np.asarray(item.get('gt_labels',
+                                 np.ones(len(gb), dtype=np.int32)),
+                        dtype=np.int32)
         n_gt_total += len(gb)
         if len(pb) == 0 and len(gb) == 0:
             continue
@@ -327,6 +438,8 @@ def evaluate_detections(per_image: Iterable[Dict[str, Any]],
         order = np.argsort(-ps) if len(ps) else np.array([], dtype=int)
         pb_o = pb[order] if len(pb) else pb
         ps_o = ps[order] if len(ps) else ps
+        pl_o = pl[order] if len(pl) else pl
+
         gt_used = np.zeros(len(gb), dtype=bool)
         matched_pred = np.zeros(len(pb_o), dtype=np.int32)
         if len(pb_o) and len(gb):
@@ -340,24 +453,30 @@ def evaluate_detections(per_image: Iterable[Dict[str, Any]],
         all_scores.extend(ps_o.tolist())
         all_matched.extend(matched_pred.tolist())
 
-        keep = ps_o >= score_thr_cm
-        kept_match = matched_pred[keep]
-        tp += int(kept_match.sum())
-        fp += int((1 - kept_match).sum())
+        # Build CM from kept (above-threshold) predictions only.
+        keep_mask = ps_o >= score_thr_cm
+        kept_gt_used = np.zeros(len(gb), dtype=bool)
+        if np.any(keep_mask) and len(pb_o):
+            kept_pb = pb_o[keep_mask]
+            kept_pl = pl_o[keep_mask]
+            ious_kept = (_iou_matrix(kept_pb, gb)
+                         if len(gb) else np.zeros((len(kept_pb), 0)))
+            for i in range(len(kept_pb)):
+                p_idx = int(np.clip(kept_pl[i] - 1, 0, nc - 1))
+                if len(gb) and ious_kept[i].size:
+                    j = int(np.argmax(ious_kept[i]))
+                    if ious_kept[i, j] >= iou_thr and not kept_gt_used[j]:
+                        kept_gt_used[j] = True
+                        g_idx = int(np.clip(gl[j] - 1, 0, nc - 1))
+                        cm[g_idx, p_idx] += 1
+                        continue
+                cm[nc, p_idx] += 1  # FP — no matching GT
+        # Any GT not matched by a kept prediction is a missed detection.
+        for j in range(len(gb)):
+            if not kept_gt_used[j]:
+                g_idx = int(np.clip(gl[j] - 1, 0, nc - 1))
+                cm[g_idx, nc] += 1
 
-        if len(gb):
-            if np.any(keep) and len(pb_o):
-                ious_kept = _iou_matrix(pb_o[keep], gb)
-                gt_matched_by_kept = (
-                    (ious_kept >= iou_thr).any(axis=0)
-                    if ious_kept.size
-                    else np.zeros(len(gb), dtype=bool)
-                )
-            else:
-                gt_matched_by_kept = np.zeros(len(gb), dtype=bool)
-            fn += int((~gt_matched_by_kept).sum())
-
-    cm = np.array([[0, fp], [fn, tp]], dtype=np.int64)
     return (
         np.asarray(all_scores, dtype=np.float32),
         np.asarray(all_matched, dtype=np.int32),
@@ -547,6 +666,10 @@ def _parse_main_args(argv: Optional[Sequence[str]] = None) -> Any:
     p.add_argument('cmd', nargs='?', default='gradcam', choices=['gradcam'])
     p.add_argument('--weights', required=True, type=str)
     p.add_argument(
+        '--architecture', default='dai_net', type=str,
+        help='Detection architecture name (used in charts path).',
+    )
+    p.add_argument(
         '--model', default='dark', type=str,
         choices=['dark', 'vgg', 'resnet50', 'resnet101', 'resnet152'],
     )
@@ -694,7 +817,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     tgt_items = [to_item(p) for p in night_imgs[:n]]
 
     out_dir = make_charts_dir(
-        args.charts_dir, args.mode_name, args.model, args.num_exp,
+        args.charts_dir, args.mode_name,
+        args.architecture, args.model, args.num_exp,
     )
     method = f'DAI-Net ({args.model}, {os.path.basename(args.weights)})'
     config = {
