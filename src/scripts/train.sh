@@ -3,9 +3,17 @@ set -e
 
 cd "$(dirname "$0")/../.."
 
-CONFIG=${CONFIG:-configs/train/dai_net/vgg16/exp1.yaml}
+CONFIG=${CONFIG:-configs/train/dai_net/vgg16/exp2.yaml}
 
-GPU_IDS=0
+if [ ! -f "$CONFIG" ]; then
+    echo "ERROR: CONFIG=$CONFIG does not exist." >&2; exit 1
+fi
+
+if [ -z "${GPU_IDS:-}" ]; then
+    GPU_IDS=$(grep -E '^[[:space:]]*gpu_ids:' "$CONFIG" \
+        | head -1 | sed 's/.*gpu_ids:[[:space:]]*//; s/[[:space:]]*$//')
+fi
+GPU_IDS=${GPU_IDS:-0}
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 NUM_GPUS=$(echo "$GPU_IDS" | awk -F',' '{print NF}')
 
@@ -15,9 +23,6 @@ TORCHRUN=${TORCHRUN:-/home/caotulab/miniconda3/envs/nhan/bin/torchrun}
 
 if [ -z "$GPU_IDS" ] || [ "$NUM_GPUS" -le 0 ] 2>/dev/null; then
     echo "ERROR: GPU_IDS is empty." >&2; exit 1
-fi
-if [ ! -f "$CONFIG" ]; then
-    echo "ERROR: CONFIG=$CONFIG does not exist." >&2; exit 1
 fi
 
 echo "=========================================="

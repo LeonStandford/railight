@@ -1,0 +1,38 @@
+architecture: dai_net
+num_exp: exp2
+
+batch_size: 16
+
+lr: 5.0e-4
+momentum: 0.9
+weight_decay: 5.0e-4
+gamma: 0.1            
+epochs:    100
+max_steps: 43000       
+lr_steps:  [21000, 31000, 39000]     
+
+cuda: true
+gpu_ids: 0
+num_workers: 2
+local_rank: 0
+
+train_file: ./dataset/source_train.txt
+val_file:   ./dataset/source_val.txt
+nc: 3
+source_folder: /mnt/Nhan/data/images/source
+target_folder: /mnt/Nhan/data/images/target
+
+save_folder: weights/
+charts_dir:  ./charts
+resume: false
+
+viz_num_samples: 6
+viz_every_iters: 500
+viz_full_every_epochs: 1
+
+kl_loss_weight: 1.0
+coral_loss_weight: 0.3
+target_loss_weight: 0.1
+
+# smooth_l1 | ciou | wiou_v1 | wiou_v3
+box_loss: wiou_v3

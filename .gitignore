@@ -5,3 +5,6 @@
 **/*charts
 **/*records
 **/*.csv
+.vscode
+**/*charts
+.claude

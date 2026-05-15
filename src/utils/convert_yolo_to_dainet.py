@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--train-split", default="Train", type=str)
     p.add_argument("--val-split", default="Val", type=str)
+    p.add_argument("--test-split", default="Test", type=str)
     p.add_argument(
         "--out-dir",
         default="dataset",
@@ -130,14 +131,19 @@ def main() -> None:
     train_labels = os.path.join(args.source_root, args.train_split, "labels")
     val_images = os.path.join(args.source_root, args.val_split, "images")
     val_labels = os.path.join(args.source_root, args.val_split, "labels")
+    test_images = os.path.join(args.source_root, args.test_split, "images")
+    test_labels = os.path.join(args.source_root, args.test_split, "labels")
     train_out = os.path.join(args.out_dir, "source_train.txt")
     val_out = os.path.join(args.out_dir, "source_val.txt")
+    test_out = os.path.join(args.out_dir, "source_test.txt")
     print(f"[train] {train_images} -> {train_out}")
     convert_split(
         train_images, train_labels, train_out, args.max_class, args.cls_offset
     )
     print(f"[val]   {val_images} -> {val_out}")
     convert_split(val_images, val_labels, val_out, args.max_class, args.cls_offset)
+    print(f"[test]  {test_images} -> {test_out}")
+    convert_split(test_images, test_labels, test_out, args.max_class, args.cls_offset)
     print("Done.")
 
 

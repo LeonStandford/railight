@@ -6,12 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-from ..bbox_utils import match, log_sum_exp, match_ssd
+from ..bbox_utils import match, log_sum_exp, match_ssd, decode
 
 
 class MultiBoxLoss(nn.Module):
 
-    def __init__(self, cfg, use_gpu=True):
+    def __init__(self, cfg, use_gpu=True, cls_loss_fn=None,
+                 box_loss_fn=None):
         super(MultiBoxLoss, self).__init__()
         self.use_gpu = use_gpu
         self.num_classes = cfg.NUM_CLASSES
@@ -19,6 +20,15 @@ class MultiBoxLoss(nn.Module):
         self.variance = cfg.VARIANCE
         self.threshold = cfg.FACE.OVERLAP_THRESH
         self.match = match_ssd
+        # Optional IoU-family box loss (CIoU / WIoU). When set it
+        # replaces Smooth-L1: positive priors are decoded to xyxy and the
+        # IoU loss is computed on real boxes (supervised day/source branch).
+        self.box_loss_fn = box_loss_fn
+        # Optional classification loss (e.g. FocalLoss). When set, it is
+        # applied over ALL priors and replaces the cross-entropy + hard
+        # negative mining path (focal loss handles the fg/bg imbalance
+        # itself, so OHEM is neither needed nor desirable).
+        self.cls_loss_fn = cls_loss_fn
 
     def forward(self, predictions, targets):
         loc_data, conf_data, priors = predictions
@@ -52,7 +62,26 @@ class MultiBoxLoss(nn.Module):
         pos_idx = pos.unsqueeze(pos.dim()).expand_as(loc_data)
         loc_p = loc_data[pos_idx].view(-1, 4)
         loc_t = loc_t[pos_idx].view(-1, 4)
-        loss_l = F.smooth_l1_loss(loc_p, loc_t, reduction="sum")
+        if self.box_loss_fn is not None and loc_p.numel() > 0:
+            # decode encoded offsets -> xyxy (pred & matched-GT) using the
+            # priors of the positive anchors, then apply the IoU loss.
+            pri = priors.to(loc_data.device)
+            pri_b = pri.unsqueeze(0).expand(num, -1, 4)
+            pp = pri_b[pos].view(-1, 4)
+            pred_xyxy = decode(loc_p, pp, self.variance)
+            tgt_xyxy = decode(loc_t, pp, self.variance)
+            loss_l = self.box_loss_fn(pred_xyxy, tgt_xyxy)
+        else:
+            loss_l = F.smooth_l1_loss(loc_p, loc_t, reduction="sum")
+        if self.cls_loss_fn is not None:
+            # Focal path: classify over every prior, no hard-neg mining.
+            loss_c = self.cls_loss_fn(
+                conf_data.view(-1, self.num_classes), conf_t.view(-1)
+            )
+            N = num_pos.data.sum() if num_pos.data.sum() > 0 else num
+            loss_l /= N
+            loss_c /= N
+            return (loss_l, loss_c)
         batch_conf = conf_data.view(-1, self.num_classes)
         loss_c = log_sum_exp(batch_conf) - batch_conf.gather(1, conf_t.view(-1, 1))
         loss_c[pos.view(-1, 1)] = 0

@@ -3,3 +3,8 @@ Pillow
 torchmetrics
 easydict
 scikit-learn
+numpy<2
+pandas
+matplotlib
+cleanlab
+cleanvision
