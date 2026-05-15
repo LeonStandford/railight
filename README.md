@@ -6,229 +6,178 @@
   </p>
 </p>
 
-PyTorch implementation of low-light object detection with zero-shot day-night
-domain adaptation, adapted from the CVPR 2024 paper
+PyTorch implementation of low-light object detection with zero-shot day–night
+**unsupervised domain adaptation (UDA)**, adapted from the CVPR 2024 paper
 **"Boosting Object Detection with Zero-Shot Day-Night Domain Adaptation"**
-([arXiv:2312.01220](https://arxiv.org/abs/2312.01220)) by Du et al. This
-fork extends the original face-detection pipeline so that it can train on
-**arbitrary YOLO-format datasets** (railway defects, custom objects, …) with
-a real low-light **target domain** sampled from video.
+([arXiv:2312.01220](https://arxiv.org/abs/2312.01220)). This fork extends the
+original face-detection pipeline to train on **arbitrary YOLO-format
+datasets** (railway defects, custom objects, …) with a **real low-light
+target domain** sampled from video, and adds explicit UDA objectives.
 
 ![overview](./assets/overview.png)
 
 ---
 
-## ✨ What's new in this fork
+## ✨ Highlights
 
 | Area | Original (Du et al.) | This fork |
 |---|---|---|
-| **Detection task** | Face only (WIDER → DARK FACE) | Any YOLO-format multi-class dataset |
-| **Dataset format** | WIDER `wider_face_train.txt` | YOLO `.txt` per image → converted on demand |
-| **Source domain** | WIDER Face | User-provided well-lit + labelled images |
-| **Target domain** | Synthetic Dark ISP only | Real video frames + Dark ISP for paired training |
-| **Alternative detector** | DSFD only | DSFD **or** YOLO26 (Ultralytics) |
-| **Visualisation** | None | Loss subplots, PR / CM / Recall-F1 curves, day vs night samples, Grad-CAM, train vs val overlay |
-| **Tooling** | — | Frame extractor from videos, dataset converter, training/evaluation shell scripts |
-| **Logging** | Console only | Tee-mirrored `logs/<datetime>.log` |
+| Detection task | Face only | Any YOLO-format multi-class dataset |
+| Source domain | WIDER Face | User well-lit + labelled images |
+| Target domain | Synthetic Dark-ISP only | **Real night frames + synthetic Dark-ISP** |
+| Detector | DSFD only | DSFD / DAI-Net **or** YOLO26 (one entrypoint) |
+| Domain adaptation | Synthetic only | + cross-domain **KL**, **entropy-min**, **weight anchor**, target Retinex |
+| Metrics | — | scikit-learn precision/recall/F1, PR/AP |
+| Visualisation | — | losses, PR/CM/F1, t-SNE, Grad-CAM, domain-metric curves |
+| Layout | flat scripts | clean **`src/` package layout**, YAML-driven |
 
 ---
 
-## 🚀 Installation
-
-```bash
-git clone <this-repo>
-cd DAI-Net
-
-conda create -y -n dainet python=3.10
-conda activate dainet
-
-pip install -r requirements.txt
-```
-
-GPU: tested on NVIDIA RTX 4090 (24 GB), Ubuntu 24.04, CUDA 12.x.
-
----
-
-## 📁 Repository layout
+## 📁 Project layout
 
 ```
 DAI-Net/
-├── train.py                  # DSFD + DAI-Net training (paired Dark ISP)
-├── train.sh                  #   ↳ shell wrapper
-├── train_yolo.py             # YOLO26 alternative trainer
-├── train_yolo.sh             #   ↳ shell wrapper
-├── cut_frames.py             # Extract video frames -> images/target/
-├── cut_frames.sh
-├── convert_yolo_to_dainet.py # YOLO label format -> DAI-Net txt format
-├── data/
-│   ├── widerface.py          # WIDER-style dataset loader (used after conversion)
-│   ├── target_domain.py      # Real dark-image loader
-│   ├── config.py
-│   └── ...
-├── models/
-│   ├── dai_net.py            # DAI-Net (DSFD + reflectance decoder)
-│   ├── enhancer.py           # RetinexNet pseudo-GT generator
-│   └── factory.py
-├── layers/                   # DSFD detection heads, anchors, losses
-├── utils/
-│   ├── visualize.py          # All chart helpers + Grad-CAM standalone main()
-│   ├── dark_isp.py           # Physics-based dark synthesis
-│   └── augmentations.py
-├── yolo/ultralytics/         # In-repo Ultralytics package (YOLO26 architecture)
-├── dataset/                  # Converted txt files end up here
-└── logs/                     # Tee-mirrored training logs (auto-created)
+├── train.py                 # unified entrypoint (dispatches by architecture)
+├── test.py                  # evaluation entrypoint
+├── configs/                 # YAML experiment configs
+├── dataset/                 # source_train.txt / source_val.txt (abs paths)
+├── weights/                 # pretrained + checkpoints  <arch>/<backbone>/<exp>/
+├── charts/  records/  logs/ # per-experiment outputs
+└── src/
+    ├── data/                # ALL dataset loading
+    │   ├── source_domain.py     labelled source (BGR-CHW)
+    │   ├── target_domain.py     TargetDomainDetection + TargetUnlabeledDataset
+    │   ├── datamodule.py        DataModule (Facade: builds every loader)
+    │   ├── meta.py              data.yaml -> nc / class names
+    │   └── config.py            global cfg (INPUT_SIZE, loss weights, schedule)
+    ├── utils/               # augmentations, dark_isp, visualize, convert/cut tools
+    ├── scripts/             # *.sh launchers
+    └── models/
+        ├── dai_net.py  dsfd_*.py  enhancer.py  factory.py
+        ├── layers/          detection layers / losses (multibox, enhance, …)
+        ├── yolo/            vendored Ultralytics (YOLO26)
+        └── dainet/          framework package
+            ├── config/          Config dataclass + ConfigLoader (Builder)
+            ├── constants.py     name/arch/backbone maps, CSV columns
+            └── yolo_runner.py   YOLO training (config-driven)
 ```
+
+`train.py` / `test.py` prepend `src/` and `src/models/` to `sys.path`, so every
+absolute import (`from data.config import cfg`, `from models.factory import …`)
+resolves with no per-file path hacks.
 
 ---
 
-## 📥 Data and weight preparation
-
-### 1. Source dataset (YOLO format)
-
-Organise your labelled well-lit data as:
-
-```
-<source-root>/
-├── Train/
-│   ├── images/                 # *.jpg / *.png
-│   └── labels/                 # *.txt — each line: "cls cx cy w h" (xywh normalised)
-├── Val/
-│   ├── images/
-│   └── labels/
-└── data.yaml                   # nc, names, …  (optional but recommended)
-```
-
-### 2. Convert YOLO → DAI-Net format
+## ⚙️ Installation
 
 ```bash
-python convert_yolo_to_dainet.py \
-    --source-root /path/to/source \
-    --train-split Train --val-split Val \
-    --out-dir dataset \
-    --max-class 3
+conda create -n dainet python=3.10 -y && conda activate dainet
+pip install -r requirements.txt          # torch, torchvision, sklearn, …
 ```
 
-Produces `dataset/source_train.txt` and `dataset/source_val.txt` in the
-DAI-Net (WIDER-style) format expected by `data.widerface.WIDERDetection`.
+Place pretrained weights in `weights/`:
+`vgg16_reducedfc.pth` (backbone) and `decomp.pth` (frozen Retinex DecomNet).
 
-### 3. Target domain (optional — for visualisation / Grad-CAM)
+---
 
-Extract frames from your low-light videos:
+## 🗂️ Data
+
+* **Source** (labelled, well-lit): listed in
+  `dataset/source_train.txt` / `source_val.txt`, one line per image:
+
+  ```
+  /abs/path/img.png  N  x y w h cls  x y w h cls  ...
+  ```
+
+  Class ids are 1-indexed (0 = background). Convert YOLO labels with
+  `src/utils/convert_yolo_to_dainet.py`. Paths must contain **no spaces**
+  (symlink a space-free path if your drive label has spaces).
+* **Target** (unlabeled, real night): a flat folder of frames
+  (`src/utils/cut_frames.py` extracts them from video).
+* `data.yaml` (in `source_folder`) supplies `nc` + `names`.
+
+---
+
+## 🚀 Training
+
+One YAML drives everything; `architecture:` selects the pipeline.
 
 ```bash
-python cut_frames.py \
-    --path-input  /path/to/videos \
-    --path-output /path/to/target \
-    --fps 1.0
+# DAI-Net / DSFD
+python train.py --config configs/train/dai_net/vgg16/exp1.yaml
+# YOLO26  (architecture: yolo… in the YAML -> YOLO runner)
+python train.py --config configs/train/yolo/csp/exp1.yaml
 ```
 
-### 4. Pretrained weights
+Multi-GPU: `torchrun --nproc_per_node=N train.py --config …`.
 
-| File | Drive link | Where |
-|---|---|---|
-| RetinexNet `decomp.pth` | [link](https://drive.google.com/file/d/1MaRK-VZmjBvkm79E1G77vFccb_9GWrfG/view) | `weights/decomp.pth` |
-| VGG16 base `vgg16_reducedfc.pth` | [link](https://drive.google.com/file/d/1whV71K42YYduOPjTTljBL8CB-Qs4Np6U/view) | `weights/vgg16_reducedfc.pth` |
+### Loss composition (DAI-Net path)
 
-If either is missing the training script falls back to scratch / no-pseudo-GT
-with a warning, but quality will suffer.
+Per iteration the model sees **three domains** — source (labelled day),
+`source_dark` (Dark-ISP synthetic, paired GT), and real `target` (unlabeled):
+
+| Term | Purpose |
+|---|---|
+| `pal1/pal2 loc+conf` | detection on `source_dark` vs source GT (paired) |
+| `enhance`, `enhance_l1ssim` | Retinex reconstruction (paper-faithful) |
+| `mutual` | KL: source ↔ source_dark backbone features |
+| `kl_st` | **UDA** KL: source ↔ target features (`kl_loss_weight`) |
+| `target_unsup` | Retinex reconstruction on **real target** via the *trainable* reflectance branch (`target_loss_weight`) |
+| `wreg` | 3C-GAN ℓ_wReg — anchor VGG to pretrained (`wreg_loss_weight`) |
+| `entropy` | 3C-GAN ℓ_ent — entropy-min on target detection (`entropy_loss_weight`) |
+
+Set any weight to `0` in the config to disable that term.
 
 ---
 
-## 🏋️ Training
-
-### DSFD + DAI-Net (paper-faithful)
+## 📊 Evaluation & visualisation
 
 ```bash
-bash train.sh                           # defaults: backbone=dark, nc=3, batch=1
-NC=3 BATCH_SIZE=2 ./train.sh            # tweak knobs via env
-BACKBONE=resnet50 NUM_EXP=exp2 ./train.sh
-GPU_IDS=1 ./train.sh                    # select physical GPU
+python test.py --config configs/test/dai_net/vgg16/exp1.yaml
 ```
 
-Key env vars: `BACKBONE`, `NUM_EXP`, `BATCH_SIZE`, `LR`, `NC`, `TRAIN_FILE`,
-`VAL_FILE`, `TARGET_FOLDER`, `GPU_IDS`, `VIZ_EVERY_ITERS`,
-`VIZ_FULL_EVERY_EPOCHS`, `VIZ_NUM_SAMPLES`, `RESUME`.
+Charts land in `charts/<mode>/<arch>/<backbone>/<exp>/`:
 
-### YOLO26 alternative
+* `losses.png`, `train_vs_val.png` (pal2-det vs val, like-for-like)
+* `confusion_matrix.png`, `pr_curve.png`, `recall_f1.png`
+  (precision/recall/F1 & AP via **scikit-learn**)
+* `samples_{day,synth_night,real_night}.png`
+* `tsne_source_features.png` — source embeddings over the **full** val set,
+  coloured by GT class
+* `gradcam_source_vs_target.png`
+* `domain_metrics.png` — KL & target-entropy vs epoch
 
-```bash
-bash train_yolo.sh                       # YOLO26n on the same source
-SCALE=s NUM_EXP=exp2 ./train_yolo.sh     # yolo26s
-GPU_IDS=0,1 ./train_yolo.sh              # multi-GPU
-```
+Validation prints a sectioned box table (Loss / Detection / Domain / Timing)
+and every visualisation step logs progress to stdout.
 
-Reads YOLO labels directly (no conversion needed) and uses Ultralytics
-v8DetectionLoss / E2ELoss.
+CSV metrics: `records/<arch>/<backbone>/<exp>_{train,val}.csv`.
 
 ---
 
-## 📊 Visualisation
+## 🔧 Config knobs (excerpt)
 
-Per-epoch (and per-N-iters cheap loss refresh), `train.py` writes to
-`charts/train/<backbone>/<num_exp>/`:
-
-* `losses.png` — subplots of every tracked loss
-* `train_vs_val.png` — mean train loss vs val proxy on a shared axis
-* `pr_curve.png`, `recall_f1.png` — detection metrics on the source val set
-* `confusion_matrix.png` — normalised, blue colormap
-* `samples_day.png` — predictions on well-lit val images
-* `samples_synth_night.png` — predictions on Dark ISP-synthesised val images
-* `samples_real_night.png` — predictions on real video frames from `target_folder`
-* `history.json` — raw loss history for offline plotting
-
-### Standalone Grad-CAM (source vs target feature comparison)
-
-```bash
-python -m utils.visualize gradcam \
-    --weights weights/dark/dsfd.pth \
-    --model dark \
-    --num_exp exp1 \
-    --target_folder /path/to/target
+```yaml
+architecture: dai_net           # or "yolo" -> YOLO26 runner
+num_exp: exp1
+batch_size: 2
+lr: 5.0e-4
+epochs: 100
+lr_steps: [170000, 250000, 310000]
+source_folder: /path/no-spaces/.../3/source     # holds Train/ Val/ data.yaml
+target_folder: /path/no-spaces/.../3/target     # real night frames
+kl_loss_weight: 1.0
+target_loss_weight: 0.05
+wreg_loss_weight: 1.0e-4
+entropy_loss_weight: 0.01
+resume: false                   # true -> auto-load last checkpoint
 ```
 
-Saves `charts/test/<backbone>/<num_exp>/gradcam_source_vs_target.png`.
+Checkpoints: `weights/<arch>/<backbone>/<num_exp>/{last,best}_model.pth`.
 
 ---
 
-## 📜 Logging
+## 🙏 Acknowledgements
 
-Every training run mirrors stdout/stderr to a file in `logs/`:
-
-```
-logs/<YYYYmmdd_HHMMSS>_<backbone>_<num_exp>.log
-```
-
-These contain the argparse config, every loss line, and any Python traceback.
-
----
-
-## 📑 Citation
-
-This implementation is built on the work of Du et al. If you use it, please
-cite both the original paper and this fork:
-
-```bibtex
-@inproceedings{du2024boosting,
-  title     = {Boosting Object Detection with Zero-Shot Day-Night Domain Adaptation},
-  author    = {Du, Zhipeng and Shi, Miaojing and Deng, Jiankang},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  pages     = {12666--12676},
-  year      = {2024}
-}
-```
-
-This fork is maintained by **Pham Minh Long**, NYCU, Taiwan, as part of
-research on low-light object detection on custom datasets (e.g. railway
-defect inspection in poor visibility conditions).
-
----
-
-## 🙏 Acknowledgement
-
-Builds on [DAI-Net](https://github.com/ZPDu/DAI-Net),
-[DSFD.pytorch](https://github.com/yxlijun/DSFD.pytorch),
-[RetinexNet_PyTorch](https://github.com/aasharma90/RetinexNet_PyTorch),
-[MAET](https://github.com/cuiziteng/ICCV_MAET),
-[HLA-Face](https://github.com/daooshee/HLA-Face-Code), and
-[Ultralytics](https://github.com/ultralytics/ultralytics). Thanks to the
-original authors for releasing their code.
+Built on DAI-Net (Du et al., CVPR 2024), DSFD, and Ultralytics YOLO. The
+unsupervised model-adaptation regularisers follow *"Model Adaptation:
+Unsupervised Domain Adaptation without Source Data"* (Li et al., CVPR 2020).
