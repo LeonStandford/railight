@@ -19,6 +19,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import yaml
 import numpy as np
 import torch
+import warnings as _warnings
+_warnings.filterwarnings(
+    "ignore",
+    message=r".*set_default_tensor_type\(\) is deprecated.*",
+    category=UserWarning,
+)
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -27,16 +33,23 @@ import torch.utils.data as data
 from PIL import Image
 from torch.autograd import Variable
 from torchmetrics.functional.image import structural_similarity_index_measure as ssim
+from sklearn.metrics import precision_recall_fscore_support
 from tqdm import tqdm
 from data.config import cfg
 from data.source_domain import SourceDomainDetection, detection_collate
+from data.target_domain import TargetUnlabeledDataset
 from layers.modules import EnhanceLoss, MultiBoxLoss
 from layers.modules.enhance_loss import smooth as retinex_smooth
+from losses.dfl import FocalLoss, compute_focal_alpha, init_focal_bias
+from losses.weight_reg import snapshot_wreg_ref, weight_reg_loss
 from models.enhancer import RetinexNet
 from models.factory import basenet_factory, build_net
 from utils import visualize as viz
-from utils.augmentations import to_chw_bgr
 from utils.dark_isp import Low_Illumination_Degrading
+from utils.augmentations import to_chw_bgr
+from utils.nms import multiclass_nms
+from utils.tee import Tee
+
 
 Point = Tuple[float, float]
 History = Dict[str, List[Point]]
@@ -83,7 +96,7 @@ _TRAIN_DEFAULTS: Dict[str, Any] = {
     "momentum": 0.9,
     "weight_decay": 0.0005,
     "gamma": 0.1,
-    "multigpu": True,
+    "gpu_ids": 0,
     "save_folder": "weights/",
     "train_file": "./dataset/source_train.txt",
     "val_file": "./dataset/source_val.txt",
@@ -100,6 +113,9 @@ _TRAIN_DEFAULTS: Dict[str, Any] = {
     "target_loss_weight": 0.05,
     "wreg_loss_weight": 0.0001,
     "entropy_loss_weight": 0.01,
+    # Localisation loss for supervised (day/source) detection:
+    # 'smooth_l1' (default) | 'ciou' | 'wiou_v1' | 'wiou_v3'
+    "box_loss": "smooth_l1",
     "epochs": 100,
     "max_steps": 150000,
     "lr_steps": [20000, 25000, 30000],
@@ -249,44 +265,6 @@ def parse_args() -> argparse.Namespace:
     return load_yaml_config(cli.config, mode="train")
 
 
-class Tee:
-
-    def __init__(self, stream: Any, file_handle: Any) -> None:
-        self._stream = stream
-        self._file = file_handle
-
-    @staticmethod
-    def _strip_cr_updates(data: str) -> str:
-        if "\r" not in data:
-            return data
-        out_chunks = []
-        for chunk in data.split("\n"):
-            if "\r" in chunk:
-                chunk = chunk.split("\r", 1)[0]
-            out_chunks.append(chunk)
-        return "\n".join(out_chunks)
-
-    def write(self, data: str) -> None:
-        self._stream.write(data)
-        try:
-            clean = self._strip_cr_updates(data)
-            if clean:
-                self._file.write(clean)
-                self._file.flush()
-        except Exception:
-            pass
-
-    def flush(self) -> None:
-        self._stream.flush()
-        try:
-            self._file.flush()
-        except Exception:
-            pass
-
-    def __getattr__(self, name: str):
-        return getattr(self._stream, name)
-
-
 def setup_logging(
     architecture: str, backbone: str, num_exp: str, args_ns: argparse.Namespace
 ) -> Optional[str]:
@@ -294,8 +272,8 @@ def setup_logging(
     os.makedirs(log_dir, exist_ok=True)
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(log_dir, f"{ts}_{num_exp}.log")
-    fh = open(path, "a", buffering=1)
-    fh.write(f"# DAI-Net training log — {_dt.datetime.now().isoformat()}\n")
+    fh = open(path, "a", buffering=1, encoding="utf-8")
+    fh.write(f"# DAI-Net training log - {_dt.datetime.now().isoformat()}\n")
     fh.write(f"# args: {vars(args_ns)}\n")
     sys.stdout = Tee(sys.stdout, fh)
     sys.stderr = Tee(sys.stderr, fh)
@@ -303,9 +281,29 @@ def setup_logging(
     return path
 
 
+def parse_gpu_ids(val: Any) -> List[int]:
+    """Normalise the ``gpu_ids`` config value to a list of ints.
+
+    Accepts an int (``0``), a comma string (``"0,1"``) or a list
+    (``[0, 1]``). ``len(...) > 1`` means multi-GPU / DDP.
+    """
+    if val is None:
+        return []
+    if isinstance(val, bool):  # guard: YAML true/false is not a gpu id
+        return [0] if val else []
+    if isinstance(val, int):
+        return [val]
+    if isinstance(val, (list, tuple)):
+        return [int(x) for x in val]
+    s = str(val).strip()
+    if not s:
+        return []
+    return [int(x) for x in s.replace(" ", "").split(",") if x != ""]
+
+
 def setup_distributed(local_rank: int, use_cuda: bool) -> None:
     if not (torch.cuda.is_available() and use_cuda):
-        torch.set_default_tensor_type("torch.FloatTensor")
+        torch.set_default_tensor_type("torch.FloatTensor")  # noqa: deprecated-ok
         return
     gpu_num = torch.cuda.device_count()
     if local_rank == 0:
@@ -315,30 +313,9 @@ def setup_distributed(local_rank: int, use_cuda: bool) -> None:
     dist.init_process_group("nccl")
 
 
-class TargetUnlabeledDataset(data.Dataset):
-    IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
-
-    def __init__(self, target_folder: str, size: int) -> None:
-        self.size = int(size)
-        if not os.path.isdir(target_folder):
-            self.paths: List[str] = []
-        else:
-            self.paths = sorted(
-                [
-                    p
-                    for p in glob.glob(os.path.join(target_folder, "*"))
-                    if p.lower().endswith(self.IMG_EXTS)
-                ]
-            )
-
-    def __len__(self) -> int:
-        return len(self.paths)
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        img = Image.open(self.paths[idx]).convert("RGB")
-        img = img.resize((self.size, self.size), Image.BILINEAR)
-        arr = to_chw_bgr(np.asarray(img, dtype=np.float32))
-        return torch.from_numpy(arr.copy())
+def teardown_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def build_data_loaders(
@@ -395,35 +372,6 @@ def build_data_loaders(
 def adjust_learning_rate(optimizer: optim.Optimizer, gamma: float) -> None:
     for g in optimizer.param_groups:
         g["lr"] = g["lr"] * gamma
-
-
-def snapshot_wreg_ref(net: torch.nn.Module) -> Dict[str, torch.Tensor]:
-    return {
-        name: p.detach().clone()
-        for (name, p) in net.named_parameters()
-        if name.startswith("vgg.") and p.requires_grad
-    }
-
-
-def weight_reg_loss(
-    net_inner: torch.nn.Module, ref: Dict[str, torch.Tensor]
-) -> torch.Tensor:
-    if not ref:
-        return torch.zeros((), device=next(net_inner.parameters()).device)
-    total = None
-    n = 0
-    for name, p in net_inner.named_parameters():
-        if name in ref:
-            r = ref[name]
-            if r.device != p.device:
-                r = r.to(p.device, non_blocking=True)
-                ref[name] = r
-            diff = (p - r).pow(2).sum()
-            total = diff if total is None else total + diff
-            n += p.numel()
-    if total is None or n == 0:
-        return torch.zeros((), device=next(net_inner.parameters()).device)
-    return total / n
 
 
 def build_dark_batch(images: torch.Tensor) -> torch.Tensor:
@@ -508,7 +456,86 @@ def history_factory() -> History:
         "val_map": [],
         "val_kl_st": [],
         "val_entropy": [],
+        "train_precision": [],
+        "train_recall": [],
+        "train_f1": [],
+        "train_map": [],
     }
+
+
+def _load_history(path: str) -> Optional[History]:
+    """Read a saved history.json back into a History (tuples, not lists)."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"[resume] could not read {path}: {e}")
+        return None
+    out: History = {}
+    for k, v in (raw or {}).items():
+        if isinstance(v, list):
+            out[k] = [
+                (p[0], p[1])
+                for p in v
+                if isinstance(p, (list, tuple)) and len(p) == 2
+            ]
+    return out
+
+
+def _history_from_csv(train_csv: str, val_csv: str) -> History:
+    """Rebuild epoch-level curves from the appended CSV records.
+
+    CSVs are append-only (survive resume), so they reliably restore
+    per-epoch curves even if history.json was overwritten/lost. Per-iter
+    loss curves are not in the CSVs — those come from history.json.
+    """
+    h: History = {}
+
+    def _read(path: str):
+        if not os.path.isfile(path):
+            return []
+        with open(path, "r", newline="") as f:
+            return list(csv.DictReader(f))
+
+    def _num(row, key):
+        try:
+            return float(row[key])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    for row in _read(val_csv):
+        e = _num(row, "epoch")
+        if e is None:
+            continue
+        e = int(e)
+        for col, key in (
+            ("loss", "val_loss"),
+            ("accuracy", "val_accuracy"),
+            ("precision", "val_precision"),
+            ("recall", "val_recall"),
+            ("f1", "val_f1"),
+            ("mAP", "val_map"),
+            ("val_kl_st", "val_kl_st"),
+            ("val_entropy", "val_entropy"),
+        ):
+            y = _num(row, col)
+            if y is not None:
+                h.setdefault(key, []).append((e, y))
+
+    for row in _read(train_csv):
+        e = _num(row, "epoch")
+        if e is None:
+            continue
+        e = int(e)
+        loss = _num(row, "loss")
+        if loss is not None:
+            h.setdefault("train_loss_epoch", []).append((e, loss))
+        ploc, pconf = _num(row, "pal2_loc"), _num(row, "pal2_conf")
+        if ploc is not None and pconf is not None:
+            h.setdefault("train_det_epoch", []).append((e, ploc + pconf))
+    return h
 
 
 def record_iter_losses(
@@ -586,7 +613,10 @@ def _decode_predictions(
 
 
 def infer_detections(
-    net: torch.nn.Module, image_chw_01: torch.Tensor, conf_thr: float = 0.05
+    net: torch.nn.Module,
+    image_chw_01: torch.Tensor,
+    conf_thr: float = 0.05,
+    nms_iou_thr: float = 0.35,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     with torch.no_grad():
         x = image_chw_01.unsqueeze(0).cuda()
@@ -610,11 +640,11 @@ def infer_detections(
             boxes.append((det[0, c, k, 1:] * scale).tolist())
             scores.append(s)
             labels.append(c)
-    return (
-        np.asarray(boxes, dtype=np.float32),
-        np.asarray(scores, dtype=np.float32),
-        np.asarray(labels, dtype=np.int32),
-    )
+    b = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+    s = np.asarray(scores, dtype=np.float32).reshape(-1)
+    lb = np.asarray(labels, dtype=np.int32).reshape(-1)
+    # Drop redundant overlapping boxes (per-class greedy NMS).
+    return multiclass_nms(b, s, lb, iou_thr=nms_iou_thr)
 
 
 def collect_target_samples(
@@ -622,6 +652,8 @@ def collect_target_samples(
     target_folder: str,
     n_show: int,
     class_names: Sequence[str] = (),
+    conf_thr: float = 0.5,
+    nms_iou_thr: float = 0.35,
 ) -> List[Dict[str, Any]]:
     if not os.path.isdir(target_folder):
         return []
@@ -634,9 +666,14 @@ def collect_target_samples(
             .convert("RGB")
             .resize((cfg.INPUT_SIZE, cfg.INPUT_SIZE), Image.BILINEAR)
         )
-        arr = np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / 255.0
-        tensor = torch.from_numpy(arr).float().cuda()
-        boxes, scores, labels = infer_detections(net, tensor)
+        rgb = np.asarray(img, dtype=np.float32)
+        # Model was trained on BGR-CHW (to_chw_bgr); feed BGR, not RGB,
+        # else channels are swapped at inference -> garbage predictions.
+        arr = to_chw_bgr(rgb) / 255.0
+        tensor = torch.from_numpy(arr.copy()).float().cuda()
+        boxes, scores, labels = infer_detections(
+            net, tensor, conf_thr=conf_thr, nms_iou_thr=nms_iou_thr
+        )
         if class_names:
             text_labels = [class_names[c - 1] for c in labels]
         else:
@@ -713,6 +750,38 @@ class TrainingContext:
                 f"Source train: {len(self.train_dataset)} | Source val: {len(self.val_dataset)} | Target unlabeled: {n_target} (weight={getattr(args_ns, 'target_loss_weight', 0.0)}) | classes ({len(self.class_names)}): {list(self.class_names)}"
             )
         self.history: History = history_factory()
+
+        if getattr(args_ns, "resume", None):
+            restored = _load_history(
+                os.path.join(self.charts_dir, "history.json")
+            ) or {}
+
+            csv_hist = _history_from_csv(
+                self.train_records_path, self.val_records_path
+            )
+
+            for k in self.history:
+                merged: Dict[float, float] = {}
+                for x, y in csv_hist.get(k, []):
+                    merged[x] = y
+                for x, y in restored.get(k, []):
+                    merged[x] = y
+                if merged:
+                    self.history[k] = [
+                        (x, merged[x]) for x in sorted(merged)
+                    ]
+            if local_rank == 0:
+                src = []
+                if restored:
+                    src.append("history.json")
+                if csv_hist:
+                    src.append("records/*.csv")
+                npts = len(self.history.get("val_loss", []))
+                print(
+                    f"[resume] restored history from "
+                    f"{' + '.join(src) or 'nothing'} "
+                    f"({npts} val epochs merged)"
+                )
         self.min_loss = float("inf")
         self.best_f1 = -1.0
         self.wreg_ref: Dict[str, torch.Tensor] = {}
@@ -761,6 +830,10 @@ def run_full_visualisation(
         method=method,
         config=config,
     )
+    _p("train-vs-val metrics (loss/precision/recall/f1/mAP)")
+    viz.plot_train_val_metrics(
+        ctx.history, ctx.charts_dir, method=method, config=config
+    )
     net.eval()
     net_inner = net.module if hasattr(net, "module") else net
     n_show = max(1, ctx.args.viz_num_samples)
@@ -803,7 +876,7 @@ def run_full_visualisation(
             images = images.cuda() / 255.0
             img_dark = build_dark_batch(images)
             for i in range(images.shape[0]):
-                pb, ps, pl = infer_detections(net, img_dark[i])
+                pb, ps, pl = infer_detections(net, img_dark[i], conf_thr=0.5)
                 h_, w_ = (img_dark.shape[2], img_dark.shape[3])
                 gt = (
                     targets[i].cpu().numpy()
@@ -834,11 +907,15 @@ def run_full_visualisation(
                     )
                 )
                 if len(day_samples) < n_show:
-                    pb_d, ps_d, pl_d = infer_detections(net, images[i])
+                    pb_d, ps_d, pl_d = infer_detections(
+                        net, images[i], conf_thr=0.5
+                    )
                     day_samples.append(
                         dict(
                             image=(
-                                images[i].detach().cpu().numpy().transpose(1, 2, 0)
+                                images[i].detach().cpu().numpy().transpose(1, 2, 0)[
+                                    :, :, ::-1
+                                ]
                                 * 255
                             )
                             .clip(0, 255)
@@ -857,7 +934,9 @@ def run_full_visualisation(
                     synth_night_samples.append(
                         dict(
                             image=(
-                                img_dark[i].detach().cpu().numpy().transpose(1, 2, 0)
+                                img_dark[i].detach().cpu().numpy().transpose(1, 2, 0)[
+                                    :, :, ::-1
+                                ]
                                 * 255
                             )
                             .clip(0, 255)
@@ -882,7 +961,7 @@ def run_full_visualisation(
         ctx.charts_dir,
         method=method,
         config=config,
-        classes=ctx.class_names + ("background",),
+        classes=list(ctx.class_names) + ["background"],
     )
     viz.plot_pr_curve(
         scores, matched, n_gt, ctx.charts_dir, method=method, config=config
@@ -950,8 +1029,15 @@ def run_full_visualisation(
             def _items_from_batch(batch: torch.Tensor, tag: str):
                 items = []
                 for i in range(min(n_show, batch.size(0))):
+                    # batch is BGR-CHW (training convention); swap to RGB
+                    # for display only — the model tensor stays BGR.
                     rgb = (
-                        (batch[i].detach().cpu().numpy().transpose(1, 2, 0) * 255)
+                        (
+                            batch[i].detach().cpu().numpy().transpose(1, 2, 0)[
+                                :, :, ::-1
+                            ]
+                            * 255
+                        )
                         .clip(0, 255)
                         .astype(np.uint8)
                     )
@@ -1002,7 +1088,6 @@ def _detect_metrics_from_cm(cm: np.ndarray) -> Dict[str, float]:
     fp = fp_class + fp_bg
     fn = int(cm[:nc, nc].sum()) + fp_class
     accuracy = tp / max(tp + fp + fn, 1)
-    from sklearn.metrics import precision_recall_fscore_support
 
     y_true: List[int] = []
     y_pred: List[int] = []
@@ -1080,6 +1165,13 @@ def _decode_per_image(
                 boxes.append(det[b, cls_id, k, 1:].tolist())
                 scores.append(s)
                 labels.append(cls_id)
+        # Per-class NMS to drop redundant overlapping predictions.
+        pb, ps, pl = multiclass_nms(
+            np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
+            np.asarray(scores, dtype=np.float32).reshape(-1),
+            np.asarray(labels, dtype=np.int32).reshape(-1),
+            iou_thr=0.35,
+        )
         gt = (
             targets[b].cpu().numpy()
             if hasattr(targets[b], "cpu")
@@ -1097,13 +1189,9 @@ def _decode_per_image(
             gt_labels = np.zeros((0,), dtype=np.int32)
         out.append(
             {
-                "pred_boxes": (
-                    np.asarray(boxes, dtype=np.float32)
-                    if boxes
-                    else np.zeros((0, 4), dtype=np.float32)
-                ),
-                "pred_scores": np.asarray(scores, dtype=np.float32),
-                "pred_labels": np.asarray(labels, dtype=np.int32),
+                "pred_boxes": pb,
+                "pred_scores": ps,
+                "pred_labels": pl,
                 "gt_boxes": gt_boxes,
                 "gt_labels": gt_labels,
             }
@@ -1227,6 +1315,37 @@ def validate(
     )
     m = _detect_metrics_from_cm(cm)
     _, _, _, mAP = viz._pr_from_scores(np.asarray(scores), np.asarray(matched), n_gt)
+
+    # --- TRAIN-subset detection metrics (same pipeline, capped) ---------
+    # Lets us overlay train vs val curves on one chart and spot the
+    # train/val gap (overfitting) per metric.
+    tr_per_image: List[Dict[str, np.ndarray]] = []
+    max_train_eval = 20
+    with torch.no_grad():
+        for tb, (timg, ttgt, _tp) in enumerate(ctx.train_loader):
+            if tb >= max_train_eval:
+                break
+            timg = timg.cuda() / 255.0
+            tdark = build_dark_batch(timg)
+            tout, _ = test_forward(tdark)
+            tr_per_image.extend(_decode_per_image(tout, ttgt, net))
+    if tr_per_image:
+        ts, tm_, tng, tcm = viz.evaluate_detections(
+            tr_per_image, iou_thr=0.5, score_thr_cm=0.5,
+            num_classes=ctx.args.nc,
+        )
+        tmet = _detect_metrics_from_cm(tcm)
+        _, _, _, tmap = viz._pr_from_scores(
+            np.asarray(ts), np.asarray(tm_), tng
+        )
+    else:
+        tmet = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        tmap = 0.0
+    ctx.history["train_precision"].append((epoch, float(tmet["precision"])))
+    ctx.history["train_recall"].append((epoch, float(tmet["recall"])))
+    ctx.history["train_f1"].append((epoch, float(tmet["f1"])))
+    ctx.history["train_map"].append((epoch, float(tmap)))
+
     elapsed = time.time() - t0
     table = _format_val_table(
         epoch,
@@ -1235,12 +1354,17 @@ def validate(
             ("Validation loss", f"{val_loss:.4f}"),
             ("PAL2 localization loss", f"{val_loc:.4f}"),
             ("PAL2 confidence loss", f"{val_conf:.4f}"),
-            ("§", "Detection metrics"),
+            ("§", "Detection metrics (val)"),
             ("Accuracy", f"{m['accuracy']:.4f}"),
             ("Precision", f"{m['precision']:.4f}"),
             ("Recall", f"{m['recall']:.4f}"),
             ("F1 score", f"{m['f1']:.4f}"),
             ("mAP @ IoU 0.5", f"{mAP:.4f}"),
+            ("§", "Detection metrics (train subset)"),
+            ("Train precision", f"{tmet['precision']:.4f}"),
+            ("Train recall", f"{tmet['recall']:.4f}"),
+            ("Train F1 score", f"{tmet['f1']:.4f}"),
+            ("Train mAP @ IoU 0.5", f"{tmap:.4f}"),
             (
                 "True / False pos / False neg",
                 f"{m['tp']} / {m['fp']} / {m['fn']}",
@@ -1434,6 +1558,37 @@ def train_one_epoch(
             + loss_wreg
             + loss_entropy
         )
+        if not torch.isfinite(loss):
+            ctx.nan_skips = getattr(ctx, "nan_skips", 0) + 1
+            bad = {
+                k: float(v.detach())
+                for k, v in (
+                    ("pal1_loc", loss_l_pa1l), ("pal1_conf", loss_c_pal1),
+                    ("pal2_loc", loss_l_pa12), ("pal2_conf", loss_c_pal2),
+                    ("enhance", loss_enhance), ("enhance2", loss_enhance2),
+                    ("mutual", loss_mutual_src_srcdark),
+                    ("kl_st", loss_kl_src_tgt),
+                    ("target_unsup", loss_target_unsup),
+                    ("wreg", loss_wreg), ("entropy", loss_entropy),
+                )
+                if not torch.isfinite(v.detach()).all()
+            }
+            if is_rank0:
+                print(
+                    f"[SKIP iter {iteration}] non-finite loss; "
+                    f"bad components={bad} (consecutive_nan={ctx.nan_skips})"
+                )
+            if ctx.nan_skips >= 50:
+                raise RuntimeError(
+                    f"50 consecutive NaN/inf iterations starting around "
+                    f"iter {iteration}; aborting to avoid wasting compute. "
+                    f"Last bad components: {bad}. "
+                    f"Restart from a clean (non-NaN) checkpoint or scratch."
+                )
+            optimizer.zero_grad(set_to_none=True)
+            iteration += 1
+            continue
+        ctx.nan_skips = 0
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=35, norm_type=2)
         optimizer.step()
@@ -1576,6 +1731,10 @@ def train(ctx: TrainingContext) -> None:
         if ctx.local_rank == 0:
             print("Initializing weights...")
         init_random_layers(net)
+        if getattr(cfg, "FOCAL", None) is not None and cfg.FOCAL.ENABLED:
+            init_focal_bias([net.conf_pal1, net.conf_pal2], num_classes)
+            if ctx.local_rank == 0:
+                print("[focal] applied RetinaNet classification bias prior")
     ctx.wreg_ref = snapshot_wreg_ref(net)
     if ctx.local_rank == 0:
         print(
@@ -1588,13 +1747,49 @@ def train(ctx: TrainingContext) -> None:
         momentum=args_ns.momentum,
         weight_decay=args_ns.weight_decay,
     )
-    if args_ns.cuda and args_ns.multigpu:
-        net = torch.nn.parallel.DistributedDataParallel(
-            net.cuda(), find_unused_parameters=False
-        )
-        net_enh = torch.nn.parallel.DistributedDataParallel(net_enh.cuda())
+    multigpu = len(parse_gpu_ids(getattr(args_ns, "gpu_ids", 0))) > 1
+    if args_ns.cuda:
+        # Always move models to GPU when cuda is on; only wrap in DDP when
+        # more than one gpu_id is requested (single-GPU keeps the bare net,
+        # otherwise the model stayed on CPU while inputs were on CUDA).
+        net = net.cuda()
+        net_enh = net_enh.cuda()
+        if multigpu:
+            net = torch.nn.parallel.DistributedDataParallel(
+                net, find_unused_parameters=False
+            )
+            net_enh = torch.nn.parallel.DistributedDataParallel(net_enh)
         cudnn.benchmark = True
-    criterion = MultiBoxLoss(cfg, args_ns.cuda)
+    focal_loss_fn = None
+    if getattr(cfg, "FOCAL", None) is not None and cfg.FOCAL.ENABLED:
+        alpha = compute_focal_alpha(
+            args_ns.train_file, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
+        )
+        focal_loss_fn = FocalLoss(
+            gamma=cfg.FOCAL.GAMMA, alpha=alpha, num_classes=num_classes
+        )
+        if ctx.local_rank == 0:
+            shown = (
+                None if alpha is None else [round(float(a), 4) for a in alpha]
+            )
+            print(
+                f"[focal] enabled gamma={cfg.FOCAL.GAMMA} "
+                f"alpha(bg,fg...)={shown} (None=uniform)"
+            )
+    from losses.iou import build_box_loss
+
+    box_loss_name = getattr(args_ns, "box_loss", "smooth_l1")
+    box_loss_fn = build_box_loss(box_loss_name)
+    if ctx.local_rank == 0:
+        print(
+            f"[box-loss] localisation = {box_loss_name} "
+            f"({'IoU-family' if box_loss_fn is not None else 'Smooth-L1'})"
+        )
+    criterion = MultiBoxLoss(
+        cfg, args_ns.cuda,
+        cls_loss_fn=focal_loss_fn,
+        box_loss_fn=box_loss_fn,
+    )
     criterion_enh = EnhanceLoss()
     if ctx.local_rank == 0:
         print("Using the specified args:")
@@ -1702,8 +1897,11 @@ def main() -> None:
         arch, backbone = resolve_arch_and_backbone(args_ns)
         setup_logging(arch, backbone, args_ns.num_exp, args_ns)
     setup_distributed(local_rank, args_ns.cuda)
-    ctx = TrainingContext(args_ns, local_rank)
-    train(ctx)
+    try:
+        ctx = TrainingContext(args_ns, local_rank)
+        train(ctx)
+    finally:
+        teardown_distributed()
 
 
 if __name__ == "__main__":

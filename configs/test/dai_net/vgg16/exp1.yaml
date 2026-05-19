@@ -1,31 +1,30 @@
-# DAI-Net evaluation / Grad-CAM config.
-# Path convention: configs/test/<architecture>/<backbone>/<num_exp>.yaml
-
-architecture: dai_net   # → charts/test/<arch>/<backbone>/<num_exp>/
+architecture: dai_net
 num_exp: exp1
 
-# ── Checkpoint to evaluate ────────────────────────────────────────────
-# Points at the file produced by training (best F1 by default).
-weights: weights/dai_net/vgg16/best_model.pth
+weights: weights/dai_net/vgg16/exp1/best_model.pth
 
-# ── Compute ───────────────────────────────────────────────────────────
 cuda: true
+gpu_ids: 0
+batch_size: 4
 
-# ── Dataset ───────────────────────────────────────────────────────────
-val_file: ./dataset/source_val.txt
+test_file: ./dataset/source_test.txt
+
+export_predicted_source_path: null
+export_predicted_target_path: /home/caotulab/wd_nhan/data/images/3/predicted
+
 nc: 3
-source_folder: /media/caotulab/303A225B3A221DFA/Nhan/data/images/source
-target_folder: /media/caotulab/303A225B3A221DFA/Nhan/data/images/target
+names: ['crack', 'missing_items', 'broken_sleeper']
 
-# ── I/O ───────────────────────────────────────────────────────────────
-charts_dir: ./charts    # final dir: <charts_dir>/test/<architecture>/<backbone>/<num_exp>/
+source_folder: /home/caotulab/wd_nhan/data/images/3/source
+target_folder: /home/caotulab/wd_nhan/data/images/3/target
+
+charts_dir: ./charts
+records_dir: ./records
 mode_name: test
 
-# ── Grad-CAM (utils/visualize.py main) ────────────────────────────────
-day_folder: ''          # leave empty to sample from WIDER val automatically
-num_pairs: 3            # number of source/target image pairs to render
-target_layer_idx: 22    # vgg[22] — the layer to extract activations from
-forward_end_idx: 30     # forward up to vgg[30-1] for feature energy
-
-# ── Visualisation ─────────────────────────────────────────────────────
 viz_num_samples: 6
+
+# Detection thresholds
+iou_thr: 0.5          
+score_thr_cm: 0.5     
+nms_iou_thr: 0.35     

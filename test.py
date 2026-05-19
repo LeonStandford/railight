@@ -14,11 +14,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 import numpy as np
 import torch
+import warnings as _warnings
+_warnings.filterwarnings(
+    "ignore",
+    message=r".*set_default_tensor_type\(\) is deprecated.*",
+    category=UserWarning,
+)
 import torch.utils.data as data
 import yaml
 from tqdm import tqdm
+import torch.nn.functional as F
+
 from data.config import cfg
 from data.source_domain import SourceDomainDetection, detection_collate
+from data.target_domain import TargetUnlabeledDataset
 from models.factory import build_net
 from utils import visualize as viz
 from train import (
@@ -40,15 +49,21 @@ _TEST_DEFAULTS: Dict[str, Any] = {
     "num_workers": 0,
     "cuda": True,
     "val_file": "./dataset/source_val.txt",
+    "test_file": "./dataset/source_test.txt",
     "nc": 3,
+    "names": None,
     "source_folder": "",
     "target_folder": "/media/caotulab/303A225B3A221DFA/Nhan/data/images/target",
     "charts_dir": "./charts",
+    "records_dir": "./records",
     "mode_name": "test",
     "viz_num_samples": 6,
     "weights": None,
     "iou_thr": 0.5,
     "score_thr_cm": 0.5,
+    "nms_iou_thr": 0.35,
+    "export_predicted_source_path": None,
+    "export_predicted_target_path": None,
 }
 
 
@@ -102,16 +117,115 @@ def _load_state_dict(net: torch.nn.Module, weights_path: str) -> None:
     net.load_state_dict(state)
 
 
+def _bgr_chw_to_rgb_uint8(tensor_chw: torch.Tensor) -> np.ndarray:
+    return (
+        (tensor_chw.detach().cpu().numpy().transpose(1, 2, 0)[:, :, ::-1] * 255)
+        .clip(0, 255)
+        .astype(np.uint8)
+    )
+
+
+def _export_yolo_predictions(
+    per_image: List[Dict[str, np.ndarray]],
+    img_paths: List[str],
+    out_dir: str,
+    nc: int,
+) -> int:
+    os.makedirs(out_dir, exist_ok=True)
+    for item, ip in zip(per_image, img_paths):
+        stem = os.path.splitext(os.path.basename(ip))[0]
+        pb = np.asarray(item.get("pred_boxes", []), dtype=np.float64).reshape(-1, 4)
+        pl = np.asarray(item.get("pred_labels", []), dtype=np.int64).reshape(-1)
+        lines: List[str] = []
+        for (x1, y1, x2, y2), lab in zip(pb, pl):
+            cls = int(lab) - 1
+            if cls < 0 or cls >= nc:
+                continue
+            cx = float(np.clip((x1 + x2) / 2.0, 0.0, 1.0))
+            cy = float(np.clip((y1 + y2) / 2.0, 0.0, 1.0))
+            bw = float(np.clip(x2 - x1, 0.0, 1.0))
+            bh = float(np.clip(y2 - y1, 0.0, 1.0))
+            lines.append(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        with open(os.path.join(out_dir, f"{stem}.txt"), "w") as fh:
+            fh.write("\n".join(lines))
+    return len(per_image)
+
+
+def _predict_target_folder(
+    net: torch.nn.Module,
+    target_folder: str,
+    args_ns: argparse.Namespace,
+    use_cuda: bool,
+) -> Tuple[List[Dict[str, np.ndarray]], List[str]]:
+    tgt_ds = TargetUnlabeledDataset(target_folder, size=cfg.INPUT_SIZE)
+    if len(tgt_ds) == 0:
+        return ([], [])
+    tgt_loader = data.DataLoader(
+        tgt_ds,
+        batch_size=args_ns.batch_size,
+        shuffle=False,
+        num_workers=args_ns.num_workers,
+        drop_last=False,
+    )
+
+    conf_thr = float(args_ns.score_thr_cm)
+    nms_iou_thr = float(args_ns.nms_iou_thr)
+    inv_size = 1.0 / float(cfg.INPUT_SIZE)
+    per_image: List[Dict[str, np.ndarray]] = []
+    paths = list(tgt_ds.paths)
+    pbar = tqdm(
+        tgt_loader,
+        total=len(tgt_loader),
+        desc="Predicting target",
+        dynamic_ncols=True,
+        unit="batch",
+        colour="magenta",
+    )
+    for t_imgs in pbar:
+        if use_cuda:
+            t_imgs = t_imgs.cuda()
+        t_imgs = t_imgs / 255.0
+        for i in range(t_imgs.size(0)):
+            pb, ps, pl = infer_detections(
+                net, t_imgs[i], conf_thr=conf_thr, nms_iou_thr=nms_iou_thr
+            )
+            if pb.size:
+                pb = pb.astype(np.float32) * inv_size
+            per_image.append(
+                {
+                    "pred_boxes": pb,
+                    "pred_scores": ps,
+                    "pred_labels": pl,
+                    "gt_boxes": np.zeros((0, 4), dtype=np.float32),
+                    "gt_labels": np.zeros((0,), dtype=np.int32),
+                }
+            )
+    return (per_image, paths[: len(per_image)])
+
+
 def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     use_cuda = bool(args_ns.cuda) and torch.cuda.is_available()
     if use_cuda:
-        torch.set_default_tensor_type("torch.cuda.FloatTensor")
-    nc_yaml, class_names = load_dataset_meta(args_ns.source_folder, args_ns.nc)
-    if nc_yaml != args_ns.nc:
-        print(
-            f"[WARN] nc mismatch: test config nc={args_ns.nc} but {args_ns.source_folder}/data.yaml has nc={nc_yaml}. Using data.yaml."
+        torch.set_default_tensor_type("torch.cuda.FloatTensor")  # noqa: deprecated-ok
+
+    cfg_names = getattr(args_ns, "names", None) or getattr(
+        args_ns, "class_names", None
+    )
+    if cfg_names:
+        class_names = tuple(str(x) for x in cfg_names)
+        args_ns.nc = len(class_names)
+        print(f"[data] class names from config: {list(class_names)}")
+    else:
+        nc_yaml, class_names = load_dataset_meta(
+            args_ns.source_folder, args_ns.nc
         )
-    args_ns.nc = nc_yaml
+        if nc_yaml != args_ns.nc:
+            print(
+                f"[WARN] nc mismatch: config nc={args_ns.nc} but "
+                f"{args_ns.source_folder}/data.yaml has nc={nc_yaml}. "
+                f"Using data.yaml."
+            )
+        args_ns.nc = nc_yaml
     num_classes = args_ns.nc + 1
     cfg.NUM_CLASSES = num_classes
     print(f"[data] classes ({len(class_names)}): {list(class_names)}")
@@ -122,7 +236,10 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     if use_cuda:
         net = net.cuda()
     net.eval()
-    val_ds = SourceDomainDetection(args_ns.val_file, mode="val")
+    eval_file = getattr(args_ns, "test_file", None) or args_ns.val_file
+    if not os.path.isfile(eval_file):
+        raise FileNotFoundError(f"test/val list not found: {eval_file}")
+    val_ds = SourceDomainDetection(eval_file, mode="val")
     val_loader = data.DataLoader(
         val_ds,
         batch_size=args_ns.batch_size,
@@ -131,8 +248,12 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         shuffle=False,
         pin_memory=use_cuda,
     )
-    print(f"[data] val samples: {len(val_ds)} | batch_size: {args_ns.batch_size}")
+    print(
+        f"[data] test set: {eval_file} | {len(val_ds)} samples "
+        f"| batch_size: {args_ns.batch_size}"
+    )
     per_image: List[Dict[str, np.ndarray]] = []
+    all_img_paths: List[str] = []
     pbar = tqdm(
         val_loader,
         total=len(val_loader),
@@ -143,14 +264,182 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     )
     t0 = time.time()
     with torch.no_grad():
-        for images, targets, _ in pbar:
+        for images, targets, img_paths in pbar:
             if use_cuda:
                 images = images.cuda()
             images = images / 255.0
             img_dark = build_dark_batch(images)
             out, _ = net.test_forward(img_dark)
             per_image.extend(_decode_per_image(out, targets, net))
+            all_img_paths.extend(list(img_paths))
     elapsed = time.time() - t0
+
+    src_export_dir = getattr(args_ns, "export_predicted_source_path", None)
+    if src_export_dir:
+        n = _export_yolo_predictions(
+            per_image, all_img_paths, str(src_export_dir), int(args_ns.nc)
+        )
+        print(f"[export] wrote {n} YOLO source prediction files to {src_export_dir}")
+
+    tgt_export_dir = getattr(args_ns, "export_predicted_target_path", None)
+    tgt_dir_for_export = getattr(args_ns, "target_folder", "")
+    if tgt_export_dir:
+        if tgt_dir_for_export and os.path.isdir(tgt_dir_for_export):
+            tgt_pred_per_image, tgt_pred_paths = _predict_target_folder(
+                net, tgt_dir_for_export, args_ns, use_cuda
+            )
+            n = _export_yolo_predictions(
+                tgt_pred_per_image,
+                tgt_pred_paths,
+                str(tgt_export_dir),
+                int(args_ns.nc),
+            )
+            print(f"[export] wrote {n} YOLO target prediction files to {tgt_export_dir}")
+        else:
+            print(
+                f"[WARN] export_predicted_target_path set but target_folder "
+                f"{tgt_dir_for_export!r} missing — skipping target export."
+            )
+
+    feat_day: List[float] = []         
+    feat_night: List[float] = []      
+    feat_before_day: List[float] = []  
+    feat_before_night: List[float] = []  
+    kl_vals: List[float] = []
+    ce_vals: List[float] = []          
+    _src_bank: List[torch.Tensor] = []  
+    _tgt_bank: List[torch.Tensor] = []
+    _src_before_bank: List[torch.Tensor] = []  
+    _tgt_before_bank: List[torch.Tensor] = []
+    _src_prob: List[torch.Tensor] = []  
+    _tgt_prob: List[torch.Tensor] = []
+
+    def _collect(imgs, feat_acc, fbank, pbank, before_acc, before_bank):
+        emb = net.embed_features(imgs)  
+        fbank.append(emb.detach().float().cpu())
+        before_bank.append(
+            F.adaptive_avg_pool2d(imgs, 8)
+            .flatten(start_dim=1)
+            .detach()
+            .float()
+            .cpu()
+        )
+
+        before_acc.extend(
+            imgs.flatten(start_dim=1).mean(dim=1).detach().cpu().tolist()
+        )
+        feat_acc += emb.mean(dim=1).detach().cpu().tolist()
+        o, _o2 = net.test_forward(imgs)
+        c = o[4]                   
+       
+        pbank.append(
+            F.softmax(c, dim=-1).mean(dim=1).detach().float().cpu()
+        )
+
+    try:
+        torch.set_default_tensor_type("torch.FloatTensor") 
+        # ---- Pass 1: ALL source-val (day) ----
+        with torch.no_grad():
+            for s_imgs, _t, _p in tqdm(
+                val_loader, total=len(val_loader),
+                desc="Dist pass 1/2 (source-val / day)",
+                dynamic_ncols=True, unit="batch", colour="cyan",
+            ):
+                if use_cuda:
+                    s_imgs = s_imgs.cuda()
+                _collect(
+                    s_imgs / 255.0, feat_day, _src_bank, _src_prob,
+                    feat_before_day, _src_before_bank,
+                )
+
+        # ---- Pass 2: ALL target (night) ----
+        tgt_dir = getattr(args_ns, "target_folder", "")
+        if tgt_dir and os.path.isdir(tgt_dir):
+            tgt_ds = TargetUnlabeledDataset(tgt_dir, size=cfg.INPUT_SIZE)
+            tgt_loader = data.DataLoader(
+                tgt_ds, batch_size=args_ns.batch_size, shuffle=False,
+                num_workers=args_ns.num_workers, drop_last=False,
+            )
+            with torch.no_grad():
+                for t_imgs in tqdm(
+                    tgt_loader, total=len(tgt_loader),
+                    desc="Dist pass 2/2 (target / night)",
+                    dynamic_ncols=True, unit="batch", colour="cyan",
+                ):
+                    if use_cuda:
+                        t_imgs = t_imgs.cuda()
+                    _collect(
+                        t_imgs / 255.0, feat_night, _tgt_bank, _tgt_prob,
+                        feat_before_night, _tgt_before_bank,
+                    )
+        else:
+            print(
+                f"[WARN] target_folder {tgt_dir!r} missing — night "
+                f"distribution / KL skipped."
+            )
+
+
+        if _src_bank and _tgt_bank:
+            src = torch.cat(_src_bank, dim=0)
+            tgt = torch.cat(_tgt_bank, dim=0)
+            kl_dev = next(net.parameters()).device
+            bs = max(2, int(args_ns.batch_size))
+            n_draw = min(300, max(1, min(len(src), len(tgt)) // bs))
+            rng = np.random.RandomState(0)
+            with torch.no_grad():
+                for _ in range(n_draw):
+                    si = rng.randint(0, len(src), size=bs)
+                    ti = rng.randint(0, len(tgt), size=bs)
+                    a = src[torch.from_numpy(si)].to(kl_dev)
+                    b = tgt[torch.from_numpy(ti)].to(kl_dev)
+                    kl = net.KL(a, b) + net.KL(b, a)
+                    kl_vals.append(float(kl.detach().cpu()))
+
+        if _src_prob and _tgt_prob:
+            pd = torch.cat(_src_prob, dim=0).clamp_min(1e-9)
+            pn = torch.cat(_tgt_prob, dim=0).clamp_min(1e-9)
+            rng2 = np.random.RandomState(1)
+            n_ce = min(2000, max(1, min(len(pd), len(pn))))
+            di = rng2.randint(0, len(pd), size=n_ce)
+            ni = rng2.randint(0, len(pn), size=n_ce)
+            ce = -(pd[torch.from_numpy(di)]
+                   * pn[torch.from_numpy(ni)].log()).sum(dim=-1)
+            ce_vals += ce.tolist()
+    except Exception as e:
+        import traceback
+
+        print(f"[WARN] distribution analysis FAILED: {type(e).__name__}: {e}")
+        traceback.print_exc()
+    finally:
+        if use_cuda:
+            torch.set_default_tensor_type(  
+                "torch.cuda.FloatTensor"
+            )
+    print(
+        f"[dist] collected: src_imgs={len(feat_day)} "
+        f"tgt_imgs={len(feat_night)} kl_draws={len(kl_vals)} "
+        f"ce_pairs={len(ce_vals)}"
+    )
+
+    def _stats(name, arr):
+        a = np.asarray(arr, dtype=np.float64)
+        a = a[np.isfinite(a)]
+        if a.size == 0:
+            return {f"{name}_mean": 0.0, f"{name}_median": 0.0,
+                    f"{name}_std": 0.0, f"{name}_p10": 0.0,
+                    f"{name}_p90": 0.0, f"{name}_n": 0}
+        return {
+            f"{name}_mean": float(a.mean()),
+            f"{name}_median": float(np.median(a)),
+            f"{name}_std": float(a.std()),
+            f"{name}_p10": float(np.percentile(a, 10)),
+            f"{name}_p90": float(np.percentile(a, 90)),
+            f"{name}_n": int(a.size),
+        }
+
+    dist_stats = {}
+    dist_stats.update(_stats("kl", kl_vals))
+    dist_stats.update(_stats("ce", ce_vals))
     scores, matched, n_gt, cm = viz.evaluate_detections(
         per_image,
         iou_thr=float(args_ns.iou_thr),
@@ -159,20 +448,45 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     )
     m = _detect_metrics_from_cm(cm)
     _, _, _, mAP = viz._pr_from_scores(np.asarray(scores), np.asarray(matched), n_gt)
+    _tp, _fp, _fn = m["tp"], m["fp"], m["fn"]
+    _tot = max(_tp + _fp + _fn, 1)
     table = _format_val_table(
         "test",
         [
+            ("§", "Setup"),
             ("weights", os.path.basename(args_ns.weights)),
             ("n_samples", f"{len(val_ds)}"),
             ("n_gt", f"{n_gt}"),
+            ("iou_thr", f"{float(args_ns.iou_thr):.2f}"),
+            ("score_thr", f"{float(args_ns.score_thr_cm):.2f}"),
+            ("§", "Detection metrics"),
             ("accuracy", f"{m['accuracy']:.4f}"),
             ("precision", f"{m['precision']:.4f}"),
             ("recall", f"{m['recall']:.4f}"),
             ("f1", f"{m['f1']:.4f}"),
-            ("mAP@0.5", f"{mAP:.4f}"),
-            ("TP/FP/FN", f"{m['tp']}/{m['fp']}/{m['fn']}"),
-            ("iou_thr", f"{float(args_ns.iou_thr):.2f}"),
-            ("score_thr", f"{float(args_ns.score_thr_cm):.2f}"),
+            (f"mAP@{float(args_ns.iou_thr):.2f}", f"{mAP:.4f}"),
+            ("TP/FP/FN (count)", f"{_tp}/{_fp}/{_fn}"),
+            (
+                "TP/FP/FN (normalized)",
+                f"{_tp / _tot:.3f}/{_fp / _tot:.3f}/{_fn / _tot:.3f}",
+            ),
+            ("§", "KL divergence (source↔target)"),
+            ("KL mean", f"{dist_stats['kl_mean']:.4f}"),
+            ("KL median", f"{dist_stats['kl_median']:.4f}"),
+            ("KL std", f"{dist_stats['kl_std']:.4f}"),
+            (
+                "KL p10/p90",
+                f"{dist_stats['kl_p10']:.4f}/{dist_stats['kl_p90']:.4f}",
+            ),
+            ("§", "Cross-entropy H(day, night)"),
+            ("CE mean", f"{dist_stats['ce_mean']:.4f}"),
+            ("CE median", f"{dist_stats['ce_median']:.4f}"),
+            ("CE std", f"{dist_stats['ce_std']:.4f}"),
+            (
+                "CE p10/p90",
+                f"{dist_stats['ce_p10']:.4f}/{dist_stats['ce_p90']:.4f}",
+            ),
+            ("§", "Timing"),
             ("time(s)", f"{elapsed:.2f}"),
         ],
     )
@@ -193,12 +507,13 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             "iou_thr": float(args_ns.iou_thr),
         },
     )
+    
     viz.plot_confusion_matrix(
         cm,
         charts_dir,
         method=method,
         config=config_dict,
-        classes=class_names + ("background",),
+        classes=list(class_names) + ["background"],
     )
     viz.plot_pr_curve(
         scores, matched, n_gt, charts_dir, method=method, config=config_dict
@@ -206,8 +521,96 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     viz.plot_recall_f1_curve(
         scores, matched, n_gt, charts_dir, method=method, config=config_dict
     )
+    viz.plot_test_distributions(
+        feat_day, feat_night, kl_vals, ce_vals,
+        charts_dir, method=method, config=config_dict,
+        feat_before_day=feat_before_day,
+        feat_before_night=feat_before_night,
+    )
+
+    try:
+        if _src_before_bank and _tgt_before_bank:
+            viz.plot_domain_tsne(
+                torch.cat(_src_before_bank, dim=0).numpy(),
+                torch.cat(_tgt_before_bank, dim=0).numpy(),
+                charts_dir, "tsne_before.png",
+                "CNN representations before DSFD.extract_features",
+                method=method, config=config_dict,
+            )
+        if _src_bank and _tgt_bank:
+            viz.plot_domain_tsne(
+                torch.cat(_src_bank, dim=0).numpy(),
+                torch.cat(_tgt_bank, dim=0).numpy(),
+                charts_dir, "tsne_after.png",
+                "CNN representations after DSFD.extract_features",
+                method=method, config=config_dict,
+            )
+    except Exception as e:
+        print(f"[WARN] before/after t-SNE scatter failed: {e}")
+
+    try:
+        import torch.nn as _nn
+
+        conv_layers = [m for m in net.vgg if isinstance(m, _nn.Conv2d)]
+        if conv_layers:
+            target_layer = conv_layers[-1]
+
+            n_show = 1
+
+            def _add(items, batch, tag):
+                for i in range(batch.size(0)):
+                    if len(items) >= n_show:
+                        break
+                    items.append({
+                        "image": _bgr_chw_to_rgb_uint8(batch[i]),
+                        "tensor": batch[i:i + 1].detach().clone(),
+                        "title": f"{tag}{len(items)}",
+                    })
+
+            # Source (day): accumulate n_show across batches.
+            src_items: list = []
+            for s_b, _t, _p in val_loader:
+                if use_cuda:
+                    s_b = s_b.cuda()
+                _add(src_items, s_b / 255.0, "src")
+                if len(src_items) >= n_show:
+                    break
+
+            tgt_items: list = []
+            tgt_dir = getattr(args_ns, "target_folder", "")
+            if tgt_dir and os.path.isdir(tgt_dir):
+                _tds = TargetUnlabeledDataset(tgt_dir, size=cfg.INPUT_SIZE)
+                _tl = data.DataLoader(
+                    _tds, batch_size=args_ns.batch_size,
+                    shuffle=False, num_workers=0,
+                )
+                for t_b in _tl:
+                    if use_cuda:
+                        t_b = t_b.cuda()
+                    _add(tgt_items, t_b / 255.0, "tgt")
+                    if len(tgt_items) >= n_show:
+                        break
+
+            viz.plot_gradcam_comparison(
+                net, target_layer, src_items, tgt_items,
+                charts_dir,
+                fname="gradcam_source_vs_target.png",
+                method=method, config=config_dict,
+                score_fn=lambda o: o[..., 1:].max(),
+                forward_fn=lambda m, t: m.test_forward(t)[0][4],
+                layer_name="vgg last conv",
+            )
+    except Exception as e:
+        print(f"[WARN] grad-cam viz failed: {e}")
+
     day_samples, synth_night_samples = _collect_paired_samples(
-        net, val_loader, args_ns.viz_num_samples, use_cuda, class_names
+        net,
+        val_loader,
+        args_ns.viz_num_samples,
+        float(args_ns.score_thr_cm),
+        float(args_ns.nms_iou_thr),
+        use_cuda,
+        class_names,
     )
     if day_samples:
         viz.plot_sample_predictions(
@@ -227,18 +630,28 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             config=config_dict,
             title_suffix="(val + Dark ISP)",
         )
-    real_night_samples = collect_target_samples(
-        net, args_ns.target_folder, args_ns.viz_num_samples, class_names
-    )
-    if real_night_samples:
-        viz.plot_sample_predictions(
-            real_night_samples,
-            charts_dir,
-            "samples_real_night.png",
-            method=method,
-            config=config_dict,
-            title_suffix="(real target / night)",
+
+    if getattr(args_ns, "target_folder", "") and os.path.isdir(
+        args_ns.target_folder
+    ):
+        real_night_samples = collect_target_samples(
+            net,
+            args_ns.target_folder,
+            args_ns.viz_num_samples,
+            class_names,
+            conf_thr=float(args_ns.score_thr_cm),
+            nms_iou_thr=float(args_ns.nms_iou_thr),
         )
+        if real_night_samples:
+            viz.plot_sample_predictions(
+                real_night_samples,
+                charts_dir,
+                "samples_real_night.png",
+                method=method,
+                config=config_dict,
+                title_suffix="(real target / night — qualitative)",
+            )
+
     metrics = dict(
         accuracy=m["accuracy"],
         precision=m["precision"],
@@ -256,14 +669,90 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     )
     with open(os.path.join(charts_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
-    print(f"[viz] charts + metrics saved to {charts_dir}")
+
+    rec_dir = os.path.join(
+        getattr(args_ns, "records_dir", "./records"),
+        args_ns.architecture,
+        backbone_dir,
+    )
+    os.makedirs(rec_dir, exist_ok=True)
+    rec_path = os.path.join(rec_dir, f"{args_ns.num_exp}_test.csv")
+    import csv as _csv
+    import datetime as _dt
+
+    _tot_cnt = max(m["tp"] + m["fp"] + m["fn"], 1)
+    stat_keys = [
+        "kl_mean", "kl_median", "kl_std", "kl_p10", "kl_p90",
+        "ce_mean", "ce_median", "ce_std", "ce_p10", "ce_p90",
+    ]
+    cols = [
+        "timestamp", "weights", "n_samples", "n_gt",
+        "accuracy", "precision", "recall", "f1", "mAP",
+        "tp", "fp", "fn", "tp_norm", "fp_norm", "fn_norm",
+        *stat_keys,
+        "iou_thr", "score_thr", "elapsed_s",
+    ]
+    row = {
+        "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+        "weights": os.path.basename(args_ns.weights),
+        "n_samples": len(val_ds),
+        "n_gt": int(n_gt),
+        "accuracy": f"{m['accuracy']:.6f}",
+        "precision": f"{m['precision']:.6f}",
+        "recall": f"{m['recall']:.6f}",
+        "f1": f"{m['f1']:.6f}",
+        "mAP": f"{float(mAP):.6f}",
+        "tp": m["tp"], "fp": m["fp"], "fn": m["fn"],
+        "tp_norm": f"{m['tp'] / _tot_cnt:.6f}",
+        "fp_norm": f"{m['fp'] / _tot_cnt:.6f}",
+        "fn_norm": f"{m['fn'] / _tot_cnt:.6f}",
+        **{k: f"{dist_stats.get(k, 0.0):.6f}" for k in stat_keys},
+        "iou_thr": float(args_ns.iou_thr),
+        "score_thr": float(args_ns.score_thr_cm),
+        "elapsed_s": f"{elapsed:.2f}",
+    }
+    is_new = not os.path.exists(rec_path)
+    with open(rec_path, "a", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=cols)
+        if is_new:
+            w.writeheader()
+        w.writerow(row)
+
+    print(f"[viz] charts saved to {charts_dir}")
+    print(f"[metrics] f1/precision/recall appended to {rec_path}")
     return metrics
+
+
+def _build_viz_sample(
+    net: torch.nn.Module,
+    tensor_chw_01: torch.Tensor,
+    title: str,
+    conf_thr: float,
+    nms_iou_thr: float,
+    class_names: Sequence[str],
+) -> Dict[str, Any]:
+    pb, ps, pl = infer_detections(
+        net, tensor_chw_01, conf_thr=conf_thr, nms_iou_thr=nms_iou_thr
+    )
+    labels = [
+        class_names[c - 1] if class_names and 1 <= c <= len(class_names) else str(c)
+        for c in pl
+    ]
+    return {
+        "image": _bgr_chw_to_rgb_uint8(tensor_chw_01),
+        "boxes": pb,
+        "scores": ps,
+        "labels": labels,
+        "title": title,
+    }
 
 
 def _collect_paired_samples(
     net: torch.nn.Module,
     val_loader: data.DataLoader,
     n_show: int,
+    conf_thr: float,
+    nms_iou_thr: float,
     use_cuda: bool,
     class_names: Sequence[str] = (),
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -271,58 +760,29 @@ def _collect_paired_samples(
     synth: List[Dict[str, Any]] = []
     if n_show <= 0:
         return (day, synth)
-
-    def _label(c: int) -> str:
-        if class_names and 1 <= c <= len(class_names):
-            return class_names[c - 1]
-        return str(c)
-
     with torch.no_grad():
-        for images, targets, img_paths in val_loader:
+        for images, _targets, img_paths in val_loader:
             if use_cuda:
                 images = images.cuda()
             images = images / 255.0
             img_dark = build_dark_batch(images)
             for i in range(images.shape[0]):
+                base = os.path.basename(img_paths[i]) if i < len(img_paths) else ""
                 if len(day) < n_show:
-                    pb_d, ps_d, pl_d = infer_detections(net, images[i])
                     day.append(
-                        dict(
-                            image=(
-                                images[i].detach().cpu().numpy().transpose(1, 2, 0)
-                                * 255
-                            )
-                            .clip(0, 255)
-                            .astype(np.uint8),
-                            boxes=pb_d,
-                            scores=ps_d,
-                            labels=[_label(c) for c in pl_d],
-                            title=(
-                                os.path.basename(img_paths[i])
-                                if i < len(img_paths)
-                                else ""
-                            ),
+                        _build_viz_sample(
+                            net, images[i], base, conf_thr, nms_iou_thr, class_names
                         )
                     )
                 if len(synth) < n_show:
-                    pb_n, ps_n, pl_n = infer_detections(net, img_dark[i])
                     synth.append(
-                        dict(
-                            image=(
-                                img_dark[i].detach().cpu().numpy().transpose(1, 2, 0)
-                                * 255
-                            )
-                            .clip(0, 255)
-                            .astype(np.uint8),
-                            boxes=pb_n,
-                            scores=ps_n,
-                            labels=[_label(c) for c in pl_n],
-                            title="synth/"
-                            + (
-                                os.path.basename(img_paths[i])
-                                if i < len(img_paths)
-                                else ""
-                            ),
+                        _build_viz_sample(
+                            net,
+                            img_dark[i],
+                            f"synth/{base}",
+                            conf_thr,
+                            nms_iou_thr,
+                            class_names,
                         )
                     )
             if len(day) >= n_show and len(synth) >= n_show:

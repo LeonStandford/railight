@@ -11,7 +11,7 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "momentum": 0.9,
     "weight_decay": 0.0005,
     "gamma": 0.1,
-    "multigpu": True,
+    "gpu_ids": 0,
     "save_folder": "weights/",
     "train_file": "./dataset/source_train.txt",
     "val_file": "./dataset/source_val.txt",
@@ -49,7 +49,7 @@ class Config:
     momentum: float = 0.9
     weight_decay: float = 0.0005
     gamma: float = 0.1
-    multigpu: bool = True
+    gpu_ids: Any = 0
     train_file: str = "./dataset/source_train.txt"
     val_file: str = "./dataset/source_val.txt"
     nc: int = 3

@@ -45,6 +45,8 @@ _PRETTY_LOSS_NAME: Dict[str, str] = {
     "enhance": "Enhance",
     "enhance_l1ssim": "Enhance L1+SSIM",
     "mutual": "Mutual",
+    "kl_st": "KL align (source<->target)",
+    "target_unsup": "Target unsup (recon)",
     "train_loss_epoch": "Train Loss (epoch)",
     "val_loss": "Val Loss",
 }
@@ -115,21 +117,31 @@ def plot_losses(
 ) -> Optional[str]:
     if not history:
         return None
-    iter_keys = [k for k in _LOSS_ORDER if k in history and history[k]]
-    extra_iter = sorted(
-        (
-            k
-            for (k, v) in history.items()
-            if v and k not in iter_keys and (k not in _EPOCH_KEYS)
-        )
-    )
-    epoch_keys = [
-        k for k in ("train_loss_epoch", "val_loss") if k in history and history[k]
+
+    # Loss-function panels (per-iter, ONE curve each — these are the
+    # objective terms, NOT compared train/val).
+    loss_fn_keys = list(_LOSS_ORDER) + [
+        "target_unsup", "kl_st", "wreg", "entropy"
     ]
-    ordered = iter_keys + extra_iter + epoch_keys
-    if not ordered:
+    iter_panels = [k for k in loss_fn_keys if history.get(k)]
+
+    # Metric panels (epoch-wise, TRAIN vs VAL overlaid -> see overfitting).
+    combined = [
+        ("Loss (epoch)", "train_det_epoch", "val_loss"),
+        ("Precision", "train_precision", "val_precision"),
+        ("Recall", "train_recall", "val_recall"),
+        ("F1 score", "train_f1", "val_f1"),
+        ("mAP@0.5", "train_map", "val_map"),
+    ]
+    combined = [
+        (lbl, tk, vk)
+        for (lbl, tk, vk) in combined
+        if history.get(tk) or history.get(vk)
+    ]
+
+    n = len(iter_panels) + len(combined)
+    if n == 0:
         return None
-    n = len(ordered)
     ncols = min(4, n)
     nrows = math.ceil(n / ncols)
     run_tag = _run_tag(method, config)
@@ -138,25 +150,61 @@ def plot_losses(
         nrows, ncols, figsize=(6 * ncols, 5 * nrows), squeeze=False
     )
     axes_flat = axes.flatten()
-    for i, key in enumerate(ordered):
-        ax = axes_flat[i]
-        pts = history[key]
-        xs, ys = zip(*pts)
-        color = _TAB_COLORS[i % len(_TAB_COLORS)]
-        is_epoch = key in _EPOCH_KEYS
-        marker = "s" if is_epoch else "o"
-        markersize = 4 if is_epoch else 3
-        ax.plot(
-            xs, ys, color=color, linewidth=2.0, marker=marker, markersize=markersize
-        )
+
+    idx = 0
+    for key in iter_panels:
+        ax = axes_flat[idx]
+        xs, ys = zip(*history[key])
+        color = _TAB_COLORS[idx % len(_TAB_COLORS)]
+        if len(ys) < 12:
+            ax.plot(
+                xs, ys, color=color, linewidth=2.0, marker="o",
+                markersize=3,
+            )
+        else:
+            ax.plot(xs, ys, color=color, linewidth=0.8, alpha=0.30)
+            ema, a, prev = [], 0.1, ys[0]
+            for y in ys:
+                prev = a * y + (1 - a) * prev
+                ema.append(prev)
+            ax.plot(xs, ema, color=color, linewidth=2.2, label="EMA(0.1)")
+            ax.legend(loc="best", framealpha=0.85, fontsize=8)
         short = _PRETTY_LOSS_NAME.get(key, key.replace("_", " ").title())
-        title_lines = [short] + run_tag_lines
-        ax.set_title("\n".join(title_lines), fontweight="bold", fontsize=11, pad=10)
-        ax.set_xlabel("Epoch" if is_epoch else "Iteration", fontweight="bold")
-        ylabel = "Loss" if key == "val_loss" else "Value"
-        ax.set_ylabel(ylabel, fontweight="bold")
-    for i in range(n, len(axes_flat)):
-        axes_flat[i].set_visible(False)
+        ax.set_title(
+            "\n".join([short] + run_tag_lines),
+            fontweight="bold", fontsize=11, pad=10,
+        )
+        ax.set_xlabel("Iteration", fontweight="bold")
+        ax.set_ylabel("Loss", fontweight="bold")
+        idx += 1
+
+    for label, tr_key, va_key in combined:
+        ax = axes_flat[idx]
+        tr, va = history.get(tr_key, []), history.get(va_key, [])
+        if tr:
+            xs, ys = zip(*tr)
+            ax.plot(
+                xs, ys, color=_BLUE, linewidth=2.0, marker="o",
+                markersize=4, label="train",
+            )
+        if va:
+            xs, ys = zip(*va)
+            ax.plot(
+                xs, ys, color=_RED, linewidth=2.0, marker="s",
+                markersize=4, label="val",
+            )
+        ax.set_title(
+            "\n".join([f"{label}  (train vs val)"] + run_tag_lines),
+            fontweight="bold", fontsize=11, pad=10,
+        )
+        ax.set_xlabel("Epoch", fontweight="bold")
+        ax.set_ylabel(label, fontweight="bold")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.legend(loc="best", framealpha=0.9, fontsize=8)
+        idx += 1
+
+    for j in range(n, len(axes_flat)):
+        axes_flat[j].set_visible(False)
     if run_tag:
         fig.suptitle(
             f"Loss Components — {run_tag}", fontsize=14, fontweight="bold", y=1.005
@@ -216,6 +264,71 @@ def plot_train_vs_val(
     ax.grid(True, linestyle="--", alpha=0.5, color="white", linewidth=1.2)
     ax.set_axisbelow(True)
     ax.legend(loc="best", framealpha=0.9)
+    return _save(fig, os.path.join(out_dir, fname))
+
+
+def plot_train_val_metrics(
+    history: History,
+    out_dir: str,
+    method: str = "DAI-Net",
+    config: Config = None,
+    fname: str = "train_val_metrics.png",
+) -> Optional[str]:
+    """One figure: each metric overlays TRAIN (blue) vs VAL (red).
+
+    Panels: Loss, Precision, Recall, F1, mAP. Train and val share the
+    same axes per panel so the gap (overfitting) is visible at a glance.
+    """
+    panels = [
+        ("Loss", "train_det_epoch", "val_loss"),
+        ("Precision", "train_precision", "val_precision"),
+        ("Recall", "train_recall", "val_recall"),
+        ("F1 score", "train_f1", "val_f1"),
+        ("mAP@0.5", "train_map", "val_map"),
+    ]
+    panels = [
+        p for p in panels if history.get(p[1]) or history.get(p[2])
+    ]
+    if not panels:
+        return None
+    n = len(panels)
+    ncols = 2
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(7.5 * ncols, 4.2 * nrows), squeeze=False
+    )
+    for idx, (label, tr_key, va_key) in enumerate(panels):
+        ax = axes[idx // ncols][idx % ncols]
+        ax.set_facecolor("#ECECEC")
+        tr = history.get(tr_key, [])
+        va = history.get(va_key, [])
+        if tr:
+            xs, ys = zip(*tr)
+            ax.plot(
+                xs, ys, color=_BLUE, linewidth=2.0, marker="o",
+                markersize=4, label="train",
+            )
+        if va:
+            xs, ys = zip(*va)
+            ax.plot(
+                xs, ys, color=_RED, linewidth=2.0, marker="s",
+                markersize=4, label="val",
+            )
+        ax.set_title(label, fontweight="bold", fontsize=12)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(label)
+        ax.grid(True, linestyle="--", alpha=0.5, color="white",
+                linewidth=1.0)
+        ax.set_axisbelow(True)
+        ax.legend(loc="best", framealpha=0.9)
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+    run_tag = _run_tag(method, config)
+    sup = "Train vs Val — metrics"
+    if run_tag:
+        sup = f"{sup}  ·  {run_tag}"
+    fig.suptitle(sup, fontweight="bold", fontsize=13)
+    fig.subplots_adjust(top=0.90)
     return _save(fig, os.path.join(out_dir, fname))
 
 
@@ -332,6 +445,131 @@ def plot_recall_f1_curve(
     return _save(fig, os.path.join(out_dir, "recall_f1.png"))
 
 
+def _hist_panel(ax, series, colors, labels, title, xlabel, bins=40):
+    """One publication-style distribution panel: filled hist + mean line."""
+    for vals, col, lab in zip(series, colors, labels):
+        v = np.asarray(vals, dtype=np.float64)
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            continue
+        ax.hist(
+            v, bins=bins, density=True, alpha=0.45, color=col,
+            edgecolor="white", linewidth=0.4,
+            label=f"{lab}  (μ={v.mean():.3g}, n={v.size})",
+        )
+        ax.axvline(
+            float(v.mean()), color=col, linestyle="--", linewidth=2.2,
+        )
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=10)
+    ax.set_xlabel(xlabel, fontsize=11, fontweight="bold")
+    ax.set_ylabel("Density", fontsize=11, fontweight="bold")
+    ax.grid(True, linestyle="--", alpha=0.45)
+    ax.legend(loc="best", framealpha=0.92, fontsize=9)
+
+
+def plot_test_distributions(
+    feat_day,
+    feat_night,
+    kl_vals,
+    ce_vals,
+    out_dir: str,
+    method: str = "DAI-Net",
+    config: Config = None,
+    fname: str = "test_distributions.png",
+    feat_before_day=None,
+    feat_before_night=None,
+) -> Optional[str]:
+    """Paper-style distributions from ``DSFD.extract_features`` over all
+    day (source-val) and night (target) images:
+
+    (0) per-image mean activation Day vs Night *before* the backbone
+        feature extractor (raw input — the domain gap going in),
+    (1) pooled backbone-feature activation Day vs Night *after*
+        ``DSFD.extract_features`` (the domain gap the model actually sees),
+    (2) source<->target symmetric KL-divergence, (3) cross-entropy
+        H(p_day, p_night) between the day and night predicted class
+        distributions (one distribution).
+    Panels with no data are dropped automatically; with all four present
+    the figure is a 2x2 grid (Before is the top-left panel, After top-right).
+    """
+    feat_before_day = feat_before_day or []
+    feat_before_night = feat_before_night or []
+    have_ba = bool(len(feat_before_day) or len(feat_before_night))
+    have_feat = bool(len(feat_day) or len(feat_night))
+    have_kl = bool(len(kl_vals))
+    have_ce = bool(len(ce_vals))
+    panels = [p for p, ok in (
+        ("ba", have_ba), ("feat", have_feat), ("kl", have_kl), ("ce", have_ce)
+    ) if ok]
+    if not panels:
+        return None
+
+    n = len(panels)
+    ncols = 2 if n >= 4 else n
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(6.8 * ncols, 5.0 * nrows), squeeze=False
+    )
+    axes = axes.flatten()
+    for ax in axes[n:]:
+        ax.axis("off")
+    i = 0
+    if have_ba:
+        _hist_panel(
+            axes[i],
+            [feat_before_day, feat_before_night],
+            [_BLUE, _RED],
+            ["Day (source-val)", "Night (target)"],
+            "Feature Distribution — Day vs Night\n"
+            "(BEFORE DSFD.extract_features, raw-input mean activation)",
+            "Mean input activation",
+        )
+        i += 1
+    if have_feat:
+        _hist_panel(
+            axes[i],
+            [feat_day, feat_night],
+            [_BLUE, _RED],
+            ["Day (source-val)", "Night (target)"],
+            "Backbone-Feature Distribution — Day vs Night\n"
+            "(AFTER DSFD.extract_features, per-image mean activation)",
+            "Mean pooled-feature activation",
+        )
+        i += 1
+    if have_kl:
+        _hist_panel(
+            axes[i],
+            [kl_vals],
+            ["#CC79A7"],
+            ["Source ↔ Target"],
+            "Domain KL-Divergence Distribution\n"
+            "(source-val vs target backbone features)",
+            "Per-batch symmetric KL  (lower = better aligned)",
+        )
+        i += 1
+    if have_ce:
+        _hist_panel(
+            axes[i],
+            [ce_vals],
+            ["#0072B2"],
+            ["H(day, night)"],
+            "Cross-Entropy Distribution\n"
+            "H(p_day, p_night)  (day↔night class distributions)",
+            "Per-pair cross-entropy  (lower = more aligned)",
+        )
+        i += 1
+
+    fig.suptitle(
+        _compose_title(
+            method, "Test-time Feature / KL / Cross-Entropy Distributions",
+            config,
+        ),
+        fontsize=15, fontweight="bold", y=1.05,
+    )
+    fig.subplots_adjust(top=0.84)
+    return _save(fig, os.path.join(out_dir, fname))
+
+
 def _project_2d(feats: np.ndarray) -> Tuple[np.ndarray, str]:
     feats = np.asarray(feats, dtype=np.float64)
     if feats.shape[0] < 3:
@@ -391,6 +629,58 @@ def plot_tsne_features(
     )
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.legend(loc="best", framealpha=0.9)
+    return _save(fig, os.path.join(out_dir, fname))
+
+
+def _subsample(a: np.ndarray, cap: int, seed: int) -> np.ndarray:
+    if a is None or len(a) <= cap:
+        return a
+    idx = np.random.RandomState(seed).choice(len(a), size=cap, replace=False)
+    return a[idx]
+
+
+def _domain_scatter(ax, xy: np.ndarray, n_src: int, proj: str, title: str) -> None:
+    ax.scatter(
+        xy[:n_src, 0], xy[:n_src, 1],
+        s=14, alpha=1.0, color="#00008B", label="source (day)",
+        edgecolors="none",
+    )
+    ax.scatter(
+        xy[n_src:, 0], xy[n_src:, 1],
+        s=14, alpha=1.0, color="#8B0000", label="target (night)",
+        edgecolors="none",
+    )
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.set_xlabel(f"{proj}-1")
+    ax.set_ylabel(f"{proj}-2")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend(loc="upper right", framealpha=0.9, markerscale=1.6)
+
+
+def plot_domain_tsne(
+    feats_src: Optional[np.ndarray],
+    feats_tgt: Optional[np.ndarray],
+    out_dir: str,
+    fname: str,
+    subject: str,
+    method: str = "DAI-Net",
+    config: Config = None,
+    cap_per_domain: int = 1500,
+) -> Optional[str]:
+    if feats_src is None or feats_tgt is None:
+        return None
+    s = np.asarray(feats_src, dtype=np.float32).reshape(len(feats_src), -1)
+    t = np.asarray(feats_tgt, dtype=np.float32).reshape(len(feats_tgt), -1)
+    if s.shape[0] == 0 or t.shape[0] == 0:
+        return None
+    s = _subsample(s, cap_per_domain, seed=0)
+    t = _subsample(t, cap_per_domain, seed=1)
+    xy, proj = _project_2d(np.concatenate([s, t], axis=0))
+    fig, ax = plt.subplots(figsize=(7.0, 6.4))
+    _domain_scatter(
+        ax, xy, len(s), proj, _compose_title(method, subject, config)
+    )
     return _save(fig, os.path.join(out_dir, fname))
 
 

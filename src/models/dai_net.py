@@ -381,14 +381,23 @@ class DSFD(nn.Module):
 
     def load_weights(self, base_file):
         other, ext = os.path.splitext(base_file)
-        if ext == ".pkl" or ".pth":
+        if ext in (".pkl", ".pth"):
             print("Loading weights into state dict...")
             mdata = torch.load(base_file, map_location=lambda storage, loc: storage)
+            # Checkpoints are saved as {"epoch": ..., "weight": state_dict};
+            # unwrap to the actual state_dict and recover the saved epoch.
             epoch = 50
+            if isinstance(mdata, dict) and "weight" in mdata:
+                epoch = mdata.get("epoch", epoch)
+                mdata = mdata["weight"]
+            elif isinstance(mdata, dict) and "state_dict" in mdata:
+                epoch = mdata.get("epoch", epoch)
+                mdata = mdata["state_dict"]
             self.load_state_dict(mdata)
             print("Finished!")
         else:
             print("Sorry only .pth and .pkl files supported.")
+            return 0
         return epoch
 
     def xavier(self, param):
@@ -499,16 +508,29 @@ def add_extras(cfg, i, batch_norm=False):
 def multibox(vgg, extra_layers, num_classes):
     loc_layers = []
     conf_layers = []
+    # Priors generated per feature-map cell by PriorBox = len(cfg.ASPECT_RATIO).
+    # The detection head must emit (num_anchors * 4) loc and
+    # (num_anchors * num_classes) conf channels so predictions stay aligned
+    # with the prior boxes after the .view(N, -1, 4 / num_classes) reshape.
+    num_anchors = len(cfg.ASPECT_RATIO)
     vgg_source = [14, 21, 28, -2]
     for k, v in enumerate(vgg_source):
-        loc_layers += [nn.Conv2d(vgg[v].out_channels, 4, kernel_size=3, padding=1)]
+        loc_layers += [
+            nn.Conv2d(vgg[v].out_channels, num_anchors * 4, kernel_size=3, padding=1)
+        ]
         conf_layers += [
-            nn.Conv2d(vgg[v].out_channels, num_classes, kernel_size=3, padding=1)
+            nn.Conv2d(
+                vgg[v].out_channels, num_anchors * num_classes, kernel_size=3, padding=1
+            )
         ]
     for k, v in enumerate(extra_layers[1::2], 2):
-        loc_layers += [nn.Conv2d(v.out_channels, 4, kernel_size=3, padding=1)]
+        loc_layers += [
+            nn.Conv2d(v.out_channels, num_anchors * 4, kernel_size=3, padding=1)
+        ]
         conf_layers += [
-            nn.Conv2d(v.out_channels, num_classes, kernel_size=3, padding=1)
+            nn.Conv2d(
+                v.out_channels, num_anchors * num_classes, kernel_size=3, padding=1
+            )
         ]
     return (loc_layers, conf_layers)
 
