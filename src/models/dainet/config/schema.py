@@ -11,7 +11,7 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "momentum": 0.9,
     "weight_decay": 0.0005,
     "gamma": 0.1,
-    "multigpu": True,
+    "gpu_ids": 0,
     "save_folder": "weights/",
     "train_file": "./dataset/source_train.txt",
     "val_file": "./dataset/source_val.txt",
@@ -25,6 +25,7 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "viz_full_every_epochs": 1,
     "resume": None,
     "kl_loss_weight": 1.0,
+    "coral_loss_weight": 0.1,
     "target_loss_weight": 0.05,
     "wreg_loss_weight": 0.0001,
     "entropy_loss_weight": 0.01,
@@ -49,7 +50,7 @@ class Config:
     momentum: float = 0.9
     weight_decay: float = 0.0005
     gamma: float = 0.1
-    multigpu: bool = True
+    gpu_ids: Any = 0
     train_file: str = "./dataset/source_train.txt"
     val_file: str = "./dataset/source_val.txt"
     nc: int = 3
@@ -63,6 +64,7 @@ class Config:
     viz_every_iters: int = 500
     viz_full_every_epochs: int = 1
     kl_loss_weight: float = 1.0
+    coral_loss_weight: float = 0.1
     target_loss_weight: float = 0.05
     wreg_loss_weight: float = 0.0001
     entropy_loss_weight: float = 0.01

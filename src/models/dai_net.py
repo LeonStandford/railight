@@ -128,6 +128,15 @@ class DSFD(nn.Module):
             f = self.vgg[k](f)
         return self.ref(f)
 
+    @staticmethod
+    def _coral(s, t):
+        d = s.size(1)
+        s = s - s.mean(dim=0, keepdim=True)
+        t = t - t.mean(dim=0, keepdim=True)
+        cs = (s.t() @ s) / max(s.size(0) - 1, 1)
+        ct = (t.t() @ t) / max(t.size(0) - 1, 1)
+        return (cs - ct).pow(2).sum() / (4.0 * d * d)
+
     def extract_features(self, x_source, x_target, I_source, I_target):
         f_source = x_source
         for k in range(5):
@@ -135,23 +144,16 @@ class DSFD(nn.Module):
         f_target = x_target
         for k in range(5):
             f_target = self.vgg[k](f_target)
-        x_source_swap = (I_source * self.ref(f_target)).detach()
-        x_target_swap = (I_target * self.ref(f_source)).detach()
-        for k in range(5):
-            x_source_swap = self.vgg[k](x_source_swap)
-        for k in range(5):
-            x_target_swap = self.vgg[k](x_target_swap)
-        f_source_pool = f_source.flatten(start_dim=2).mean(dim=-1)
-        f_target_pool = f_target.flatten(start_dim=2).mean(dim=-1)
-        x_source_swap_pool = x_source_swap.flatten(start_dim=2).mean(dim=-1)
-        x_target_swap_pool = x_target_swap.flatten(start_dim=2).mean(dim=-1)
-        loss_kl_st = cfg.WEIGHT.MC * (
-            self.KL(f_source_pool, f_target_pool)
-            + self.KL(f_target_pool, f_source_pool)
-            + self.KL(x_source_swap_pool, x_target_swap_pool)
-            + self.KL(x_target_swap_pool, x_source_swap_pool)
+        s = f_source.mean(dim=(2, 3))
+        t = f_target.mean(dim=(2, 3))
+        temp = self.KL.T
+        s_prob = F.softmax(s / temp, dim=1).detach()
+        t_log_prob = F.log_softmax(t / temp, dim=1)
+        loss_kl_st = (
+            F.kl_div(t_log_prob, s_prob, reduction="batchmean") * temp * temp
         )
-        return (f_source_pool, f_target_pool, loss_kl_st)
+        loss_coral = self._coral(s, t)
+        return (s, t, loss_kl_st, loss_coral)
 
     @torch.no_grad()
     def embed_features(self, x):
@@ -381,14 +383,23 @@ class DSFD(nn.Module):
 
     def load_weights(self, base_file):
         other, ext = os.path.splitext(base_file)
-        if ext == ".pkl" or ".pth":
+        if ext in (".pkl", ".pth"):
             print("Loading weights into state dict...")
             mdata = torch.load(base_file, map_location=lambda storage, loc: storage)
+            # Checkpoints are saved as {"epoch": ..., "weight": state_dict};
+            # unwrap to the actual state_dict and recover the saved epoch.
             epoch = 50
+            if isinstance(mdata, dict) and "weight" in mdata:
+                epoch = mdata.get("epoch", epoch)
+                mdata = mdata["weight"]
+            elif isinstance(mdata, dict) and "state_dict" in mdata:
+                epoch = mdata.get("epoch", epoch)
+                mdata = mdata["state_dict"]
             self.load_state_dict(mdata)
             print("Finished!")
         else:
             print("Sorry only .pth and .pkl files supported.")
+            return 0
         return epoch
 
     def xavier(self, param):
@@ -499,16 +510,29 @@ def add_extras(cfg, i, batch_norm=False):
 def multibox(vgg, extra_layers, num_classes):
     loc_layers = []
     conf_layers = []
+    # Priors generated per feature-map cell by PriorBox = len(cfg.ASPECT_RATIO).
+    # The detection head must emit (num_anchors * 4) loc and
+    # (num_anchors * num_classes) conf channels so predictions stay aligned
+    # with the prior boxes after the .view(N, -1, 4 / num_classes) reshape.
+    num_anchors = len(cfg.ASPECT_RATIO)
     vgg_source = [14, 21, 28, -2]
     for k, v in enumerate(vgg_source):
-        loc_layers += [nn.Conv2d(vgg[v].out_channels, 4, kernel_size=3, padding=1)]
+        loc_layers += [
+            nn.Conv2d(vgg[v].out_channels, num_anchors * 4, kernel_size=3, padding=1)
+        ]
         conf_layers += [
-            nn.Conv2d(vgg[v].out_channels, num_classes, kernel_size=3, padding=1)
+            nn.Conv2d(
+                vgg[v].out_channels, num_anchors * num_classes, kernel_size=3, padding=1
+            )
         ]
     for k, v in enumerate(extra_layers[1::2], 2):
-        loc_layers += [nn.Conv2d(v.out_channels, 4, kernel_size=3, padding=1)]
+        loc_layers += [
+            nn.Conv2d(v.out_channels, num_anchors * 4, kernel_size=3, padding=1)
+        ]
         conf_layers += [
-            nn.Conv2d(v.out_channels, num_classes, kernel_size=3, padding=1)
+            nn.Conv2d(
+                v.out_channels, num_anchors * num_classes, kernel_size=3, padding=1
+            )
         ]
     return (loc_layers, conf_layers)
 
