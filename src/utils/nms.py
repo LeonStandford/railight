@@ -1,11 +1,3 @@
-"""Non-Maximum Suppression for post-processing detections.
-
-Greedy, per-class NMS on numpy arrays (boxes are decoded to numpy before
-metrics / visualisation, so a numpy implementation keeps it dependency-free
-and avoids extra GPU<->CPU traffic). Used in the training/eval pipeline to
-drop redundant overlapping boxes the detector still emits after its own
-internal Detect layer.
-"""
 from __future__ import annotations
 
 from typing import Tuple
@@ -18,17 +10,7 @@ __all__ = ["nms", "multiclass_nms"]
 def nms(
     boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45
 ) -> np.ndarray:
-    """Greedy NMS on one class.
 
-    Args:
-        boxes:   (N, 4) float array in xyxy.
-        scores:  (N,) float array.
-        iou_thr: suppress a box if its IoU with a kept higher-scoring box
-                 exceeds this threshold.
-    Returns:
-        Indices (into the input arrays) of the boxes to keep, ordered by
-        descending score.
-    """
     if boxes.size == 0:
         return np.empty((0,), dtype=np.int64)
 
@@ -61,19 +43,7 @@ def multiclass_nms(
     iou_thr: float = 0.45,
     max_det: int = 300,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-class NMS over a full detection set.
-
-    NMS is applied independently within each class id so boxes of
-    different classes never suppress one another. The merged survivors
-    are returned sorted by descending score and capped at ``max_det``.
-
-    Args:
-        boxes:  (N, 4) xyxy.
-        scores: (N,).
-        labels: (N,) class ids.
-    Returns:
-        (boxes, scores, labels) with redundant boxes removed.
-    """
+    
     boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
     scores = np.asarray(scores, dtype=np.float32).reshape(-1)
     labels = np.asarray(labels).reshape(-1)

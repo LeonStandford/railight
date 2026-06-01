@@ -23,9 +23,7 @@ def random_noise_levels():
 
 
 def Low_Illumination_Degrading(img, safe_invert=False):
-    """
-    parameter setting
-    """
+
     device = img.device
     config = dict(
         darkness_range=(0.01, 0.1),

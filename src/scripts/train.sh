@@ -4,7 +4,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd "$(dirname "$0")/../.."
 
-CONFIG=${CONFIG:-configs/train/dai_net/vgg16/exp2.yaml}
+CONFIG=${CONFIG:-configs/train/dai_net/vgg16/exp3.yaml}
 
 if [ ! -f "$CONFIG" ]; then
     echo "ERROR: CONFIG=$CONFIG does not exist." >&2; exit 1

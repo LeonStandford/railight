@@ -1,0 +1,30 @@
+architecture: dai_net
+num_exp: exp3
+
+weights: weights/dai_net/vgg16/exp3/best_model.pth
+
+cuda: true
+gpu_ids: 0
+batch_size: 4
+
+source_test_file: ./dataset/source_test.txt
+target_test_file: ./dataset/target_test.txt
+
+export_predicted_source_path: null
+export_predicted_target_path: null
+
+nc: 8
+names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
+
+source_folder: /home/caotulab/wd_nhan/data/images/8/source
+target_folder4unsupervised: /home/caotulab/wd_nhan/data/images/8/target
+
+charts_dir: ./charts
+records_dir: ./records
+mode_name: test
+
+viz_num_samples: 6
+
+iou_thr: 0.5
+score_thr_cm: 0.5
+nms_iou_thr: 0.35

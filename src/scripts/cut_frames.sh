@@ -3,7 +3,7 @@ set -e
 cd "$(dirname "$0")/../.."
 
 python src/utils/cut_frames.py \
-    --path-input  /mnt/Nhan/data/videos \
-    --path-output '/media/caotulab/WD STORAGE/Nhan/data/images/3/target' \
-    --fps 1 \
-    --max-frames-per-video 2000
+    --path-input  /media/caotulab/303A225B3A221DFA/Nhan/data/videos \
+    --path-output '/media/caotulab/303A225B3A221DFA/Nhan/data/images_v2' \
+    --fps 30 \
+    --max-frames-per-video 5000

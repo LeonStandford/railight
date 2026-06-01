@@ -27,12 +27,17 @@ import torch.nn.functional as F
 
 from data.config import cfg
 from data.source_domain import SourceDomainDetection, detection_collate
-from data.target_domain import TargetUnlabeledDataset
+from data.target_domain import (
+    TargetLabeledDataset,
+    TargetUnlabeledDataset,
+    resolve_target_label_paths,
+)
 from models.factory import build_net
 from utils import visualize as viz
 from train import (
     _BACKBONE_FROM_MODEL,
     _MODEL_FROM_ARCH_BACKBONE,
+    TARGET_TO_SOURCE_CLASS_MAP,
     _decode_per_image,
     _detect_metrics_from_cm,
     _format_val_table,
@@ -48,12 +53,16 @@ _TEST_DEFAULTS: Dict[str, Any] = {
     "batch_size": 1,
     "num_workers": 0,
     "cuda": True,
-    "val_file": "./dataset/source_val.txt",
-    "test_file": "./dataset/source_test.txt",
+    "source_train_file": "./dataset/source_train.txt",
+    "source_val_file": "./dataset/source_val.txt",
+    "source_test_file": "./dataset/source_test.txt",
+    "target_train_file": "./dataset/target_train.txt",
+    "target_val_file": "./dataset/target_val.txt",
+    "target_test_file": "./dataset/target_test.txt",
     "nc": 3,
     "names": None,
     "source_folder": "",
-    "target_folder": "/media/caotulab/303A225B3A221DFA/Nhan/data/images/target",
+    "target_folder4unsupervised": "/media/caotulab/303A225B3A221DFA/Nhan/data/images/target",
     "charts_dir": "./charts",
     "records_dir": "./records",
     "mode_name": "test",
@@ -64,8 +73,11 @@ _TEST_DEFAULTS: Dict[str, Any] = {
     "nms_iou_thr": 0.35,
     "export_predicted_source_path": None,
     "export_predicted_target_path": None,
+    "focal_enabled": True,
+    "focal_gamma": 2.0,
+    "focal_alpha_bg": 0.25,
+    "box_loss": "smooth_l1",
 }
-
 
 def load_test_config(config_path: str) -> argparse.Namespace:
     p = Path(config_path)
@@ -88,10 +100,18 @@ def load_test_config(config_path: str) -> argparse.Namespace:
             f"Cannot infer --model from architecture={arch!r}, backbone={backbone!r}. Add `model:` to {config_path}."
         )
     merged: Dict[str, Any] = dict(_TEST_DEFAULTS)
+    legacy_aliases = {
+        "train_file": "source_train_file",
+        "val_file": "source_val_file",
+        "test_file": "source_test_file",
+    }
     for k, v in cfg_yaml.items():
         if k in ("architecture", "backbone", "num_exp", "model"):
             continue
-        merged[k] = v
+        if k in legacy_aliases:
+            merged[legacy_aliases[k]] = v
+        else:
+            merged[k] = v
     merged.update(
         dict(
             architecture=arch,
@@ -109,13 +129,11 @@ def load_test_config(config_path: str) -> argparse.Namespace:
         raise FileNotFoundError(f"weights file does not exist: {merged['weights']}")
     return argparse.Namespace(**merged)
 
-
 def _load_state_dict(net: torch.nn.Module, weights_path: str) -> None:
     state = torch.load(weights_path, map_location="cpu")
     if isinstance(state, dict) and "weight" in state:
         state = state["weight"]
     net.load_state_dict(state)
-
 
 def _bgr_chw_to_rgb_uint8(tensor_chw: torch.Tensor) -> np.ndarray:
     return (
@@ -123,7 +141,6 @@ def _bgr_chw_to_rgb_uint8(tensor_chw: torch.Tensor) -> np.ndarray:
         .clip(0, 255)
         .astype(np.uint8)
     )
-
 
 def _export_yolo_predictions(
     per_image: List[Dict[str, np.ndarray]],
@@ -149,7 +166,6 @@ def _export_yolo_predictions(
         with open(os.path.join(out_dir, f"{stem}.txt"), "w") as fh:
             fh.write("\n".join(lines))
     return len(per_image)
-
 
 def _predict_target_folder(
     net: torch.nn.Module,
@@ -202,11 +218,10 @@ def _predict_target_folder(
             )
     return (per_image, paths[: len(per_image)])
 
-
 def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     use_cuda = bool(args_ns.cuda) and torch.cuda.is_available()
     if use_cuda:
-        torch.set_default_tensor_type("torch.cuda.FloatTensor")  # noqa: deprecated-ok
+        torch.set_default_tensor_type("torch.cuda.FloatTensor")
 
     cfg_names = getattr(args_ns, "names", None) or getattr(
         args_ns, "class_names", None
@@ -228,6 +243,12 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         args_ns.nc = nc_yaml
     num_classes = args_ns.nc + 1
     cfg.NUM_CLASSES = num_classes
+    if hasattr(cfg, "FOCAL"):
+        cfg.FOCAL.ENABLED = bool(getattr(args_ns, "focal_enabled", cfg.FOCAL.ENABLED))
+        cfg.FOCAL.GAMMA = float(getattr(args_ns, "focal_gamma", cfg.FOCAL.GAMMA))
+        cfg.FOCAL.ALPHA_BG = float(
+            getattr(args_ns, "focal_alpha_bg", cfg.FOCAL.ALPHA_BG)
+        )
     print(f"[data] classes ({len(class_names)}): {list(class_names)}")
     print(f"[net] building {args_ns.architecture}/{args_ns.model}")
     net = build_net("train", num_classes, args_ns.model)
@@ -236,9 +257,12 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     if use_cuda:
         net = net.cuda()
     net.eval()
-    eval_file = getattr(args_ns, "test_file", None) or args_ns.val_file
-    if not os.path.isfile(eval_file):
-        raise FileNotFoundError(f"test/val list not found: {eval_file}")
+    eval_file = (
+        getattr(args_ns, "source_test_file", None)
+        or getattr(args_ns, "source_val_file", None)
+    )
+    if not eval_file or not os.path.isfile(eval_file):
+        raise FileNotFoundError(f"source test/val list not found: {eval_file}")
     val_ds = SourceDomainDetection(eval_file, mode="val")
     val_loader = data.DataLoader(
         val_ds,
@@ -282,7 +306,7 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         print(f"[export] wrote {n} YOLO source prediction files to {src_export_dir}")
 
     tgt_export_dir = getattr(args_ns, "export_predicted_target_path", None)
-    tgt_dir_for_export = getattr(args_ns, "target_folder", "")
+    tgt_dir_for_export = getattr(args_ns, "target_folder4unsupervised", "")
     if tgt_export_dir:
         if tgt_dir_for_export and os.path.isdir(tgt_dir_for_export):
             tgt_pred_per_image, tgt_pred_paths = _predict_target_folder(
@@ -338,7 +362,6 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
 
     try:
         torch.set_default_tensor_type("torch.FloatTensor") 
-        # ---- Pass 1: ALL source-val (day) ----
         with torch.no_grad():
             for s_imgs, _t, _p in tqdm(
                 val_loader, total=len(val_loader),
@@ -352,8 +375,7 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                     feat_before_day, _src_before_bank,
                 )
 
-        # ---- Pass 2: ALL target (night) ----
-        tgt_dir = getattr(args_ns, "target_folder", "")
+        tgt_dir = getattr(args_ns, "target_folder4unsupervised", "")
         if tgt_dir and os.path.isdir(tgt_dir):
             tgt_ds = TargetUnlabeledDataset(tgt_dir, size=cfg.INPUT_SIZE)
             tgt_loader = data.DataLoader(
@@ -377,7 +399,6 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                 f"[WARN] target_folder {tgt_dir!r} missing — night "
                 f"distribution / KL skipped."
             )
-
 
         if _src_bank and _tgt_bank:
             src = torch.cat(_src_bank, dim=0)
@@ -450,6 +471,139 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     _, _, _, mAP = viz._pr_from_scores(np.asarray(scores), np.asarray(matched), n_gt)
     _tp, _fp, _fn = m["tp"], m["fp"], m["fn"]
     _tot = max(_tp + _fp + _fn, 1)
+
+    tgt_per_image: List[Dict[str, np.ndarray]] = []
+    tgt_m = {"precision": 0.0, "recall": 0.0, "f1": 0.0,
+             "accuracy": 0.0, "tp": 0, "fp": 0, "fn": 0}
+    tgt_mAP = 0.0
+    tgt_n_gt = 0
+    tgt_scores = np.zeros(0, dtype=np.float32)
+    tgt_matched = np.zeros(0, dtype=np.int32)
+    tgt_cm = None
+    tgt_loss = 0.0
+    tgt_loc_loss = 0.0
+    tgt_conf_loss = 0.0
+    tgt_n_imgs = 0
+    target_test_file = getattr(args_ns, "target_test_file", None)
+    if target_test_file and os.path.isfile(target_test_file):
+        try:
+            from layers.modules import MultiBoxLoss
+            from losses.dfl import FocalLoss, compute_focal_alpha
+            from losses.iou import build_box_loss
+
+            cls_loss_fn = None
+            if getattr(cfg, "FOCAL", None) is not None and cfg.FOCAL.ENABLED:
+                alpha = compute_focal_alpha(
+                    target_test_file, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
+                )
+                cls_loss_fn = FocalLoss(
+                    gamma=cfg.FOCAL.GAMMA, alpha=alpha, num_classes=num_classes
+                )
+            box_loss_fn = build_box_loss(
+                getattr(args_ns, "box_loss", "smooth_l1")
+            )
+            tgt_criterion = MultiBoxLoss(
+                cfg, use_cuda, cls_loss_fn=cls_loss_fn, box_loss_fn=box_loss_fn
+            )
+
+            tgt_ds = SourceDomainDetection(target_test_file, mode="val")
+            tgt_n_imgs = len(tgt_ds)
+            tv_loader = data.DataLoader(
+                tgt_ds,
+                args_ns.batch_size,
+                num_workers=args_ns.num_workers,
+                collate_fn=detection_collate,
+                shuffle=False,
+                pin_memory=use_cuda,
+            )
+            steps = 0
+            with torch.no_grad():
+                for tvi, ttgt, _tpaths in tqdm(
+                    tv_loader, total=len(tv_loader),
+                    desc="Evaluating target test",
+                    dynamic_ncols=True, unit="batch", colour="magenta",
+                ):
+                    if use_cuda:
+                        tvi = tvi.cuda()
+                    tvi = tvi / 255.0
+                    ttgt_v = [t.cuda() if use_cuda else t for t in ttgt]
+                    tvout, _ = net.test_forward(tvi)
+                    l_loc, l_conf = tgt_criterion(tvout[3:], ttgt_v)
+                    tgt_loc_loss += float(l_loc.item())
+                    tgt_conf_loss += float(l_conf.item())
+                    tgt_loss += float((l_loc + l_conf).item())
+                    steps += 1
+                    tgt_per_image.extend(_decode_per_image(tvout, ttgt, net))
+            if steps > 0:
+                tgt_loss /= steps
+                tgt_loc_loss /= steps
+                tgt_conf_loss /= steps
+            if tgt_per_image:
+                tgt_scores, tgt_matched, tgt_n_gt, tgt_cm = (
+                    viz.evaluate_detections(
+                        tgt_per_image,
+                        iou_thr=float(args_ns.iou_thr),
+                        score_thr_cm=float(args_ns.score_thr_cm),
+                        num_classes=args_ns.nc,
+                    )
+                )
+                tgt_m = _detect_metrics_from_cm(tgt_cm)
+                _, _, _, tgt_mAP = viz._pr_from_scores(
+                    np.asarray(tgt_scores),
+                    np.asarray(tgt_matched), tgt_n_gt,
+                )
+        except Exception as e:
+            print(f"[WARN] target test eval skipped: {e}")
+    else:
+        tgt_images_dir, tgt_labels_dir = resolve_target_label_paths(
+            getattr(args_ns, "target_folder4unsupervised", "")
+        )
+        if tgt_images_dir and tgt_labels_dir:
+            try:
+                tvds = TargetLabeledDataset(
+                    tgt_images_dir, tgt_labels_dir,
+                    class_map=TARGET_TO_SOURCE_CLASS_MAP, mode="val",
+                )
+                tgt_n_imgs = len(tvds)
+                if tgt_n_imgs > 0:
+                    tv_loader = data.DataLoader(
+                        tvds,
+                        args_ns.batch_size,
+                        num_workers=0,
+                        collate_fn=detection_collate,
+                        shuffle=False,
+                        pin_memory=use_cuda,
+                    )
+                    with torch.no_grad():
+                        for tvi, ttgt, _tpaths in tqdm(
+                            tv_loader, total=len(tv_loader),
+                            desc="Evaluating target (real night, full folder)",
+                            dynamic_ncols=True, unit="batch", colour="magenta",
+                        ):
+                            if use_cuda:
+                                tvi = tvi.cuda()
+                            tvi = tvi / 255.0
+                            tvout, _ = net.test_forward(tvi)
+                            tgt_per_image.extend(
+                                _decode_per_image(tvout, ttgt, net)
+                            )
+                    if tgt_per_image:
+                        tgt_scores, tgt_matched, tgt_n_gt, tgt_cm = (
+                            viz.evaluate_detections(
+                                tgt_per_image,
+                                iou_thr=float(args_ns.iou_thr),
+                                score_thr_cm=float(args_ns.score_thr_cm),
+                                num_classes=args_ns.nc,
+                            )
+                        )
+                        tgt_m = _detect_metrics_from_cm(tgt_cm)
+                        _, _, _, tgt_mAP = viz._pr_from_scores(
+                            np.asarray(tgt_scores),
+                            np.asarray(tgt_matched), tgt_n_gt,
+                        )
+            except Exception as e:
+                print(f"[WARN] target-val eval skipped: {e}")
+    _t_tot = max(tgt_m["tp"] + tgt_m["fp"] + tgt_m["fn"], 1)
     table = _format_val_table(
         "test",
         [
@@ -469,6 +623,27 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             (
                 "TP/FP/FN (normalized)",
                 f"{_tp / _tot:.3f}/{_fp / _tot:.3f}/{_fn / _tot:.3f}",
+            ),
+            ("§", "Target test metrics (real night)"),
+            ("target_test_file", str(target_test_file or "<labeled folder>")),
+            ("target_n", f"{len(tgt_per_image)}"),
+            ("target_n_gt", f"{tgt_n_gt}"),
+            ("target_loss", f"{tgt_loss:.4f}"),
+            ("target_pal2_loc_loss", f"{tgt_loc_loss:.4f}"),
+            ("target_pal2_conf_loss", f"{tgt_conf_loss:.4f}"),
+            ("target_accuracy", f"{tgt_m['accuracy']:.4f}"),
+            ("target_precision", f"{tgt_m['precision']:.4f}"),
+            ("target_recall", f"{tgt_m['recall']:.4f}"),
+            ("target_f1", f"{tgt_m['f1']:.4f}"),
+            (f"target_mAP@{float(args_ns.iou_thr):.2f}", f"{tgt_mAP:.4f}"),
+            (
+                "target TP/FP/FN (count)",
+                f"{tgt_m['tp']}/{tgt_m['fp']}/{tgt_m['fn']}",
+            ),
+            (
+                "target TP/FP/FN (normalized)",
+                f"{tgt_m['tp'] / _t_tot:.3f}/"
+                f"{tgt_m['fp'] / _t_tot:.3f}/{tgt_m['fn'] / _t_tot:.3f}",
             ),
             ("§", "KL divergence (source↔target)"),
             ("KL mean", f"{dist_stats['kl_mean']:.4f}"),
@@ -521,13 +696,25 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     viz.plot_recall_f1_curve(
         scores, matched, n_gt, charts_dir, method=method, config=config_dict
     )
-    viz.plot_test_distributions(
-        feat_day, feat_night, kl_vals, ce_vals,
-        charts_dir, method=method, config=config_dict,
-        feat_before_day=feat_before_day,
-        feat_before_night=feat_before_night,
-    )
-
+    if tgt_per_image and tgt_cm is not None:
+        viz.plot_confusion_matrix(
+            tgt_cm,
+            charts_dir,
+            method=method,
+            config=config_dict,
+            classes=list(class_names) + ["background"],
+            fname="confusion_matrix_target.png",
+        )
+        viz.plot_pr_curve(
+            tgt_scores, tgt_matched, tgt_n_gt, charts_dir,
+            method=method, config=config_dict,
+            fname="pr_curve_target.png",
+        )
+        viz.plot_recall_f1_curve(
+            tgt_scores, tgt_matched, tgt_n_gt, charts_dir,
+            method=method, config=config_dict,
+            fname="recall_f1_target.png",
+        )
     try:
         if _src_before_bank and _tgt_before_bank:
             viz.plot_domain_tsne(
@@ -567,7 +754,6 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                         "title": f"{tag}{len(items)}",
                     })
 
-            # Source (day): accumulate n_show across batches.
             src_items: list = []
             for s_b, _t, _p in val_loader:
                 if use_cuda:
@@ -577,7 +763,7 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                     break
 
             tgt_items: list = []
-            tgt_dir = getattr(args_ns, "target_folder", "")
+            tgt_dir = getattr(args_ns, "target_folder4unsupervised", "")
             if tgt_dir and os.path.isdir(tgt_dir):
                 _tds = TargetUnlabeledDataset(tgt_dir, size=cfg.INPUT_SIZE)
                 _tl = data.DataLoader(
@@ -631,12 +817,12 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             title_suffix="(val + Dark ISP)",
         )
 
-    if getattr(args_ns, "target_folder", "") and os.path.isdir(
-        args_ns.target_folder
+    if getattr(args_ns, "target_folder4unsupervised", "") and os.path.isdir(
+        args_ns.target_folder4unsupervised
     ):
         real_night_samples = collect_target_samples(
             net,
-            args_ns.target_folder,
+            args_ns.target_folder4unsupervised,
             args_ns.viz_num_samples,
             class_names,
             conf_thr=float(args_ns.score_thr_cm),
@@ -652,6 +838,53 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                 title_suffix="(real target / night — qualitative)",
             )
 
+    if target_test_file and os.path.isfile(target_test_file):
+        try:
+            tt_ds = SourceDomainDetection(target_test_file, mode="val")
+            tt_loader = data.DataLoader(
+                tt_ds,
+                args_ns.batch_size,
+                num_workers=0,
+                collate_fn=detection_collate,
+                shuffle=False,
+                pin_memory=use_cuda,
+            )
+            tt_samples: List[Dict[str, Any]] = []
+            need = max(1, int(args_ns.viz_num_samples))
+            with torch.no_grad():
+                for images, _t, img_paths in tt_loader:
+                    if use_cuda:
+                        images = images.cuda()
+                    images = images / 255.0
+                    for i in range(images.shape[0]):
+                        if len(tt_samples) >= need:
+                            break
+                        base = (
+                            os.path.basename(img_paths[i])
+                            if i < len(img_paths) else ""
+                        )
+                        tt_samples.append(
+                            _build_viz_sample(
+                                net, images[i], base,
+                                float(args_ns.score_thr_cm),
+                                float(args_ns.nms_iou_thr),
+                                class_names,
+                            )
+                        )
+                    if len(tt_samples) >= need:
+                        break
+            if tt_samples:
+                viz.plot_sample_predictions(
+                    tt_samples,
+                    charts_dir,
+                    "samples_target_test.png",
+                    method=method,
+                    config=config_dict,
+                    title_suffix="(target test — real night, with GT)",
+                )
+        except Exception as e:
+            print(f"[WARN] target-test sample viz failed: {e}")
+
     metrics = dict(
         accuracy=m["accuracy"],
         precision=m["precision"],
@@ -666,6 +899,20 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         score_thr=float(args_ns.score_thr_cm),
         weights=str(args_ns.weights),
         elapsed_s=elapsed,
+        target_n=len(tgt_per_image),
+        target_n_gt=int(tgt_n_gt),
+        target_loss=float(tgt_loss),
+        target_pal2_loc_loss=float(tgt_loc_loss),
+        target_pal2_conf_loss=float(tgt_conf_loss),
+        target_accuracy=float(tgt_m["accuracy"]),
+        target_precision=float(tgt_m["precision"]),
+        target_recall=float(tgt_m["recall"]),
+        target_f1=float(tgt_m["f1"]),
+        target_mAP=float(tgt_mAP),
+        target_tp=int(tgt_m["tp"]),
+        target_fp=int(tgt_m["fp"]),
+        target_fn=int(tgt_m["fn"]),
+        target_test_file=str(target_test_file or ""),
     )
     with open(os.path.join(charts_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
@@ -689,6 +936,12 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         "timestamp", "weights", "n_samples", "n_gt",
         "accuracy", "precision", "recall", "f1", "mAP",
         "tp", "fp", "fn", "tp_norm", "fp_norm", "fn_norm",
+        "target_n", "target_n_gt",
+        "target_loss", "target_pal2_loc_loss", "target_pal2_conf_loss",
+        "target_accuracy", "target_precision", "target_recall",
+        "target_f1", "target_mAP",
+        "target_tp", "target_fp", "target_fn",
+        "target_tp_norm", "target_fp_norm", "target_fn_norm",
         *stat_keys,
         "iou_thr", "score_thr", "elapsed_s",
     ]
@@ -706,6 +959,22 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         "tp_norm": f"{m['tp'] / _tot_cnt:.6f}",
         "fp_norm": f"{m['fp'] / _tot_cnt:.6f}",
         "fn_norm": f"{m['fn'] / _tot_cnt:.6f}",
+        "target_n": len(tgt_per_image),
+        "target_n_gt": int(tgt_n_gt),
+        "target_loss": f"{tgt_loss:.6f}",
+        "target_pal2_loc_loss": f"{tgt_loc_loss:.6f}",
+        "target_pal2_conf_loss": f"{tgt_conf_loss:.6f}",
+        "target_accuracy": f"{tgt_m['accuracy']:.6f}",
+        "target_precision": f"{tgt_m['precision']:.6f}",
+        "target_recall": f"{tgt_m['recall']:.6f}",
+        "target_f1": f"{tgt_m['f1']:.6f}",
+        "target_mAP": f"{float(tgt_mAP):.6f}",
+        "target_tp": tgt_m["tp"],
+        "target_fp": tgt_m["fp"],
+        "target_fn": tgt_m["fn"],
+        "target_tp_norm": f"{tgt_m['tp'] / _t_tot:.6f}",
+        "target_fp_norm": f"{tgt_m['fp'] / _t_tot:.6f}",
+        "target_fn_norm": f"{tgt_m['fn'] / _t_tot:.6f}",
         **{k: f"{dist_stats.get(k, 0.0):.6f}" for k in stat_keys},
         "iou_thr": float(args_ns.iou_thr),
         "score_thr": float(args_ns.score_thr_cm),
@@ -721,7 +990,6 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     print(f"[viz] charts saved to {charts_dir}")
     print(f"[metrics] f1/precision/recall appended to {rec_path}")
     return metrics
-
 
 def _build_viz_sample(
     net: torch.nn.Module,
@@ -745,7 +1013,6 @@ def _build_viz_sample(
         "labels": labels,
         "title": title,
     }
-
 
 def _collect_paired_samples(
     net: torch.nn.Module,
@@ -789,7 +1056,6 @@ def _collect_paired_samples(
                 break
     return (day, synth)
 
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("DAI-Net evaluation driven by a YAML config.")
     p.add_argument(
@@ -801,11 +1067,9 @@ def parse_args() -> argparse.Namespace:
     cli = p.parse_args()
     return load_test_config(cli.config)
 
-
 def main() -> None:
     args_ns = parse_args()
     evaluate(args_ns)
-
 
 if __name__ == "__main__":
     main()
