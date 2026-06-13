@@ -45,11 +45,15 @@ _PRETTY_LOSS_NAME: Dict[str, str] = {
     "enhance": "Enhance",
     "enhance_l1ssim": "Enhance L1+SSIM",
     "mutual": "Mutual",
-    "kl_st": "KL align (target->source)",
-    "coral": "CORAL align (global)",
+    "kl_st": "KL align (source<->target)",
     "target_unsup": "Target unsup (recon)",
+    "target_sup_loc_pal1": "Target Sup Pal1 Loc",
+    "target_sup_conf_pal1": "Target Sup Pal1 Conf",
+    "target_sup_loc_pal2": "Target Sup Pal2 Loc",
+    "target_sup_conf_pal2": "Target Sup Pal2 Conf",
     "train_loss_epoch": "Train Loss (epoch)",
     "val_loss": "Val Loss",
+    "target_val_loss": "Target Val Loss",
 }
 _LOSS_ORDER: Tuple[str, ...] = (
     "total",
@@ -57,12 +61,15 @@ _LOSS_ORDER: Tuple[str, ...] = (
     "pal1_conf",
     "pal2_loc",
     "pal2_conf",
+    "target_sup_loc_pal1",
+    "target_sup_conf_pal1",
+    "target_sup_loc_pal2",
+    "target_sup_conf_pal2",
     "enhance",
     "enhance_l1ssim",
     "mutual",
 )
 _EPOCH_KEYS = frozenset({"train_loss_epoch", "val_loss"})
-
 
 def _run_tag(method: str, config: Config) -> str:
     parts: List[str] = []
@@ -77,7 +84,6 @@ def _run_tag(method: str, config: Config) -> str:
             parts.append(f"Exp {exp}")
     return " | ".join(parts)
 
-
 def make_charts_dir(
     charts_root: str, mode: str, architecture: str, backbone: str, num_exp: str
 ) -> str:
@@ -87,12 +93,10 @@ def make_charts_dir(
     os.makedirs(out, exist_ok=True)
     return out
 
-
 def _config_suffix(config: Config) -> str:
     if not config:
         return ""
     return " | ".join((f"{k}={v}" for (k, v) in config.items()))
-
 
 def _compose_title(method: str, subject: str, config: Config) -> str:
     title = f"{method} — {subject}"
@@ -101,13 +105,11 @@ def _compose_title(method: str, subject: str, config: Config) -> str:
         title += f"\n({sub})"
     return title
 
-
 def _save(fig: Figure, path: str) -> str:
     fig.tight_layout()
     fig.savefig(path, dpi=_DPI, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return path
-
 
 def plot_losses(
     history: History,
@@ -119,20 +121,22 @@ def plot_losses(
     if not history:
         return None
 
-    # Loss-function panels (per-iter, ONE curve each — these are the
-    # objective terms, NOT compared train/val).
     loss_fn_keys = list(_LOSS_ORDER) + [
-        "target_unsup", "kl_st", "coral", "wreg", "entropy"
+        "target_unsup", "kl_st", "wreg", "entropy"
     ]
     iter_panels = [k for k in loss_fn_keys if history.get(k)]
 
-    # Metric panels (epoch-wise, TRAIN vs VAL overlaid -> see overfitting).
     combined = [
         ("Loss (epoch)", "train_det_epoch", "val_loss"),
         ("Precision", "train_precision", "val_precision"),
         ("Recall", "train_recall", "val_recall"),
         ("F1 score", "train_f1", "val_f1"),
         ("mAP@0.5", "train_map", "val_map"),
+        ("Target Loss (epoch)", "train_target_det_epoch", "target_val_loss"),
+        ("Target Precision", None, "target_precision"),
+        ("Target Recall", None, "target_recall"),
+        ("Target F1 score", None, "target_f1"),
+        ("Target mAP@0.5", None, "target_map"),
     ]
     combined = [
         (lbl, tk, vk)
@@ -220,7 +224,6 @@ def plot_losses(
     plt.close(fig)
     return os.path.join(out_dir, "losses.png")
 
-
 def plot_train_vs_val(
     train_pts: Sequence[Point],
     val_pts: Sequence[Point],
@@ -266,7 +269,6 @@ def plot_train_vs_val(
     ax.set_axisbelow(True)
     ax.legend(loc="best", framealpha=0.9)
     return _save(fig, os.path.join(out_dir, fname))
-
 
 def plot_train_val_metrics(
     history: History,
@@ -332,7 +334,6 @@ def plot_train_val_metrics(
     fig.subplots_adjust(top=0.90)
     return _save(fig, os.path.join(out_dir, fname))
 
-
 def plot_confusion_matrix(
     cm: np.ndarray,
     out_dir: str,
@@ -340,6 +341,7 @@ def plot_confusion_matrix(
     config: Config = None,
     classes: Sequence[str] = ("object", "background"),
     normalize: bool = True,
+    fname: str = "confusion_matrix.png",
 ) -> str:
     cm = np.asarray(cm, dtype=np.float64)
     if normalize:
@@ -375,8 +377,7 @@ def plot_confusion_matrix(
                 color="white" if val > thresh else "black",
                 fontsize=11,
             )
-    return _save(fig, os.path.join(out_dir, "confusion_matrix.png"))
-
+    return _save(fig, os.path.join(out_dir, fname))
 
 def _pr_from_scores(
     scores: np.ndarray, matched: np.ndarray, n_gt: int
@@ -398,7 +399,6 @@ def _pr_from_scores(
     f1 = 2 * precision * recall / np.maximum(precision + recall, 1e-09)
     return (precision, recall, f1, ap)
 
-
 def plot_pr_curve(
     scores: np.ndarray,
     matched: np.ndarray,
@@ -406,6 +406,7 @@ def plot_pr_curve(
     out_dir: str,
     method: str = "DAI-Net",
     config: Config = None,
+    fname: str = "pr_curve.png",
 ) -> Tuple[str, float]:
     precision, recall, _, ap = _pr_from_scores(
         np.asarray(scores), np.asarray(matched), n_gt
@@ -420,9 +421,8 @@ def plot_pr_curve(
     ax.set_title(_compose_title(method, "Precision-Recall curve", config), fontsize=11)
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.legend(loc="lower left")
-    path = _save(fig, os.path.join(out_dir, "pr_curve.png"))
+    path = _save(fig, os.path.join(out_dir, fname))
     return (path, ap)
-
 
 def plot_recall_f1_curve(
     scores: np.ndarray,
@@ -431,6 +431,7 @@ def plot_recall_f1_curve(
     out_dir: str,
     method: str = "DAI-Net",
     config: Config = None,
+    fname: str = "recall_f1.png",
 ) -> str:
     _, recall, f1, _ = _pr_from_scores(np.asarray(scores), np.asarray(matched), n_gt)
     best_f1 = float(f1.max()) if len(f1) else 0.0
@@ -443,8 +444,7 @@ def plot_recall_f1_curve(
     ax.set_title(_compose_title(method, "Recall-F1 curve", config), fontsize=11)
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.legend(loc="lower left")
-    return _save(fig, os.path.join(out_dir, "recall_f1.png"))
-
+    return _save(fig, os.path.join(out_dir, fname))
 
 def _hist_panel(ax, series, colors, labels, title, xlabel, bins=40):
     """One publication-style distribution panel: filled hist + mean line."""
@@ -467,7 +467,6 @@ def _hist_panel(ax, series, colors, labels, title, xlabel, bins=40):
     ax.grid(True, linestyle="--", alpha=0.45)
     ax.legend(loc="best", framealpha=0.92, fontsize=9)
 
-
 def plot_test_distributions(
     feat_day,
     feat_night,
@@ -480,19 +479,7 @@ def plot_test_distributions(
     feat_before_day=None,
     feat_before_night=None,
 ) -> Optional[str]:
-    """Paper-style distributions from ``DSFD.extract_features`` over all
-    day (source-val) and night (target) images:
-
-    (0) per-image mean activation Day vs Night *before* the backbone
-        feature extractor (raw input — the domain gap going in),
-    (1) pooled backbone-feature activation Day vs Night *after*
-        ``DSFD.extract_features`` (the domain gap the model actually sees),
-    (2) source<->target symmetric KL-divergence, (3) cross-entropy
-        H(p_day, p_night) between the day and night predicted class
-        distributions (one distribution).
-    Panels with no data are dropped automatically; with all four present
-    the figure is a 2x2 grid (Before is the top-left panel, After top-right).
-    """
+  
     feat_before_day = feat_before_day or []
     feat_before_night = feat_before_night or []
     have_ba = bool(len(feat_before_day) or len(feat_before_night))
@@ -570,7 +557,6 @@ def plot_test_distributions(
     fig.subplots_adjust(top=0.84)
     return _save(fig, os.path.join(out_dir, fname))
 
-
 def _project_2d(feats: np.ndarray) -> Tuple[np.ndarray, str]:
     feats = np.asarray(feats, dtype=np.float64)
     if feats.shape[0] < 3:
@@ -593,7 +579,6 @@ def _project_2d(feats: np.ndarray) -> Tuple[np.ndarray, str]:
             return (x @ vt[:2].T, "PCA")
         except Exception:
             return (x[:, :2], "PCA(raw)")
-
 
 def plot_tsne_features(
     feats: np.ndarray,
@@ -632,13 +617,11 @@ def plot_tsne_features(
     ax.legend(loc="best", framealpha=0.9)
     return _save(fig, os.path.join(out_dir, fname))
 
-
 def _subsample(a: np.ndarray, cap: int, seed: int) -> np.ndarray:
     if a is None or len(a) <= cap:
         return a
     idx = np.random.RandomState(seed).choice(len(a), size=cap, replace=False)
     return a[idx]
-
 
 def _domain_scatter(ax, xy: np.ndarray, n_src: int, proj: str, title: str) -> None:
     ax.scatter(
@@ -657,7 +640,6 @@ def _domain_scatter(ax, xy: np.ndarray, n_src: int, proj: str, title: str) -> No
     ax.set_aspect("equal", adjustable="datalim")
     ax.grid(True, linestyle="--", alpha=0.35)
     ax.legend(loc="upper right", framealpha=0.9, markerscale=1.6)
-
 
 def plot_domain_tsne(
     feats_src: Optional[np.ndarray],
@@ -684,6 +666,65 @@ def plot_domain_tsne(
     )
     return _save(fig, os.path.join(out_dir, fname))
 
+def plot_target_metrics(
+    history: History,
+    out_dir: str,
+    method: str = "DAI-Net",
+    config: Config = None,
+    fname: str = "target_metrics.png",
+) -> Optional[str]:
+    panels = [
+        ("Loss", "train_target_det_epoch", "target_val_loss"),
+        ("Precision", None, "target_precision"),
+        ("Recall", None, "target_recall"),
+        ("F1 score", None, "target_f1"),
+        ("mAP@0.5", None, "target_map"),
+    ]
+    panels = [
+        p for p in panels
+        if (p[1] and history.get(p[1])) or history.get(p[2])
+    ]
+    if not panels:
+        return None
+    n = len(panels)
+    ncols = 2
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(7.5 * ncols, 4.2 * nrows), squeeze=False
+    )
+    for idx, (label, tr_key, va_key) in enumerate(panels):
+        ax = axes[idx // ncols][idx % ncols]
+        ax.set_facecolor("#ECECEC")
+        if tr_key:
+            tr = history.get(tr_key, [])
+            if tr:
+                xs, ys = zip(*tr)
+                ax.plot(
+                    xs, ys, color=_BLUE, linewidth=2.0, marker="o",
+                    markersize=4, label="train (target sup)",
+                )
+        va = history.get(va_key, [])
+        if va:
+            xs, ys = zip(*va)
+            ax.plot(
+                xs, ys, color=_RED, linewidth=2.0, marker="s",
+                markersize=4, label="val (target)",
+            )
+        ax.set_title(label, fontweight="bold", fontsize=12)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(label)
+        ax.grid(True, linestyle="--", alpha=0.5, color="white", linewidth=1.0)
+        ax.set_axisbelow(True)
+        ax.legend(loc="best", framealpha=0.9)
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+    run_tag = _run_tag(method, config)
+    sup = "Target — train vs val metrics"
+    if run_tag:
+        sup = f"{sup}  ·  {run_tag}"
+    fig.suptitle(sup, fontweight="bold", fontsize=13)
+    fig.subplots_adjust(top=0.90)
+    return _save(fig, os.path.join(out_dir, fname))
 
 def plot_domain_metrics(
     history: History,
@@ -741,7 +782,6 @@ def plot_domain_metrics(
     ax1.legend(lines, labs, loc="best", framealpha=0.9)
     return _save(fig, os.path.join(out_dir, fname))
 
-
 def _draw_boxes(ax: "plt.Axes", sample: Dict[str, Any]) -> None:
     boxes = np.asarray(sample.get("boxes", []))
     scores = np.asarray(sample.get("scores", []))
@@ -760,7 +800,6 @@ def _draw_boxes(ax: "plt.Axes", sample: Dict[str, Any]) -> None:
             fontsize=8,
             bbox=dict(facecolor="lime", alpha=0.7, pad=1),
         )
-
 
 def plot_sample_predictions(
     samples: Sequence[Dict[str, Any]],
@@ -792,7 +831,6 @@ def plot_sample_predictions(
     fig.subplots_adjust(top=0.9)
     return _save(fig, os.path.join(out_dir, fname))
 
-
 def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     if len(a) == 0 or len(b) == 0:
         return np.zeros((len(a), len(b)), dtype=np.float32)
@@ -809,7 +847,6 @@ def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
     union = area_a[:, None] + area_b[None, :] - inter
     return inter / np.maximum(union, 1e-09)
-
 
 def evaluate_detections(
     per_image: Iterable[Dict[str, Any]],
@@ -879,7 +916,6 @@ def evaluate_detections(
         cm,
     )
 
-
 class GradCAM:
 
     def __init__(self, model: Any, target_layer: Any) -> None:
@@ -890,14 +926,9 @@ class GradCAM:
         self.target_layer = target_layer
         self.activations: Optional[Any] = None
         self.gradients: Optional[Any] = None
-        # Tensor-hook approach (not register_full_backward_hook): DAI-Net
-        # uses inplace ReLU + custom autograd (Dark-ISP / reflectance), and
-        # a module full-backward-hook on a view modified inplace is
-        # forbidden by autograd. A hook on the activation tensor avoids it.
         self._fwd_handle = target_layer.register_forward_hook(self._fwd_hook)
 
     def _fwd_hook(self, module: Any, inp: Any, out: Any) -> None:
-        # Detached copy for the CAM weighting (safe vs later inplace ops).
         self.activations = out.detach().clone()
         if getattr(out, "requires_grad", False):
             out.register_hook(self._grad_hook)
@@ -943,7 +974,6 @@ class GradCAM:
         mn, mx = (float(cam.min()), float(cam.max()))
         return (cam - mn) / (mx - mn + 1e-09)
 
-
 def _overlay_heatmap(
     rgb_uint8: np.ndarray, cam01: np.ndarray, alpha: float = 0.45
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -957,7 +987,6 @@ def _overlay_heatmap(
     color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
     out = (alpha * color + (1 - alpha) * rgb_uint8).clip(0, 255).astype(np.uint8)
     return (out, color)
-
 
 def plot_gradcam_comparison(
     model: Any,
@@ -1029,7 +1058,6 @@ def plot_gradcam_comparison(
     fig.subplots_adjust(top=0.86)
     return _save(fig, os.path.join(out_dir, fname))
 
-
 def _parse_main_args(argv: Optional[Sequence[str]] = None) -> Any:
     import argparse
 
@@ -1064,7 +1092,6 @@ def _parse_main_args(argv: Optional[Sequence[str]] = None) -> Any:
     p.add_argument("--forward_end_idx", default=30, type=int)
     return p.parse_args(argv)
 
-
 def _load_images_from_folder(
     folder: str, max_n: int, size: int
 ) -> List[Tuple[np.ndarray, str]]:
@@ -1080,7 +1107,6 @@ def _load_images_from_folder(
         img = Image.open(f).convert("RGB").resize((size, size), Image.BILINEAR)
         out.append((np.asarray(img, dtype=np.uint8), os.path.basename(f)))
     return out
-
 
 def _load_day_from_wider(max_n: int, size: int) -> List[Tuple[np.ndarray, str]]:
     from PIL import Image
@@ -1114,7 +1140,6 @@ def _load_day_from_wider(max_n: int, size: int) -> List[Tuple[np.ndarray, str]]:
                 break
     return out
 
-
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = _parse_main_args(argv)
     import torch
@@ -1128,7 +1153,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cudnn.benchmark = True
     print(f"[main] building network ({args.model})")
     net = build_net("test", num_classes=dcfg.NUM_CLASSES, model=args.model)
-    state = torch.load(args.weights, map_location="cpu")
+    state = torch.load(args.weights, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "weight" in state:
         state = state["weight"]
     net.load_state_dict(state)
@@ -1205,7 +1230,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         layer_name=f"vgg[{target_idx}]->vgg[{end - 1}] (feature energy)",
     )
     print(f"[main] saved: {path}")
-
 
 if __name__ == "__main__":
     main()

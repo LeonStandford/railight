@@ -128,32 +128,38 @@ class DSFD(nn.Module):
             f = self.vgg[k](f)
         return self.ref(f)
 
-    @staticmethod
-    def _coral(s, t):
-        d = s.size(1)
-        s = s - s.mean(dim=0, keepdim=True)
-        t = t - t.mean(dim=0, keepdim=True)
-        cs = (s.t() @ s) / max(s.size(0) - 1, 1)
-        ct = (t.t() @ t) / max(t.size(0) - 1, 1)
-        return (cs - ct).pow(2).sum() / (4.0 * d * d)
-
-    def extract_features(self, x_source, x_target, I_source, I_target):
+    def extract_features(
+        self, x_source, x_target, I_source, I_target, return_reflectance=False
+    ):
         f_source = x_source
         for k in range(5):
             f_source = self.vgg[k](f_source)
         f_target = x_target
         for k in range(5):
             f_target = self.vgg[k](f_target)
-        s = f_source.mean(dim=(2, 3))
-        t = f_target.mean(dim=(2, 3))
-        temp = self.KL.T
-        s_prob = F.softmax(s / temp, dim=1).detach()
-        t_log_prob = F.log_softmax(t / temp, dim=1)
-        loss_kl_st = (
-            F.kl_div(t_log_prob, s_prob, reduction="batchmean") * temp * temp
+            
+        R_source = self.ref(f_source)
+        R_target = self.ref(f_target)
+        x_source_swap = (I_source * R_target).detach()
+        x_target_swap = (I_target * R_source).detach()
+        
+        for k in range(5):
+            x_source_swap = self.vgg[k](x_source_swap)
+        for k in range(5):
+            x_target_swap = self.vgg[k](x_target_swap)
+        f_source_pool = f_source.flatten(start_dim=2).mean(dim=-1)
+        f_target_pool = f_target.flatten(start_dim=2).mean(dim=-1)
+        x_source_swap_pool = x_source_swap.flatten(start_dim=2).mean(dim=-1)
+        x_target_swap_pool = x_target_swap.flatten(start_dim=2).mean(dim=-1)
+        loss_kl_st = cfg.WEIGHT.MC * (
+            self.KL(f_source_pool, f_target_pool)
+            + self.KL(f_target_pool, f_source_pool)
+            + self.KL(x_source_swap_pool, x_target_swap_pool)
+            + self.KL(x_target_swap_pool, x_source_swap_pool)
         )
-        loss_coral = self._coral(s, t)
-        return (s, t, loss_kl_st, loss_coral)
+        if return_reflectance:
+            return (f_source_pool, f_target_pool, loss_kl_st, R_target)
+        return (f_source_pool, f_target_pool, loss_kl_st)
 
     @torch.no_grad()
     def embed_features(self, x):
@@ -385,7 +391,7 @@ class DSFD(nn.Module):
         other, ext = os.path.splitext(base_file)
         if ext in (".pkl", ".pth"):
             print("Loading weights into state dict...")
-            mdata = torch.load(base_file, map_location=lambda storage, loc: storage)
+            mdata = torch.load(base_file, map_location=lambda storage, loc: storage, weights_only=False)
             # Checkpoints are saved as {"epoch": ..., "weight": state_dict};
             # unwrap to the actual state_dict and recover the saved epoch.
             epoch = 50

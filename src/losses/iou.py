@@ -102,17 +102,20 @@ class WIoULoss(nn.Module):
         if pred.numel() == 0:
             return pred.sum()
         iou, cw, ch, c2, *_ = _iou_parts(pred, tgt)
-        l_iou = 1 - iou  # per-box IoU loss
-
-        # R_WIoU: enclosing-box size in the denominator is detached.
-        denom = (cw**2 + ch**2).detach() ** 2 + _EPS
-        r_wiou = torch.exp(c2 / denom)
+        l_iou = 1 - iou
+        # R_WIoU = exp(rho^2 / c^2). c^2 = cw^2 + ch^2 (paper); the prior
+        # code squared it again (c^4) which made the ratio diverge when
+        # the enclosing box was small at init. Clamp the exp arg too: at
+        # random init pred/gt centers can be far apart relative to a
+        # degenerate enclosing box and exp(huge) -> 1e+25 finite garbage.
+        c2_denom = (cw**2 + ch**2).detach() + _EPS
+        ratio = (c2 / c2_denom).clamp_(max=10.0)
+        r_wiou = torch.exp(ratio)
         l_v1 = r_wiou * l_iou
 
         if self.version < 3:
-            return l_v1.sum()
+            return l_v1.mean()
 
-        # v3: dynamic non-monotonic focusing factor r.
         with torch.no_grad():
             mean = self._liou_mean.to(l_iou.device)
             mean = (
@@ -126,7 +129,7 @@ class WIoULoss(nn.Module):
                 * torch.pow(self.alpha, beta - self.delta)
                 + _EPS
             )
-        return (r * l_v1).sum()
+        return (r * l_v1).mean()
 
 
 class DFLoss(nn.Module):

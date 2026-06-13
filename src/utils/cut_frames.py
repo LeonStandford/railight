@@ -139,6 +139,9 @@ def main() -> None:
     total = 0
     outer = tqdm(videos, desc="videos", unit="vid", colour="red", dynamic_ncols=True)
     for v in outer:
+        # name_video = os.path.splitext(v)[0]
+        # output_path = os.path.join(args.path_output, name_video)
+        # os.makedirs(output_path, exist_ok=True)
         n = cutter.cut(
             os.path.join(args.path_input, v), args.path_output, outer_bar=outer
         )

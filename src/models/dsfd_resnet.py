@@ -1,6 +1,7 @@
 from __future__ import division
 from __future__ import print_function
 from __future__ import absolute_import
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -274,7 +275,7 @@ class DSFD(nn.Module):
         other, ext = os.path.splitext(base_file)
         if ext == ".pkl" or ".pth":
             print("Loading weights into state dict...")
-            mdata = torch.load(base_file, map_location=lambda storage, loc: storage)
+            mdata = torch.load(base_file, map_location=lambda storage, loc: storage, weights_only=False)
             weights = mdata["weight"]
             epoch = mdata["epoch"]
             self.load_state_dict(weights)

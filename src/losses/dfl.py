@@ -16,7 +16,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["FocalLoss", "compute_focal_alpha", "init_focal_bias"]
+__all__ = [
+    "FocalLoss",
+    "SigmoidFocalLoss",
+    "compute_focal_alpha",
+    "compute_focal_alpha_sigmoid",
+    "init_focal_bias",
+    "init_focal_bias_sigmoid",
+]
 
 
 class FocalLoss(nn.Module):
@@ -118,6 +125,140 @@ def compute_focal_alpha(
     except Exception as e:
         print(f"[focal] could not compute class alpha ({e}); using uniform.")
         return None
+
+
+class SigmoidFocalLoss(nn.Module):
+    """RetinaNet-style sigmoid focal loss with NO background class.
+
+    Per-class binary cross-entropy through sigmoid, with the focal
+    down-weighting. Input ``conf_t`` from the matcher follows the
+    SSD convention (0 = negative prior, 1..K = positive prior with that
+    fg class id). Internally:
+      * positive priors -> one-hot target of length K
+      * negative priors -> all-zero target of length K
+    All K outputs contribute via BCE-with-logits, so we genuinely train
+    "is class k present?" per anchor without a background slot.
+
+    Args:
+        gamma: focusing factor.
+        alpha: ``None`` | float | (K,) tensor of per-class weights. If
+            scalar, foreground positives get ``alpha``, negatives get
+            ``1 - alpha`` (standard RetinaNet alpha-balancing).
+        num_classes: K (foreground classes only).
+        reduction: "sum" | "mean" | "none".
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: Optional[Union[float, torch.Tensor]] = None,
+        num_classes: Optional[int] = None,
+        reduction: str = "sum",
+    ) -> None:
+        super().__init__()
+        self.gamma = float(gamma)
+        self.num_classes = num_classes
+        self.reduction = reduction
+        if alpha is None or isinstance(alpha, (float, int)):
+            self.register_buffer("alpha", None)
+            self.alpha_scalar = None if alpha is None else float(alpha)
+        else:
+            alpha_t = torch.as_tensor(alpha, dtype=torch.float32)
+            if num_classes is not None and alpha_t.numel() != num_classes:
+                raise ValueError(
+                    f"alpha length {alpha_t.numel()} != num_classes (K) {num_classes}"
+                )
+            self.register_buffer("alpha", alpha_t)
+            self.alpha_scalar = None
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # logits: (M, K) raw scores; targets: (M,) int (0 = negative,
+        # 1..K = positive prior with class id) — same convention as the
+        # matcher already produces.
+        M, K = logits.shape
+        targets = targets.view(-1).long()
+        onehot = logits.new_zeros((M, K))
+        pos = targets > 0
+        if pos.any():
+            cls_idx = (targets[pos] - 1).clamp_(0, K - 1)
+            onehot[pos, cls_idx] = 1.0
+        bce = F.binary_cross_entropy_with_logits(
+            logits, onehot, reduction="none"
+        )
+        p = torch.sigmoid(logits)
+        pt = p * onehot + (1.0 - p) * (1.0 - onehot)
+        loss = (1.0 - pt).pow(self.gamma) * bce
+        if self.alpha is not None:
+            # Per-(sample, channel) alpha (standard RetinaNet sigmoid focal).
+            # Channel c on a sample with target class c -> alpha[c]; channel
+            # c on a sample of any other class (or a negative anchor) ->
+            # 1 - alpha[c]. NOT alpha[target] broadcast across all K
+            # channels (that was wrong: it under-weighted positives in
+            # their own channel and left negatives entirely unweighted).
+            a = self.alpha.to(logits.device).view(1, -1)
+            w = a * onehot + (1.0 - a) * (1.0 - onehot)
+            loss = w * loss
+        elif self.alpha_scalar is not None:
+            w_pos = onehot * self.alpha_scalar + (1.0 - onehot) * (1.0 - self.alpha_scalar)
+            loss = w_pos * loss
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "none":
+            return loss
+        return loss.sum()
+
+
+def compute_focal_alpha_sigmoid(
+    list_file: str, num_classes: int
+) -> Optional[torch.Tensor]:
+    """Per-class focal alpha for SigmoidFocalLoss (no bg slot).
+
+    Inverse-frequency from the train list, normalised so the mean equals
+    0.25 (RetinaNet alpha default scale). Returns ``None`` on parse error
+    (focal then uses no alpha).
+    """
+    try:
+        counts = np.zeros(num_classes, dtype=np.float64)
+        with open(list_file, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    continue
+                n = int(parts[1])
+                for i in range(n):
+                    c = int(parts[6 + 5 * i])  # dataset is 1-indexed
+                    k = c - 1
+                    if 0 <= k < num_classes:
+                        counts[k] += 1
+        if counts.sum() == 0:
+            return None
+        # inverse frequency, normalise to mean 0.25 (RetinaNet scale)
+        w = 1.0 / np.maximum(counts, 1.0)
+        w = w * (0.25 * num_classes / w.sum())
+        return torch.as_tensor(w, dtype=torch.float32)
+    except Exception:
+        return None
+
+
+def init_focal_bias_sigmoid(
+    conf_modules: Iterable[nn.Module], num_classes: int, prior: float = 0.01
+) -> None:
+    """Sigmoid-focal classification-head bias prior (RetinaNet).
+
+    Every output channel is a binary "class-present" sigmoid; initialise
+    each bias to ``-log((1-pi)/pi)`` so the starting per-class probability
+    is ~= ``pi``. This avoids the early-training loss spike.
+    """
+    b = -math.log((1.0 - prior) / prior)
+    for module in conf_modules:
+        for m in module.modules():
+            if (
+                isinstance(m, nn.Conv2d)
+                and m.bias is not None
+                and m.out_channels % num_classes == 0
+            ):
+                with torch.no_grad():
+                    m.bias.fill_(b)
 
 
 def init_focal_bias(
