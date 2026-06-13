@@ -195,7 +195,7 @@ class DSFD(nn.Module):
         other, ext = os.path.splitext(base_file)
         if ext == ".pkl" or ".pth":
             print("Loading weights into state dict...")
-            mdata = torch.load(base_file, map_location=lambda storage, loc: storage)
+            mdata = torch.load(base_file, map_location=lambda storage, loc: storage, weights_only=False)
             weights = mdata["weight"]
             epoch = mdata["epoch"]
             self.load_state_dict(weights)
@@ -337,5 +337,5 @@ def build_net_vgg(phase, num_classes=2):
 
 if __name__ == "__main__":
     inputs = Variable(torch.randn(1, 3, 640, 640))
-    net = build_net("train", 2)
+    net = build_net_vgg("train", 2)
     out = net(inputs)

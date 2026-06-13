@@ -130,7 +130,7 @@ def load_test_config(config_path: str) -> argparse.Namespace:
     return argparse.Namespace(**merged)
 
 def _load_state_dict(net: torch.nn.Module, weights_path: str) -> None:
-    state = torch.load(weights_path, map_location="cpu")
+    state = torch.load(weights_path, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "weight" in state:
         state = state["weight"]
     net.load_state_dict(state)

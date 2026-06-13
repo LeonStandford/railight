@@ -11,7 +11,6 @@ from data.config import cfg
 from utils.augmentations import to_chw_bgr
 
 __all__ = [
-    "TargetDomainDetection",
     "TargetUnlabeledDataset",
     "TargetLabeledDataset",
     "target_collate",
@@ -28,52 +27,6 @@ IMG_EXTS: Tuple[str, ...] = (
     ".PNG",
     ".BMP",
 )
-
-def _list_images(folder: str, exts: Sequence[str] = IMG_EXTS) -> List[str]:
-    return sorted(
-        (os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(tuple(exts)))
-    )
-
-class TargetDomainDetection(data.Dataset):
-
-    def __init__(
-        self,
-        folder: str,
-        size: Optional[int] = None,
-        mode: str = "train",
-        return_path: bool = False,
-    ) -> None:
-        super().__init__()
-        if not os.path.isdir(folder):
-            raise FileNotFoundError(f"Target folder does not exist: {folder}")
-        self.folder = folder
-        self.size = int(size or cfg.INPUT_SIZE)
-        self.mode = mode
-        self.return_path = return_path
-        self.files: List[str] = _list_images(folder)
-        if not self.files:
-            raise RuntimeError(f"No images with extensions {IMG_EXTS} in {folder}")
-
-    def __len__(self) -> int:
-        return len(self.files)
-
-    def _load(self, path: str) -> torch.Tensor:
-        img = Image.open(path)
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        img = img.resize((self.size, self.size), Image.BILINEAR)
-        arr = np.asarray(img, dtype=np.float32)
-        if self.mode == "train" and random.random() < 0.5:
-            arr = arr[:, ::-1, :].copy()
-        arr = arr.transpose(2, 0, 1)
-        return torch.from_numpy(arr)
-
-    def __getitem__(self, idx: int) -> Union[torch.Tensor, Tuple[torch.Tensor, str]]:
-        path = self.files[idx]
-        img = self._load(path)
-        if self.return_path:
-            return (img, path)
-        return img
 
 class TargetUnlabeledDataset(data.Dataset):
     IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
@@ -229,7 +182,7 @@ class TargetLabeledDataset(data.Dataset):
             img = Image.open(image_path)
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            im_width, im_height = img.size
+                
             boxes_n = np.array(self.boxes[index], dtype=np.float32)
             label = np.array(self.labels[index], dtype=np.int64)
             bbox_labels = np.hstack(

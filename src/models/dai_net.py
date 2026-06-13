@@ -128,15 +128,21 @@ class DSFD(nn.Module):
             f = self.vgg[k](f)
         return self.ref(f)
 
-    def extract_features(self, x_source, x_target, I_source, I_target):
+    def extract_features(
+        self, x_source, x_target, I_source, I_target, return_reflectance=False
+    ):
         f_source = x_source
         for k in range(5):
             f_source = self.vgg[k](f_source)
         f_target = x_target
         for k in range(5):
             f_target = self.vgg[k](f_target)
-        x_source_swap = (I_source * self.ref(f_target)).detach()
-        x_target_swap = (I_target * self.ref(f_source)).detach()
+            
+        R_source = self.ref(f_source)
+        R_target = self.ref(f_target)
+        x_source_swap = (I_source * R_target).detach()
+        x_target_swap = (I_target * R_source).detach()
+        
         for k in range(5):
             x_source_swap = self.vgg[k](x_source_swap)
         for k in range(5):
@@ -151,6 +157,8 @@ class DSFD(nn.Module):
             + self.KL(x_source_swap_pool, x_target_swap_pool)
             + self.KL(x_target_swap_pool, x_source_swap_pool)
         )
+        if return_reflectance:
+            return (f_source_pool, f_target_pool, loss_kl_st, R_target)
         return (f_source_pool, f_target_pool, loss_kl_st)
 
     @torch.no_grad()
@@ -383,7 +391,7 @@ class DSFD(nn.Module):
         other, ext = os.path.splitext(base_file)
         if ext in (".pkl", ".pth"):
             print("Loading weights into state dict...")
-            mdata = torch.load(base_file, map_location=lambda storage, loc: storage)
+            mdata = torch.load(base_file, map_location=lambda storage, loc: storage, weights_only=False)
             # Checkpoints are saved as {"epoch": ..., "weight": state_dict};
             # unwrap to the actual state_dict and recover the saved epoch.
             epoch = 50

@@ -479,19 +479,7 @@ def plot_test_distributions(
     feat_before_day=None,
     feat_before_night=None,
 ) -> Optional[str]:
-    """Paper-style distributions from ``DSFD.extract_features`` over all
-    day (source-val) and night (target) images:
-
-    (0) per-image mean activation Day vs Night *before* the backbone
-        feature extractor (raw input — the domain gap going in),
-    (1) pooled backbone-feature activation Day vs Night *after*
-        ``DSFD.extract_features`` (the domain gap the model actually sees),
-    (2) source<->target symmetric KL-divergence, (3) cross-entropy
-        H(p_day, p_night) between the day and night predicted class
-        distributions (one distribution).
-    Panels with no data are dropped automatically; with all four present
-    the figure is a 2x2 grid (Before is the top-left panel, After top-right).
-    """
+  
     feat_before_day = feat_before_day or []
     feat_before_night = feat_before_night or []
     have_ba = bool(len(feat_before_day) or len(feat_before_night))
@@ -1165,7 +1153,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cudnn.benchmark = True
     print(f"[main] building network ({args.model})")
     net = build_net("test", num_classes=dcfg.NUM_CLASSES, model=args.model)
-    state = torch.load(args.weights, map_location="cpu")
+    state = torch.load(args.weights, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "weight" in state:
         state = state["weight"]
     net.load_state_dict(state)

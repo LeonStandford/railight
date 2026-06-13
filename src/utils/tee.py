@@ -27,6 +27,9 @@ class Tee:
 
         if had_escape and data.strip() == "":
             return ""
+
+        if data.strip() == "":
+            return ""
         return data
 
     def write(self, data: str) -> None:

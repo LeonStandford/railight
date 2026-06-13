@@ -5,6 +5,7 @@ CHECKPOINT_LATEST: str = "last_model.pth"
 CHECKPOINT_BEST: str = "best_model.pth"
 RETINEX_WEIGHTS: str = "decomp.pth"
 PRINT_EVERY: int = 100
+PBAR_EVERY: int = 20
 BACKBONE_FROM_MODEL: Dict[str, str] = {
     "dark": "vgg16",
     "vgg": "vgg16",
@@ -26,6 +27,13 @@ MODEL_FROM_ARCH_BACKBONE: Dict[Tuple[str, str], str] = {
     ("dsfd", "resnet101"): "resnet101",
     ("dsfd", "resnet152"): "resnet152",
 }
+
+TARGET_TO_SOURCE_CLASS_MAP: Dict[int, int] = {
+    1: 1,
+    7: 1,
+    5: 2,
+    6: 3,
+}
 TRAIN_COLUMNS: Tuple[str, ...] = (
     "epoch",
     "iteration",
@@ -42,6 +50,10 @@ TRAIN_COLUMNS: Tuple[str, ...] = (
     "kl_st",
     "wreg",
     "entropy",
+    "target_sup_loc_pal1",
+    "target_sup_conf_pal1",
+    "target_sup_loc_pal2",
+    "target_sup_conf_pal2",
     "elapsed_s",
     "timestamp",
 )
@@ -60,6 +72,17 @@ VAL_COLUMNS: Tuple[str, ...] = (
     "fn",
     "val_kl_st",
     "val_entropy",
+    "target_val_loss",
+    "target_val_pal2_loc",
+    "target_val_pal2_conf",
+    "target_precision",
+    "target_recall",
+    "target_f1",
+    "target_mAP",
+    "target_tp",
+    "target_fp",
+    "target_fn",
+    "target_n",
     "elapsed_s",
     "timestamp",
 )

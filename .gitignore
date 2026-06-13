@@ -9,3 +9,6 @@
 **/*charts
 .claude
 runs
+data
+**/*assets/*.tex
+**/*assets/*.pdf

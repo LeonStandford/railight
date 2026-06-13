@@ -4,6 +4,92 @@ import random
 import scipy.stats as stats
 
 
+_XYZ2CAMS = torch.tensor(
+    [
+        [[1.0234, -0.2969, -0.2266], [-0.5625, 1.6328, -0.0469], [-0.0703, 0.2188, 0.6406]],
+        [[0.4913, -0.0541, -0.0202], [-0.613, 1.3513, 0.2906], [-0.1564, 0.2151, 0.7183]],
+        [[0.838, -0.263, -0.0639], [-0.2887, 1.0725, 0.2496], [-0.0627, 0.1427, 0.5438]],
+        [[0.6596, -0.2079, -0.0562], [-0.4782, 1.3016, 0.1933], [-0.097, 0.1581, 0.5181]],
+    ],
+    dtype=torch.float,
+)
+_RGB2XYZ = torch.tensor(
+    [
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.072175],
+        [0.0193339, 0.119192, 0.9503041],
+    ],
+    dtype=torch.float,
+)
+
+
+@torch.no_grad()
+def run_batch_run_low_illumination_degrading(imgs):
+    """Vectorised, whole-batch equivalent of ``run_low_illumination_degrading``.
+
+    ``imgs`` is ``[B, 3, H, W]`` in ``[0, 1]``; returns the degraded batch with
+    the same shape. Random ISP parameters are sampled independently per image
+    (``[B]`` each), matching the per-image loop it replaces, but every step runs
+    as a single batched kernel instead of B Python iterations. Runs under
+    ``no_grad`` — the degraded image is a fixed augmented input (the ISP has no
+    learnable parameters), so this changes no model gradient.
+    """
+    device = imgs.device
+    B = imgs.shape[0]
+    eps = 1e-8
+    x = imgs.permute(0, 2, 3, 1)  # [B, H, W, 3]
+    # (1) inverse tone
+    x = 0.5 - torch.sin(torch.asin(1.0 - 2.0 * x) / 3.0)
+    # (2) inverse gamma
+    gamma = torch.empty(B, device=device).uniform_(2.0, 3.5)
+    g = gamma.view(B, 1, 1, 1)
+    x = x.clamp_min(eps) ** g
+    # (3) sRGB -> cRGB
+    idx = torch.randint(0, _XYZ2CAMS.shape[0], (B,), device=device)
+    xyz2cam = _XYZ2CAMS.to(device)[idx]  # [B, 3, 3]
+    rgb2cam = torch.matmul(xyz2cam, _RGB2XYZ.to(device))  # [B, 3, 3]
+    # match numpy ``rgb2cam / np.sum(rgb2cam, axis=-1)`` broadcast ([i, j] / rowsum[j])
+    rgb2cam = rgb2cam / rgb2cam.sum(dim=-1).unsqueeze(1)
+    x = torch.einsum("bhwj,bij->bhwi", x, rgb2cam)
+    # (4) inverse WB digital gains
+    rgb_gain = torch.empty(B, device=device).normal_(0.8, 0.1)
+    red_gain = torch.empty(B, device=device).uniform_(1.9, 2.4)
+    blue_gain = torch.empty(B, device=device).uniform_(1.5, 1.9)
+    ones = torch.ones_like(red_gain)
+    gains1 = torch.stack([1.0 / red_gain, ones, 1.0 / blue_gain], dim=-1) * rgb_gain.unsqueeze(-1)
+    x = x * gains1.view(B, 1, 1, 3)
+    # (5) darkness
+    lower, upper, mu, sigma = 0.01, 0.1, 0.1, 0.08
+    darkness = stats.truncnorm(
+        (lower - mu) / sigma, (upper - mu) / sigma, loc=mu, scale=sigma
+    ).rvs(size=B)
+    darkness = torch.as_tensor(darkness, dtype=torch.float, device=device).view(B, 1, 1, 1)
+    x = x * darkness
+    # (6) shot + read noise
+    log_shot = torch.empty(B, device=device).uniform_(float(np.log(0.0001)), float(np.log(0.012)))
+    shot_noise = log_shot.exp().view(B, 1, 1, 1)
+    read_noise = (
+        2.18 * log_shot + 1.2 + torch.empty(B, device=device).normal_(0.0, 0.26)
+    ).exp().view(B, 1, 1, 1)
+    var = (x * shot_noise + read_noise).clamp_min(eps)
+    x = x + torch.normal(mean=0.0, std=torch.sqrt(var))
+    # (7) quantisation
+    bits = torch.tensor([12.0, 14.0, 16.0], device=device)[
+        torch.randint(0, 3, (B,), device=device)
+    ]
+    q = (1.0 / (255.0 * bits)).view(B, 1, 1, 1)
+    x = x + (torch.rand_like(x) * 2.0 - 1.0) * q
+    # (8) white balance
+    gains2 = torch.stack([red_gain, ones, blue_gain], dim=-1)
+    x = x * gains2.view(B, 1, 1, 3)
+    # (9) cRGB -> sRGB
+    cam2rgb = torch.inverse(rgb2cam)  # [B, 3, 3]
+    x = torch.einsum("bhwj,bij->bhwi", x, cam2rgb)
+    # (10) gamma correction
+    x = x.clamp_min(eps) ** (1.0 / g)
+    return x.permute(0, 3, 1, 2).contiguous()
+
+
 def apply_ccm(image, ccm):
     shape = image.shape
     image = image.view(-1, 3)
@@ -22,7 +108,7 @@ def random_noise_levels():
     return (shot_noise, read_noise)
 
 
-def Low_Illumination_Degrading(img, safe_invert=False):
+def run_low_illumination_degrading(img, safe_invert=False):
 
     device = img.device
     config = dict(
