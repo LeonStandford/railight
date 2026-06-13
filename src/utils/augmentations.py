@@ -1,45 +1,30 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-import torch
-from torchvision import transforms
+
 import cv2
 import numpy as np
-import types
-from PIL import Image, ImageEnhance, ImageDraw
+from PIL import Image, ImageEnhance
 import math
 import six
+from dataclasses import dataclass
 from data.config import cfg
 import random
 
 
-class sampler:
-
-    def __init__(
-        self,
-        max_sample,
-        max_trial,
-        min_scale,
-        max_scale,
-        min_aspect_ratio,
-        max_aspect_ratio,
-        min_jaccard_overlap,
-        max_jaccard_overlap,
-        min_object_coverage,
-        max_object_coverage,
-        use_square=False,
-    ):
-        self.max_sample = max_sample
-        self.max_trial = max_trial
-        self.min_scale = min_scale
-        self.max_scale = max_scale
-        self.min_aspect_ratio = min_aspect_ratio
-        self.max_aspect_ratio = max_aspect_ratio
-        self.min_jaccard_overlap = min_jaccard_overlap
-        self.max_jaccard_overlap = max_jaccard_overlap
-        self.min_object_coverage = min_object_coverage
-        self.max_object_coverage = max_object_coverage
-        self.use_square = use_square
+@dataclass
+class Sampler:
+    max_sample: int
+    max_trial: int
+    min_scale: float
+    max_scale: float
+    min_aspect_ratio: float
+    max_aspect_ratio: float
+    min_jaccard_overlap: float
+    max_jaccard_overlap: float
+    min_object_coverage: float
+    max_object_coverage: float
+    use_square: bool = False
 
 
 def intersect(box_a, box_b):
@@ -627,15 +612,20 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
     rand_Side = boxArea[rand_idx] ** 0.5
     distance = infDistance
     anchor_idx = 5
+    
     for i, anchor in enumerate(scale_array):
         if abs(anchor - rand_Side) < distance:
             distance = abs(anchor - rand_Side)
             anchor_idx = i
-    target_anchor = random.choice(scale_array[0 : min(anchor_idx + 1, 5) + 1])
+            
+    _anchor_choices = scale_array[0 : min(anchor_idx + 1, 5) + 1]
+    target_anchor = _anchor_choices[random.randrange(len(_anchor_choices))]
     ratio = float(target_anchor) / rand_Side
     ratio = ratio * 2 ** random.uniform(-1, 1)
+    
     if int(img_height * ratio * img_width * ratio) > maxSize * maxSize:
         ratio = (maxSize * maxSize / (img_height * img_width)) ** 0.5
+    
     interp_methods = [
         cv2.INTER_LINEAR,
         cv2.INTER_CUBIC,
@@ -643,6 +633,7 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
         cv2.INTER_NEAREST,
         cv2.INTER_LANCZOS4,
     ]
+    
     interp_method = random.choice(interp_methods)
     image = cv2.resize(img, None, None, fx=ratio, fy=ratio, interpolation=interp_method)
     boxes[:, 0] *= ratio
@@ -656,6 +647,7 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
     bw = boxes[rand_idx, 2] - boxes[rand_idx, 0] + 1
     bh = boxes[rand_idx, 3] - boxes[rand_idx, 1] + 1
     w = h = 640
+    
     for _ in range(50):
         if w < max(height, width):
             if bw <= w:
@@ -669,6 +661,7 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
         else:
             w_off = random.uniform(width - w, 0)
             h_off = random.uniform(height - h, 0)
+            
         w_off = math.floor(w_off)
         h_off = math.floor(h_off)
         rect = np.array([int(w_off), int(h_off), int(w_off + w), int(h_off + h)])
@@ -681,6 +674,7 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
             continue
         else:
             sample_boxes.append(rect)
+            
     sampled_labels = []
     if len(sample_boxes) > 0:
         choice_idx = np.random.randint(len(sample_boxes))
@@ -693,6 +687,7 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
         current_labels = labels[mask]
         current_boxes[:, :2] -= choice_box[:2]
         current_boxes[:, 2:] -= choice_box[:2]
+        
         if choice_box[0] < 0 or choice_box[1] < 0:
             new_img_width = width if choice_box[0] >= 0 else width - choice_box[0]
             new_img_height = height if choice_box[1] >= 0 else height - choice_box[1]
@@ -711,6 +706,7 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
                 start_top:end_bottom, start_left:end_right, :
             ].copy()
             image_height, image_width, _ = current_image.shape
+            
             if cfg.filter_min_face:
                 bbox_w = current_boxes[:, 2] - current_boxes[:, 0]
                 bbox_h = current_boxes[:, 3] - current_boxes[:, 1]
@@ -727,6 +723,7 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
                     sample_label.append(current_boxes[i][3] / image_height)
                     sampled_labels += [sample_label]
                 sampled_labels = np.array(sampled_labels)
+                
             else:
                 current_boxes /= np.array(
                     [image_width, image_height, image_width, image_height]
@@ -735,10 +732,12 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
                     (current_labels[:, np.newaxis], current_boxes)
                 )
             return (current_image, sampled_labels)
+        
         current_image = image[
             choice_box[1] : choice_box[3], choice_box[0] : choice_box[2], :
         ].copy()
         image_height, image_width, _ = current_image.shape
+        
         if cfg.filter_min_face:
             bbox_w = current_boxes[:, 2] - current_boxes[:, 0]
             bbox_h = current_boxes[:, 3] - current_boxes[:, 1]
@@ -755,12 +754,14 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
                 sample_label.append(current_boxes[i][3] / image_height)
                 sampled_labels += [sample_label]
             sampled_labels = np.array(sampled_labels)
+            
         else:
             current_boxes /= np.array(
                 [image_width, image_height, image_width, image_height]
             )
             sampled_labels = np.hstack((current_labels[:, np.newaxis], current_boxes))
         return (current_image, sampled_labels)
+    
     else:
         image_height, image_width, _ = image.shape
         if cfg.filter_min_face:
@@ -779,6 +780,7 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
                 sample_label.append(boxes[i][3] / image_height)
                 sampled_labels += [sample_label]
             sampled_labels = np.array(sampled_labels)
+            
         else:
             boxes /= np.array([image_width, image_height, image_width, image_height])
             sampled_labels = np.hstack((labels[:, np.newaxis], boxes))
@@ -800,13 +802,17 @@ def anchor_crop_image_sampling2(
     rand_Side = boxArea[rand_idx] ** 0.5
     distance = infDistance
     anchor_idx = 5
+    
     for i, anchor in enumerate(scale_array):
         if abs(anchor - rand_Side) < distance:
             distance = abs(anchor - rand_Side)
             anchor_idx = i
-    target_anchor = random.choice(scale_array[0 : min(anchor_idx + 1, 5) + 1])
+            
+    _anchor_choices = scale_array[0 : min(anchor_idx + 1, 5) + 1]
+    target_anchor = _anchor_choices[random.randrange(len(_anchor_choices))]
     ratio = float(target_anchor) / rand_Side
     ratio = ratio * 2 ** random.uniform(-1, 1)
+    
     if int(img_height * ratio * img_width * ratio) > maxSize * maxSize:
         ratio = (maxSize * maxSize / (img_height * img_width)) ** 0.5
     interp_methods = [
@@ -816,6 +822,7 @@ def anchor_crop_image_sampling2(
         cv2.INTER_NEAREST,
         cv2.INTER_LANCZOS4,
     ]
+    
     interp_method = random.choice(interp_methods)
     image = cv2.resize(img, None, None, fx=ratio, fy=ratio, interpolation=interp_method)
     dark_image = cv2.resize(
@@ -832,6 +839,7 @@ def anchor_crop_image_sampling2(
     bw = boxes[rand_idx, 2] - boxes[rand_idx, 0] + 1
     bh = boxes[rand_idx, 3] - boxes[rand_idx, 1] + 1
     w = h = 640
+    
     for _ in range(50):
         if w < max(height, width):
             if bw <= w:
@@ -845,6 +853,7 @@ def anchor_crop_image_sampling2(
         else:
             w_off = random.uniform(width - w, 0)
             h_off = random.uniform(height - h, 0)
+            
         w_off = math.floor(w_off)
         h_off = math.floor(h_off)
         rect = np.array([int(w_off), int(h_off), int(w_off + w), int(h_off + h)])
@@ -857,6 +866,7 @@ def anchor_crop_image_sampling2(
             continue
         else:
             sample_boxes.append(rect)
+            
     sampled_labels = []
     if len(sample_boxes) > 0:
         choice_idx = np.random.randint(len(sample_boxes))
@@ -869,6 +879,7 @@ def anchor_crop_image_sampling2(
         current_labels = labels[mask]
         current_boxes[:, :2] -= choice_box[:2]
         current_boxes[:, 2:] -= choice_box[:2]
+        
         if choice_box[0] < 0 or choice_box[1] < 0:
             new_img_width = width if choice_box[0] >= 0 else width - choice_box[0]
             new_img_height = height if choice_box[1] >= 0 else height - choice_box[1]
@@ -909,6 +920,7 @@ def anchor_crop_image_sampling2(
                     sample_label.append(current_boxes[i][3] / image_height)
                     sampled_labels += [sample_label]
                 sampled_labels = np.array(sampled_labels)
+                
             else:
                 current_boxes /= np.array(
                     [image_width, image_height, image_width, image_height]
@@ -917,6 +929,7 @@ def anchor_crop_image_sampling2(
                     (current_labels[:, np.newaxis], current_boxes)
                 )
             return (current_image, current_darkimage, sampled_labels)
+        
         current_image = image[
             choice_box[1] : choice_box[3], choice_box[0] : choice_box[2], :
         ].copy()
@@ -924,6 +937,7 @@ def anchor_crop_image_sampling2(
             choice_box[1] : choice_box[3], choice_box[0] : choice_box[2], :
         ].copy()
         image_height, image_width, _ = current_image.shape
+        
         if cfg.filter_min_face:
             bbox_w = current_boxes[:, 2] - current_boxes[:, 0]
             bbox_h = current_boxes[:, 3] - current_boxes[:, 1]
@@ -931,6 +945,7 @@ def anchor_crop_image_sampling2(
             mask = bbox_area > cfg.min_face_size * cfg.min_face_size
             current_boxes = current_boxes[mask]
             current_labels = current_labels[mask]
+            
             for i in range(len(current_boxes)):
                 sample_label = []
                 sample_label.append(current_labels[i])
@@ -940,12 +955,14 @@ def anchor_crop_image_sampling2(
                 sample_label.append(current_boxes[i][3] / image_height)
                 sampled_labels += [sample_label]
             sampled_labels = np.array(sampled_labels)
+            
         else:
             current_boxes /= np.array(
                 [image_width, image_height, image_width, image_height]
             )
             sampled_labels = np.hstack((current_labels[:, np.newaxis], current_boxes))
         return (current_image, current_darkimage, sampled_labels)
+    
     else:
         image_height, image_width, _ = image.shape
         if cfg.filter_min_face:
@@ -964,6 +981,7 @@ def anchor_crop_image_sampling2(
                 sample_label.append(boxes[i][3] / image_height)
                 sampled_labels += [sample_label]
             sampled_labels = np.array(sampled_labels)
+            
         else:
             boxes /= np.array([image_width, image_height, image_width, image_height])
             sampled_labels = np.hstack((labels[:, np.newaxis], boxes))
@@ -973,18 +991,22 @@ def anchor_crop_image_sampling2(
 def preprocess(img, bbox_labels, mode, image_path):
     img_width, img_height = img.size
     sampled_labels = bbox_labels
+    
     if mode == "train":
+        
         if cfg.apply_distort:
             img = distort_image(img)
+            
         if cfg.apply_expand:
             img, bbox_labels, img_width, img_height = expand_image(
                 img, bbox_labels, img_width, img_height
             )
+            
         batch_sampler = []
         prob = np.random.uniform(0.0, 1.0)
         if prob > cfg.data_anchor_sampling_prob and cfg.anchor_sampling:
             scale_array = np.array([16, 32, 64, 128, 256, 512])
-            "\n            batch_sampler.append(\n                sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.6, 0.0, True))\n            sampled_bbox = generate_batch_random_samples(\n                batch_sampler, bbox_labels, img_width, img_height, scale_array,\n                cfg.resize_width, cfg.resize_height)\n            "
+            "\n            batch_sampler.append(\n                Sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.6, 0.0, True))\n            sampled_bbox = generate_batch_random_samples(\n                batch_sampler, bbox_labels, img_width, img_height, scale_array,\n                cfg.resize_width, cfg.resize_height)\n            "
             img = np.array(img)
             img, sampled_labels = anchor_crop_image_sampling(
                 img, bbox_labels, scale_array, img_width, img_height
@@ -992,26 +1014,28 @@ def preprocess(img, bbox_labels, mode, image_path):
             "\n            if len(sampled_bbox) > 0:\n                idx = int(np.random.uniform(0, len(sampled_bbox)))\n                img, sampled_labels = crop_image_sampling(\n                    img, bbox_labels, sampled_bbox[idx], img_width, img_height,\n                    cfg.resize_width, cfg.resize_height, cfg.min_face_size)\n            "
             img = img.astype("uint8")
             img = Image.fromarray(img)
+            
         else:
             batch_sampler.append(
-                sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             batch_sampler.append(
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             batch_sampler.append(
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             batch_sampler.append(
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             batch_sampler.append(
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             sampled_bbox = generate_batch_samples(
                 batch_sampler, bbox_labels, img_width, img_height
             )
             img = np.array(img)
+            
             if len(sampled_bbox) > 0:
                 idx = int(np.random.uniform(0, len(sampled_bbox)))
                 img, sampled_labels = crop_image(
@@ -1025,6 +1049,7 @@ def preprocess(img, bbox_labels, mode, image_path):
                     cfg.min_face_size,
                 )
             img = Image.fromarray(img)
+            
     interp_mode = [
         Image.BILINEAR,
         Image.HAMMING,
@@ -1032,33 +1057,45 @@ def preprocess(img, bbox_labels, mode, image_path):
         Image.BICUBIC,
         Image.LANCZOS,
     ]
+    
     interp_indx = np.random.randint(0, 5)
+    
     img = img.resize(
         (cfg.resize_width, cfg.resize_height), resample=interp_mode[interp_indx]
     )
+    
     img = np.array(img)
     if mode == "train":
         mirror = int(np.random.uniform(0, 2))
+        
         if mirror == 1:
             img = img[:, ::-1, :]
+            swap = {int(a): int(b) for a, b in cfg.FLIP_LABEL_SWAP}
             for i in six.moves.xrange(len(sampled_labels)):
                 tmp = sampled_labels[i][1]
                 sampled_labels[i][1] = 1 - sampled_labels[i][3]
                 sampled_labels[i][3] = 1 - tmp
+                c = int(sampled_labels[i][0])
+                if c in swap:
+                    sampled_labels[i][0] = swap[c]
+
     img = to_chw_bgr(img)
     img = img.astype("float32")
     img -= cfg.img_mean
     img = img[[2, 1, 0], :, :]
+    
     return (img, sampled_labels)
 
 
 def preprocess2(img, dark_img, bbox_labels, mode):
     img_width, img_height = img.size
     sampled_labels = bbox_labels
+    
     if mode == "train":
         if cfg.apply_distort:
             img = distort_image(img)
             dark_img = distort_image(dark_img)
+            
         if cfg.apply_expand:
             img, dark_img, bbox_labels, img_width, img_height = expand_image2(
                 img, dark_img, bbox_labels, img_width, img_height
@@ -1067,7 +1104,7 @@ def preprocess2(img, dark_img, bbox_labels, mode):
         prob = np.random.uniform(0.0, 1.0)
         if prob > cfg.data_anchor_sampling_prob and cfg.anchor_sampling:
             scale_array = np.array([16, 32, 64, 128, 256, 512])
-            "\n            batch_sampler.append(\n                sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.6, 0.0, True))\n            sampled_bbox = generate_batch_random_samples(\n                batch_sampler, bbox_labels, img_width, img_height, scale_array,\n                cfg.resize_width, cfg.resize_height)\n            "
+            "\n            batch_sampler.append(\n                Sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.6, 0.0, True))\n            sampled_bbox = generate_batch_random_samples(\n                batch_sampler, bbox_labels, img_width, img_height, scale_array,\n                cfg.resize_width, cfg.resize_height)\n            "
             img = np.array(img)
             img, dark_img, sampled_labels = anchor_crop_image_sampling2(
                 img, dark_img, bbox_labels, scale_array, img_width, img_height
@@ -1079,19 +1116,19 @@ def preprocess2(img, dark_img, bbox_labels, mode):
             dark_img = Image.fromarray(dark_img)
         else:
             batch_sampler.append(
-                sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             batch_sampler.append(
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             batch_sampler.append(
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             batch_sampler.append(
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             batch_sampler.append(
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
+                Sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True)
             )
             sampled_bbox = generate_batch_samples(
                 batch_sampler, bbox_labels, img_width, img_height
@@ -1134,10 +1171,14 @@ def preprocess2(img, dark_img, bbox_labels, mode):
         if mirror == 1:
             img = img[:, ::-1, :]
             dark_img = dark_img[:, ::-1, :]
+            swap = {int(a): int(b) for a, b in cfg.FLIP_LABEL_SWAP}
             for i in six.moves.xrange(len(sampled_labels)):
                 tmp = sampled_labels[i][1]
                 sampled_labels[i][1] = 1 - sampled_labels[i][3]
                 sampled_labels[i][3] = 1 - tmp
+                c = int(sampled_labels[i][0])
+                if c in swap:
+                    sampled_labels[i][0] = swap[c]
     img = to_chw_bgr(img)
     dark_img = to_chw_bgr(dark_img)
     img = img.astype("float32")

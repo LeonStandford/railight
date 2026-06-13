@@ -5,8 +5,11 @@ CHECKPOINT_LATEST: str = "last_model.pth"
 CHECKPOINT_BEST: str = "best_model.pth"
 RETINEX_WEIGHTS: str = "decomp.pth"
 PRINT_EVERY: int = 100
+PBAR_EVERY: int = 20
 BACKBONE_FROM_MODEL: Dict[str, str] = {
     "dark": "vgg16",
+    "dark_sppf": "vgg16_sppf",
+    "yolo26n": "yolo26n",
     "vgg": "vgg16",
     "resnet50": "resnet50",
     "resnet101": "resnet101",
@@ -14,6 +17,8 @@ BACKBONE_FROM_MODEL: Dict[str, str] = {
 }
 DEFAULT_ARCH_FROM_MODEL: Dict[str, str] = {
     "dark": "dai_net",
+    "dark_sppf": "dai_net",
+    "yolo26n": "dai_net",
     "vgg": "dsfd",
     "resnet50": "dsfd",
     "resnet101": "dsfd",
@@ -21,10 +26,19 @@ DEFAULT_ARCH_FROM_MODEL: Dict[str, str] = {
 }
 MODEL_FROM_ARCH_BACKBONE: Dict[Tuple[str, str], str] = {
     ("dai_net", "vgg16"): "dark",
+    ("dai_net", "vgg16_sppf"): "dark_sppf",
+    ("dai_net", "yolo26n"): "yolo26n",
     ("dsfd", "vgg16"): "vgg",
     ("dsfd", "resnet50"): "resnet50",
     ("dsfd", "resnet101"): "resnet101",
     ("dsfd", "resnet152"): "resnet152",
+}
+
+TARGET_TO_SOURCE_CLASS_MAP: Dict[int, int] = {
+    1: 1,
+    7: 1,
+    5: 2,
+    6: 3,
 }
 TRAIN_COLUMNS: Tuple[str, ...] = (
     "epoch",
@@ -60,6 +74,17 @@ VAL_COLUMNS: Tuple[str, ...] = (
     "fn",
     "val_kl_st",
     "val_entropy",
+    "target_val_loss",
+    "target_val_pal2_loc",
+    "target_val_pal2_conf",
+    "target_precision",
+    "target_recall",
+    "target_f1",
+    "target_mAP",
+    "target_tp",
+    "target_fp",
+    "target_fn",
+    "target_n",
     "elapsed_s",
     "timestamp",
 )

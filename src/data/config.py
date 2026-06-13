@@ -1,7 +1,7 @@
 from __future__ import division
 from __future__ import absolute_import
 from __future__ import print_function
-import os
+
 from easydict import EasyDict
 import numpy as np
 
@@ -35,12 +35,6 @@ _C.INPUT_SIZE = 640
 _C.STEPS = [4, 8, 16, 32, 64, 128]
 _C.ANCHOR_SIZES1 = [8, 16, 32, 64, 128, 256]
 _C.ANCHOR_SIZES2 = [16, 32, 64, 128, 256, 512]
-# Anchor aspect ratios. PriorBox builds priors with width=s/sqrt(ar),
-# height=s*sqrt(ar) -> prior w/h ~= 1/ar. Derived by k-means (K=6) on the
-# railway-defect train-set box aspect ratios so priors cover elongated
-# `crack` (w/h~3), tall `missing_items` (w/h~0.42) and `broken_sleeper`.
-# (Original [1.0] = square-only, inherited from the WIDER FACE detector,
-# could not match elongated cracks -> ~31% had no positive anchor.)
 _C.ASPECT_RATIO = [0.204, 0.317, 0.479, 0.823, 1.424, 2.455]
 _C.CLIP = False
 _C.VARIANCE = [0.1, 0.2]
@@ -59,11 +53,9 @@ _C.FACE = EasyDict()
 _C.FACE.TRAIN_FILE = "./dataset/wider_face_train.txt"
 _C.FACE.VAL_FILE = "./dataset/wider_face_val.txt"
 _C.FACE.OVERLAP_THRESH = 0.35
-
-# Focal loss for the classification branch (mitigates class imbalance:
-# rare `broken_sleeper`, misdetected `crack` vs dominant background).
-# ENABLED False -> fall back to the original cross-entropy + OHEM path.
 _C.FOCAL = EasyDict()
 _C.FOCAL.ENABLED = True
 _C.FOCAL.GAMMA = 2.0
 _C.FOCAL.ALPHA_BG = 0.25
+_C.FOCAL.CLASS_WEIGHTS = {}
+_C.FLIP_LABEL_SWAP = [[3, 4], [4, 3]]

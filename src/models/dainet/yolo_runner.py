@@ -322,7 +322,7 @@ def run(args: argparse.Namespace) -> None:
     if args.resume and os.path.isfile(args.resume):
         if dctx.rank0:
             print(f"Resuming weights from {args.resume}")
-        ckpt = torch.load(args.resume, map_location="cpu")
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt.get("weight", ckpt), strict=False)
     if dctx.enabled:
         model = DDP(model, device_ids=[dctx.local_rank], find_unused_parameters=True)
