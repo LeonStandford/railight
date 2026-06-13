@@ -16,10 +16,7 @@ class Tee:
 
     @classmethod
     def _sanitize_for_file(cls, data: str) -> str:
-        """Return a plain-text version: drop ANSI codes and progress-bar
-        refresh frames so the log file is readable as text."""
         had_cr = "\r" in data
-        # Keep only the latest segment of each carriage-return-updated line.
         if had_cr:
             data = "\n".join(seg.split("\r")[-1] for seg in data.split("\n"))
         had_escape = "\x1b" in data
@@ -29,6 +26,9 @@ class Tee:
             return ""
 
         if had_escape and data.strip() == "":
+            return ""
+
+        if data.strip() == "":
             return ""
         return data
 

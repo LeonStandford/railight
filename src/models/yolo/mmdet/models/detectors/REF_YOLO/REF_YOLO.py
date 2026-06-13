@@ -97,7 +97,7 @@ class REF_YOLO(BaseDetector):
         )
         return loss
 
-    def Low_Illumination_Degrading(self, img, img_meta, safe_invert=False):
+    def run_low_illumination_degrading(self, img, img_meta, safe_invert=False):
         """
         parameter setting
         """
@@ -293,7 +293,7 @@ class REF_YOLO(BaseDetector):
         ).to(torch.device(device))
         para_gt = torch.empty(size=(batch_size, 4)).to(torch.device(device))
         for i in range(batch_size):
-            img_dark[i], para_gt[i] = self.Low_Illumination_Degrading(
+            img_dark[i], para_gt[i] = self.run_low_illumination_degrading(
                 img[i], img_metas[i]
             )
         x_dark, loss = self.extract_feat_aet(img, img_dark)

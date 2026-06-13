@@ -25,7 +25,6 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "viz_full_every_epochs": 1,
     "resume": None,
     "kl_loss_weight": 1.0,
-    "coral_loss_weight": 0.1,
     "target_loss_weight": 0.05,
     "wreg_loss_weight": 0.0001,
     "entropy_loss_weight": 0.01,
@@ -64,7 +63,6 @@ class Config:
     viz_every_iters: int = 500
     viz_full_every_epochs: int = 1
     kl_loss_weight: float = 1.0
-    coral_loss_weight: float = 0.1
     target_loss_weight: float = 0.05
     wreg_loss_weight: float = 0.0001
     entropy_loss_weight: float = 0.01
