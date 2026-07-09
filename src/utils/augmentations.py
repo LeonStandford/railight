@@ -1070,11 +1070,15 @@ def preprocess(img, bbox_labels, mode, image_path):
         
         if mirror == 1:
             img = img[:, ::-1, :]
+            swap = {int(a): int(b) for a, b in cfg.FLIP_LABEL_SWAP}
             for i in six.moves.xrange(len(sampled_labels)):
                 tmp = sampled_labels[i][1]
                 sampled_labels[i][1] = 1 - sampled_labels[i][3]
                 sampled_labels[i][3] = 1 - tmp
-                
+                c = int(sampled_labels[i][0])
+                if c in swap:
+                    sampled_labels[i][0] = swap[c]
+
     img = to_chw_bgr(img)
     img = img.astype("float32")
     img -= cfg.img_mean
@@ -1167,10 +1171,14 @@ def preprocess2(img, dark_img, bbox_labels, mode):
         if mirror == 1:
             img = img[:, ::-1, :]
             dark_img = dark_img[:, ::-1, :]
+            swap = {int(a): int(b) for a, b in cfg.FLIP_LABEL_SWAP}
             for i in six.moves.xrange(len(sampled_labels)):
                 tmp = sampled_labels[i][1]
                 sampled_labels[i][1] = 1 - sampled_labels[i][3]
                 sampled_labels[i][3] = 1 - tmp
+                c = int(sampled_labels[i][0])
+                if c in swap:
+                    sampled_labels[i][0] = swap[c]
     img = to_chw_bgr(img)
     dark_img = to_chw_bgr(dark_img)
     img = img.astype("float32")

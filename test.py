@@ -37,7 +37,6 @@ from utils import visualize as viz
 from train import (
     _BACKBONE_FROM_MODEL,
     _MODEL_FROM_ARCH_BACKBONE,
-    TARGET_TO_SOURCE_CLASS_MAP,
     _decode_per_image,
     _detect_metrics_from_cm,
     _format_val_table,
@@ -141,6 +140,62 @@ def _bgr_chw_to_rgb_uint8(tensor_chw: torch.Tensor) -> np.ndarray:
         .clip(0, 255)
         .astype(np.uint8)
     )
+
+@torch.no_grad()
+def extract_backbone_features(
+    net: torch.nn.Module,
+    image: torch.Tensor,
+    layer_idx: int | None = None,
+) -> torch.Tensor:
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+    n = len(net.vgg) if layer_idx is None else int(layer_idx)
+    gf = image
+    for k in range(n):
+        gf = net.vgg[k](gf)
+    return gf
+
+def features_to_single_channel(
+    gf: torch.Tensor, normalize: bool = True
+) -> torch.Tensor:
+    if gf.dim() == 3:
+        gf = gf.unsqueeze(0)
+    smap = gf.mean(dim=1, keepdim=True)
+    if normalize:
+        b = smap.shape[0]
+        flat = smap.reshape(b, -1).float()
+        mn = flat.min(dim=1, keepdim=True)[0]
+        mx = flat.max(dim=1, keepdim=True)[0]
+        flat = (flat - mn) / (mx - mn + 1e-8)
+        smap = flat.reshape_as(smap)
+    return smap
+
+def backbone_feature_map(
+    net: torch.nn.Module,
+    image: torch.Tensor,
+    layer_idx: int | None = None,
+    normalize: bool = True,
+) -> torch.Tensor:
+    gf = extract_backbone_features(net, image, layer_idx=layer_idx)
+    return features_to_single_channel(gf, normalize=normalize)
+
+def save_backbone_feature_heatmap(
+    net: torch.nn.Module,
+    image: torch.Tensor,
+    out_path: str,
+    layer_idx: int | None = None,
+) -> str:
+    import cv2
+
+    if image.dim() == 4:
+        image = image[0]
+    smap = backbone_feature_map(net, image, layer_idx=layer_idx, normalize=True)
+    cam = smap[0, 0].detach().cpu().numpy()
+    rgb = _bgr_chw_to_rgb_uint8(image)
+    overlay, _heat = viz._overlay_heatmap(rgb, cam)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    cv2.imwrite(out_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    return out_path
 
 def _export_yolo_predictions(
     per_image: List[Dict[str, np.ndarray]],
@@ -485,7 +540,31 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     tgt_conf_loss = 0.0
     tgt_n_imgs = 0
     target_test_file = getattr(args_ns, "target_test_file", None)
-    if target_test_file and os.path.isfile(target_test_file):
+    tgt_images_dir, tgt_labels_dir = resolve_target_label_paths(
+        getattr(args_ns, "target_folder4unsupervised", "")
+    )
+    target_class_map = getattr(args_ns, "target_class_map", None) or {
+        i: i + 1 for i in range(int(args_ns.nc))
+    }
+    tgt_ds = None
+    tgt_source_desc = ""
+    if tgt_images_dir and tgt_labels_dir:
+        try:
+            tgt_ds = TargetLabeledDataset(
+                tgt_images_dir, tgt_labels_dir,
+                class_map=target_class_map, mode="val",
+            )
+            tgt_source_desc = tgt_labels_dir
+        except Exception as e:
+            print(f"[WARN] target labelled folder eval skipped: {e}")
+            tgt_ds = None
+    if (tgt_ds is None or len(tgt_ds) == 0) and (
+        target_test_file and os.path.isfile(target_test_file)
+    ):
+        tgt_ds = SourceDomainDetection(target_test_file, mode="val")
+        tgt_source_desc = target_test_file
+
+    if tgt_ds is not None and len(tgt_ds) > 0:
         try:
             from layers.modules import MultiBoxLoss
             from losses.dfl import FocalLoss, compute_focal_alpha
@@ -493,9 +572,11 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
 
             cls_loss_fn = None
             if getattr(cfg, "FOCAL", None) is not None and cfg.FOCAL.ENABLED:
-                alpha = compute_focal_alpha(
-                    target_test_file, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
-                )
+                alpha = None
+                if target_test_file and os.path.isfile(target_test_file):
+                    alpha = compute_focal_alpha(
+                        target_test_file, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
+                    )
                 cls_loss_fn = FocalLoss(
                     gamma=cfg.FOCAL.GAMMA, alpha=alpha, num_classes=num_classes
                 )
@@ -506,7 +587,6 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                 cfg, use_cuda, cls_loss_fn=cls_loss_fn, box_loss_fn=box_loss_fn
             )
 
-            tgt_ds = SourceDomainDetection(target_test_file, mode="val")
             tgt_n_imgs = len(tgt_ds)
             tv_loader = data.DataLoader(
                 tgt_ds,
@@ -520,7 +600,7 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             with torch.no_grad():
                 for tvi, ttgt, _tpaths in tqdm(
                     tv_loader, total=len(tv_loader),
-                    desc="Evaluating target test",
+                    desc="Evaluating target (supervised)",
                     dynamic_ncols=True, unit="batch", colour="magenta",
                 ):
                     if use_cuda:
@@ -553,56 +633,7 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                     np.asarray(tgt_matched), tgt_n_gt,
                 )
         except Exception as e:
-            print(f"[WARN] target test eval skipped: {e}")
-    else:
-        tgt_images_dir, tgt_labels_dir = resolve_target_label_paths(
-            getattr(args_ns, "target_folder4unsupervised", "")
-        )
-        if tgt_images_dir and tgt_labels_dir:
-            try:
-                tvds = TargetLabeledDataset(
-                    tgt_images_dir, tgt_labels_dir,
-                    class_map=TARGET_TO_SOURCE_CLASS_MAP, mode="val",
-                )
-                tgt_n_imgs = len(tvds)
-                if tgt_n_imgs > 0:
-                    tv_loader = data.DataLoader(
-                        tvds,
-                        args_ns.batch_size,
-                        num_workers=0,
-                        collate_fn=detection_collate,
-                        shuffle=False,
-                        pin_memory=use_cuda,
-                    )
-                    with torch.no_grad():
-                        for tvi, ttgt, _tpaths in tqdm(
-                            tv_loader, total=len(tv_loader),
-                            desc="Evaluating target (real night, full folder)",
-                            dynamic_ncols=True, unit="batch", colour="magenta",
-                        ):
-                            if use_cuda:
-                                tvi = tvi.cuda()
-                            tvi = tvi / 255.0
-                            tvout, _ = net.test_forward(tvi)
-                            tgt_per_image.extend(
-                                _decode_per_image(tvout, ttgt, net)
-                            )
-                    if tgt_per_image:
-                        tgt_scores, tgt_matched, tgt_n_gt, tgt_cm = (
-                            viz.evaluate_detections(
-                                tgt_per_image,
-                                iou_thr=float(args_ns.iou_thr),
-                                score_thr_cm=float(args_ns.score_thr_cm),
-                                num_classes=args_ns.nc,
-                            )
-                        )
-                        tgt_m = _detect_metrics_from_cm(tgt_cm)
-                        _, _, _, tgt_mAP = viz._pr_from_scores(
-                            np.asarray(tgt_scores),
-                            np.asarray(tgt_matched), tgt_n_gt,
-                        )
-            except Exception as e:
-                print(f"[WARN] target-val eval skipped: {e}")
+            print(f"[WARN] target supervised eval skipped: {e}")
     _t_tot = max(tgt_m["tp"] + tgt_m["fp"] + tgt_m["fn"], 1)
     table = _format_val_table(
         "test",
@@ -624,8 +655,8 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                 "TP/FP/FN (normalized)",
                 f"{_tp / _tot:.3f}/{_fp / _tot:.3f}/{_fn / _tot:.3f}",
             ),
-            ("§", "Target test metrics (real night)"),
-            ("target_test_file", str(target_test_file or "<labeled folder>")),
+            ("§", "Target metrics (real night, supervised)"),
+            ("target_source", str(tgt_source_desc or "<none>")),
             ("target_n", f"{len(tgt_per_image)}"),
             ("target_n_gt", f"{tgt_n_gt}"),
             ("target_loss", f"{tgt_loss:.4f}"),
@@ -789,6 +820,38 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     except Exception as e:
         print(f"[WARN] grad-cam viz failed: {e}")
 
+    try:
+        s_img = None
+        for s_b, _t, _p in val_loader:
+            if use_cuda:
+                s_b = s_b.cuda()
+            s_img = (s_b / 255.0)[0]
+            break
+        if s_img is not None:
+            save_backbone_feature_heatmap(
+                net, s_img,
+                os.path.join(charts_dir, "gf_heatmap_source.png"),
+            )
+
+        tgt_dir = getattr(args_ns, "target_folder4unsupervised", "")
+        if tgt_dir and os.path.isdir(tgt_dir):
+            _tds = TargetUnlabeledDataset(tgt_dir, size=cfg.INPUT_SIZE)
+            _tl = data.DataLoader(
+                _tds, batch_size=args_ns.batch_size,
+                shuffle=False, num_workers=0,
+            )
+            for t_b in _tl:
+                if use_cuda:
+                    t_b = t_b.cuda()
+                save_backbone_feature_heatmap(
+                    net, (t_b / 255.0)[0],
+                    os.path.join(charts_dir, "gf_heatmap_target.png"),
+                )
+                break
+        print(f"[viz] backbone feature heatmaps saved to {charts_dir}")
+    except Exception as e:
+        print(f"[WARN] backbone feature heatmap failed: {e}")
+
     day_samples, synth_night_samples = _collect_paired_samples(
         net,
         val_loader,
@@ -912,7 +975,7 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         target_tp=int(tgt_m["tp"]),
         target_fp=int(tgt_m["fp"]),
         target_fn=int(tgt_m["fn"]),
-        target_test_file=str(target_test_file or ""),
+        target_test_file=str(tgt_source_desc or ""),
     )
     with open(os.path.join(charts_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)

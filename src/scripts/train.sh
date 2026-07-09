@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -e
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 cd "$(dirname "$0")/../.."
 
-CONFIG=configs/train/dai_net/vgg16/exp4.yaml
+CONFIG=configs/train/dai_net/yolo26n/exp1.yaml
 
 if [ ! -f "$CONFIG" ]; then
     echo "ERROR: CONFIG=$CONFIG does not exist." >&2; exit 1
@@ -15,10 +14,10 @@ GPU_IDS=$(grep -E '^[[:space:]]*gpu_ids:' "$CONFIG" \
 if [ -z "$GPU_IDS" ]; then
     echo "ERROR: gpu_ids not set in $CONFIG." >&2; exit 1
 fi
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 NUM_GPUS=$(echo "$GPU_IDS" | awk -F',' '{print NF}')
-
-TORCHRUN=/home/longpm/miniconda3/envs/dai-net/bin/torchrun
 
 echo "=========================================="
 echo " DAI-Net training"
@@ -26,7 +25,7 @@ echo "   config         : $CONFIG"
 echo "   gpu_ids        : $GPU_IDS        nproc_per_node : $NUM_GPUS"
 echo "=========================================="
 
-"$TORCHRUN" \
+torchrun \
     --standalone \
     --nnodes=1 \
     --nproc_per_node="$NUM_GPUS" \

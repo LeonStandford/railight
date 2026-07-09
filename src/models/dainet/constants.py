@@ -8,6 +8,8 @@ PRINT_EVERY: int = 100
 PBAR_EVERY: int = 20
 BACKBONE_FROM_MODEL: Dict[str, str] = {
     "dark": "vgg16",
+    "dark_sppf": "vgg16_sppf",
+    "yolo26n": "yolo26n",
     "vgg": "vgg16",
     "resnet50": "resnet50",
     "resnet101": "resnet101",
@@ -15,6 +17,8 @@ BACKBONE_FROM_MODEL: Dict[str, str] = {
 }
 DEFAULT_ARCH_FROM_MODEL: Dict[str, str] = {
     "dark": "dai_net",
+    "dark_sppf": "dai_net",
+    "yolo26n": "dai_net",
     "vgg": "dsfd",
     "resnet50": "dsfd",
     "resnet101": "dsfd",
@@ -22,6 +26,8 @@ DEFAULT_ARCH_FROM_MODEL: Dict[str, str] = {
 }
 MODEL_FROM_ARCH_BACKBONE: Dict[Tuple[str, str], str] = {
     ("dai_net", "vgg16"): "dark",
+    ("dai_net", "vgg16_sppf"): "dark_sppf",
+    ("dai_net", "yolo26n"): "yolo26n",
     ("dsfd", "vgg16"): "vgg",
     ("dsfd", "resnet50"): "resnet50",
     ("dsfd", "resnet101"): "resnet101",
@@ -50,10 +56,6 @@ TRAIN_COLUMNS: Tuple[str, ...] = (
     "kl_st",
     "wreg",
     "entropy",
-    "target_sup_loc_pal1",
-    "target_sup_conf_pal1",
-    "target_sup_loc_pal2",
-    "target_sup_conf_pal2",
     "elapsed_s",
     "timestamp",
 )

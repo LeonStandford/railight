@@ -40,8 +40,9 @@ def smooth(input_I, input_R):
 
 class EnhanceLoss(nn.Module):
 
-    def __init__(self):
+    def __init__(self, use_rc_loss: bool = True):
         super(EnhanceLoss, self).__init__()
+        self.use_rc_loss = use_rc_loss
 
     def forward(self, preds, img, img_dark):
         R_dark, R_light, R_dark_2, R_light_2, I_dark, I_light = preds
@@ -54,10 +55,13 @@ class EnhanceLoss(nn.Module):
         )
         losses_smooth_low = smooth(I_dark, R_dark) * cfg.WEIGHT.SMOOTH
         losses_smooth_high = smooth(I_light, R_light) * cfg.WEIGHT.SMOOTH
-        losses_rc = (
-            F.mse_loss(R_dark_2, R_dark.detach())
-            + F.mse_loss(R_light_2, R_light.detach())
-        ) * cfg.WEIGHT.RC
+        if self.use_rc_loss:
+            losses_rc = (
+                F.mse_loss(R_dark_2, R_dark.detach())
+                + F.mse_loss(R_light_2, R_light.detach())
+            ) * cfg.WEIGHT.RC
+        else:
+            losses_rc = torch.zeros((), device=R_dark.device)
         enhance_loss = (
             losses_equal_R
             + losses_recon_low
