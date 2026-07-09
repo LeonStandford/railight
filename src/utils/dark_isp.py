@@ -25,15 +25,6 @@ _RGB2XYZ = torch.tensor(
 
 @torch.no_grad()
 def run_batch_run_low_illumination_degrading(imgs):
-    """Vectorised, whole-batch equivalent of ``run_low_illumination_degrading``.
-
-    ``imgs`` is ``[B, 3, H, W]`` in ``[0, 1]``; returns the degraded batch with
-    the same shape. Random ISP parameters are sampled independently per image
-    (``[B]`` each), matching the per-image loop it replaces, but every step runs
-    as a single batched kernel instead of B Python iterations. Runs under
-    ``no_grad`` — the degraded image is a fixed augmented input (the ISP has no
-    learnable parameters), so this changes no model gradient.
-    """
     device = imgs.device
     B = imgs.shape[0]
     eps = 1e-8

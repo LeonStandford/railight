@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable, Function
 from layers import *
 from data.config import cfg
+from models.blocks_ultra import SPPF, C2PSA
 
 
 class Interpolate(nn.Module):
@@ -80,10 +81,17 @@ class FEM(nn.Module):
 
 class DSFD(nn.Module):
 
-    def __init__(self, phase, base, extras, fem, head1, head2, num_classes):
+    def __init__(
+        self, phase, base, extras, fem, head1, head2, num_classes, enhance=False
+    ):
         super(DSFD, self).__init__()
         self.phase = phase
         self.num_classes = num_classes
+        self._prior_cache = {}
+        self.enhance = enhance
+        if enhance:
+            self.sppf = SPPF(1024, 1024, k=5)
+            self.psa = C2PSA(1024, 1024, n=1)
         self.vgg = nn.ModuleList(base)
         self.L2Normof1 = L2Norm(256, 10)
         self.L2Normof2 = L2Norm(512, 8)
@@ -114,6 +122,15 @@ class DSFD(nn.Module):
     def _upsample_prod(self, x, y):
         _, _, H, W = y.size()
         return F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False) * y
+
+    def _cached_priors(self, size, features_maps, pal):
+        key = (int(size[0]), int(size[1]), tuple(tuple(f) for f in features_maps), pal)
+        cached = self._prior_cache.get(key)
+        if cached is None:
+            with torch.no_grad():
+                cached = PriorBox(size, features_maps, cfg, pal=pal).forward()
+            self._prior_cache[key] = cached
+        return cached
 
     def enh_forward(self, x):
         x = x[:1]
@@ -197,6 +214,9 @@ class DSFD(nn.Module):
         for k in range(30, len(self.vgg)):
             x = self.vgg[k](x)
         of4 = x
+        if self.enhance:
+            of4 = self.psa(self.sppf(of4))
+            x = of4
         pal1_sources.append(of4)
         for k in range(2):
             x = F.relu(self.extras[k](x), inplace=True)
@@ -244,12 +264,8 @@ class DSFD(nn.Module):
         conf_pal1 = torch.cat([o.view(o.size(0), -1) for o in conf_pal1], 1)
         loc_pal2 = torch.cat([o.view(o.size(0), -1) for o in loc_pal2], 1)
         conf_pal2 = torch.cat([o.view(o.size(0), -1) for o in conf_pal2], 1)
-        priorbox = PriorBox(size, features_maps, cfg, pal=1)
-        with torch.no_grad():
-            self.priors_pal1 = priorbox.forward()
-        priorbox = PriorBox(size, features_maps, cfg, pal=2)
-        with torch.no_grad():
-            self.priors_pal2 = priorbox.forward()
+        self.priors_pal1 = self._cached_priors(size, features_maps, 1)
+        self.priors_pal2 = self._cached_priors(size, features_maps, 2)
         if self.phase == "test":
             output = self.detect.forward(
                 loc_pal2.view(loc_pal2.size(0), -1, 4),
@@ -317,6 +333,9 @@ class DSFD(nn.Module):
         for k in range(30, len(self.vgg)):
             x = self.vgg[k](x)
         of4 = x
+        if self.enhance:
+            of4 = self.psa(self.sppf(of4))
+            x = of4
         pal1_sources.append(of4)
         for k in range(2):
             x = F.relu(self.extras[k](x), inplace=True)
@@ -364,12 +383,8 @@ class DSFD(nn.Module):
         conf_pal1 = torch.cat([o.view(o.size(0), -1) for o in conf_pal1], 1)
         loc_pal2 = torch.cat([o.view(o.size(0), -1) for o in loc_pal2], 1)
         conf_pal2 = torch.cat([o.view(o.size(0), -1) for o in conf_pal2], 1)
-        priorbox = PriorBox(size, features_maps, cfg, pal=1)
-        with torch.no_grad():
-            self.priors_pal1 = priorbox.forward()
-        priorbox = PriorBox(size, features_maps, cfg, pal=2)
-        with torch.no_grad():
-            self.priors_pal2 = priorbox.forward()
+        self.priors_pal1 = self._cached_priors(size, features_maps, 1)
+        self.priors_pal2 = self._cached_priors(size, features_maps, 2)
         if self.phase == "test":
             output = self.detect.forward(
                 loc_pal2.view(loc_pal2.size(0), -1, 4),
@@ -516,10 +531,6 @@ def add_extras(cfg, i, batch_norm=False):
 def multibox(vgg, extra_layers, num_classes):
     loc_layers = []
     conf_layers = []
-    # Priors generated per feature-map cell by PriorBox = len(cfg.ASPECT_RATIO).
-    # The detection head must emit (num_anchors * 4) loc and
-    # (num_anchors * num_classes) conf channels so predictions stay aligned
-    # with the prior boxes after the .view(N, -1, 4 / num_classes) reshape.
     num_anchors = len(cfg.ASPECT_RATIO)
     vgg_source = [14, 21, 28, -2]
     for k, v in enumerate(vgg_source):
@@ -543,13 +554,13 @@ def multibox(vgg, extra_layers, num_classes):
     return (loc_layers, conf_layers)
 
 
-def build_net_dark(phase, num_classes=2):
+def build_net_dark(phase, num_classes=2, enhance=False):
     base = vgg(vgg_cfg, 3)
     extras = add_extras(extras_cfg, 1024)
     head1 = multibox(base, extras, num_classes)
     head2 = multibox(base, extras, num_classes)
     fem = fem_module(fem_cfg)
-    return DSFD(phase, base, extras, fem, head1, head2, num_classes)
+    return DSFD(phase, base, extras, fem, head1, head2, num_classes, enhance=enhance)
 
 
 class DistillKL(nn.Module):

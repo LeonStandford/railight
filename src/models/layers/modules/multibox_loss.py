@@ -20,15 +20,12 @@ class MultiBoxLoss(nn.Module):
         self.variance = cfg.VARIANCE
         self.threshold = cfg.FACE.OVERLAP_THRESH
         self.match = match_ssd
-        # Optional IoU-family box loss (CIoU / WIoU). When set it
-        # replaces Smooth-L1: positive priors are decoded to xyxy and the
-        # IoU loss is computed on real boxes (supervised day/source branch).
         self.box_loss_fn = box_loss_fn
-        # Optional classification loss (e.g. FocalLoss). When set, it is
-        # applied over ALL priors and replaces the cross-entropy + hard
-        # negative mining path (focal loss handles the fg/bg imbalance
-        # itself, so OHEM is neither needed nor desirable).
         self.cls_loss_fn = cls_loss_fn
+        stal = getattr(cfg, "STAL", None)
+        self.stal = bool(getattr(stal, "ENABLED", False))
+        self.stal_ref = float(getattr(stal, "REF_AREA", 0.02))
+        self.stal_max = float(getattr(stal, "MAX_W", 4.0))
 
     def forward(self, predictions, targets):
         loc_data, conf_data, priors = predictions
@@ -63,18 +60,25 @@ class MultiBoxLoss(nn.Module):
         loc_p = loc_data[pos_idx].view(-1, 4)
         loc_t = loc_t[pos_idx].view(-1, 4)
         if self.box_loss_fn is not None and loc_p.numel() > 0:
-            # decode encoded offsets -> xyxy (pred & matched-GT) using the
-            # priors of the positive anchors, then apply the IoU loss.
             pri = priors.to(loc_data.device)
             pri_b = pri.unsqueeze(0).expand(num, -1, 4)
             pp = pri_b[pos].view(-1, 4)
             pred_xyxy = decode(loc_p, pp, self.variance)
             tgt_xyxy = decode(loc_t, pp, self.variance)
             loss_l = self.box_loss_fn(pred_xyxy, tgt_xyxy)
+        elif self.stal and loc_p.numel() > 0:
+            # STAL: weight each positive by (ref_area / gt_area)^0.5 so small
+            # ground-truth boxes contribute more localisation loss.
+            with torch.no_grad():
+                pri = priors.to(loc_data.device).unsqueeze(0).expand(num, -1, 4)[pos].view(-1, 4)
+                gt = decode(loc_t, pri, self.variance)
+                area = (gt[:, 2] - gt[:, 0]).clamp(min=0) * (gt[:, 3] - gt[:, 1]).clamp(min=0)
+                size_w = (self.stal_ref / (area + 1e-06)).sqrt().clamp(1.0, self.stal_max)
+            per = F.smooth_l1_loss(loc_p, loc_t, reduction="none").sum(1)
+            loss_l = (per * size_w).sum()
         else:
             loss_l = F.smooth_l1_loss(loc_p, loc_t, reduction="sum")
         if self.cls_loss_fn is not None:
-            # Focal path: classify over every prior, no hard-neg mining.
             loss_c = self.cls_loss_fn(
                 conf_data.view(-1, self.num_classes), conf_t.view(-1)
             )

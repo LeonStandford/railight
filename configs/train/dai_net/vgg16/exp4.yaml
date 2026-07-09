@@ -37,10 +37,10 @@ viz_full_every_epochs: 1
 
 kl_loss_weight: 1.0
 target_loss_weight: 0.1
-target_sup_loss_weight: 1.0
 
 focal_enabled: true
 focal_gamma: 2.0
 focal_alpha_bg: 0.25
 
 box_loss: smooth_l1
+is_use_rc_loss: true

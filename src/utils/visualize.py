@@ -47,10 +47,6 @@ _PRETTY_LOSS_NAME: Dict[str, str] = {
     "mutual": "Mutual",
     "kl_st": "KL align (source<->target)",
     "target_unsup": "Target unsup (recon)",
-    "target_sup_loc_pal1": "Target Sup Pal1 Loc",
-    "target_sup_conf_pal1": "Target Sup Pal1 Conf",
-    "target_sup_loc_pal2": "Target Sup Pal2 Loc",
-    "target_sup_conf_pal2": "Target Sup Pal2 Conf",
     "train_loss_epoch": "Train Loss (epoch)",
     "val_loss": "Val Loss",
     "target_val_loss": "Target Val Loss",
@@ -61,10 +57,6 @@ _LOSS_ORDER: Tuple[str, ...] = (
     "pal1_conf",
     "pal2_loc",
     "pal2_conf",
-    "target_sup_loc_pal1",
-    "target_sup_conf_pal1",
-    "target_sup_loc_pal2",
-    "target_sup_conf_pal2",
     "enhance",
     "enhance_l1ssim",
     "mutual",
@@ -132,7 +124,7 @@ def plot_losses(
         ("Recall", "train_recall", "val_recall"),
         ("F1 score", "train_f1", "val_f1"),
         ("mAP@0.5", "train_map", "val_map"),
-        ("Target Loss (epoch)", "train_target_det_epoch", "target_val_loss"),
+        ("Target Loss (epoch)", None, "target_val_loss"),
         ("Target Precision", None, "target_precision"),
         ("Target Recall", None, "target_recall"),
         ("Target F1 score", None, "target_f1"),
@@ -624,20 +616,20 @@ def _subsample(a: np.ndarray, cap: int, seed: int) -> np.ndarray:
     return a[idx]
 
 def _domain_scatter(ax, xy: np.ndarray, n_src: int, proj: str, title: str) -> None:
+    # ECB-style domain t-SNE: source=red, target=blue, 'o' markers, alpha 0.5.
     ax.scatter(
         xy[:n_src, 0], xy[:n_src, 1],
-        s=14, alpha=1.0, color="#00008B", label="source (day)",
+        s=18, alpha=0.5, color="red", marker="o", label="Source Domain",
         edgecolors="none",
     )
     ax.scatter(
         xy[n_src:, 0], xy[n_src:, 1],
-        s=14, alpha=1.0, color="#8B0000", label="target (night)",
+        s=18, alpha=0.5, color="blue", marker="o", label="Target Domain",
         edgecolors="none",
     )
     ax.set_title(title, fontsize=11, fontweight="bold")
     ax.set_xlabel(f"{proj}-1")
     ax.set_ylabel(f"{proj}-2")
-    ax.set_aspect("equal", adjustable="datalim")
     ax.grid(True, linestyle="--", alpha=0.35)
     ax.legend(loc="upper right", framealpha=0.9, markerscale=1.6)
 
@@ -660,7 +652,11 @@ def plot_domain_tsne(
     s = _subsample(s, cap_per_domain, seed=0)
     t = _subsample(t, cap_per_domain, seed=1)
     xy, proj = _project_2d(np.concatenate([s, t], axis=0))
-    fig, ax = plt.subplots(figsize=(7.0, 6.4))
+    # ECB-style min-max scaling of the 2D embedding to [0, 1] per axis.
+    mn = xy.min(axis=0, keepdims=True)
+    mx = xy.max(axis=0, keepdims=True)
+    xy = (xy - mn) / (mx - mn + 1e-9)
+    fig, ax = plt.subplots(figsize=(10, 8))
     _domain_scatter(
         ax, xy, len(s), proj, _compose_title(method, subject, config)
     )
@@ -674,7 +670,7 @@ def plot_target_metrics(
     fname: str = "target_metrics.png",
 ) -> Optional[str]:
     panels = [
-        ("Loss", "train_target_det_epoch", "target_val_loss"),
+        ("Loss", None, "target_val_loss"),
         ("Precision", None, "target_precision"),
         ("Recall", None, "target_recall"),
         ("F1 score", None, "target_f1"),
@@ -831,6 +827,146 @@ def plot_sample_predictions(
     fig.subplots_adjust(top=0.9)
     return _save(fig, os.path.join(out_dir, fname))
 
+def make_gradcam(net_inner: Any, target_layer: Any = None) -> Optional["GradCAM"]:
+    import torch.nn as nn
+
+    try:
+        if target_layer is None:
+            if hasattr(net_inner, "backbone") and hasattr(net_inner.backbone, "proj"):
+                target_layer = net_inner.backbone.proj[-1]
+            elif hasattr(net_inner, "vgg") and len(net_inner.vgg):
+                convs = [m for m in net_inner.vgg if isinstance(m, nn.Conv2d)]
+                target_layer = convs[-1] if convs else None
+        if target_layer is None:
+            return None
+        return GradCAM(net_inner, target_layer)
+    except Exception as e:
+        print(f"[viz] grad-cam unavailable ({e})")
+        return None
+
+
+def collect_grid_items(
+    loader: Any,
+    detect_fn: Callable[[Any], Sequence[Tuple[np.ndarray, np.ndarray, np.ndarray]]],
+    class_names: Sequence[str],
+    n_show: int = 6,
+    gradcam: Optional["GradCAM"] = None,
+) -> List[Dict[str, Any]]:
+
+    def _score(o):
+        conf = o[4] if isinstance(o, (tuple, list)) else o
+        return conf[..., 1:].max()
+
+    def _fwd(m, t):
+        return m.test_forward(t)[0]
+
+    items: List[Dict[str, Any]] = []
+    try:
+        it = iter(loader)
+        while len(items) < n_show:
+            try:
+                images, targets, paths = next(it)
+            except StopIteration:
+                break
+            images = images.cuda() / 255.0
+            dets = detect_fn(images)
+            h_, w_ = (images.shape[2], images.shape[3])
+            for i in range(images.shape[0]):
+                if len(items) >= n_show:
+                    break
+                raw = (
+                    images[i].detach().cpu().numpy().transpose(1, 2, 0)[:, :, ::-1]
+                    * 255
+                ).clip(0, 255).astype(np.uint8)
+                pb, ps, pl = dets[i]
+                gt = (
+                    targets[i].cpu().numpy()
+                    if hasattr(targets[i], "cpu")
+                    else np.asarray(targets[i])
+                )
+                if gt.size:
+                    gt_px = gt[:, :4].astype(np.float32).copy()
+                    gt_px[:, [0, 2]] *= w_
+                    gt_px[:, [1, 3]] *= h_
+                else:
+                    gt_px = np.zeros((0, 4), dtype=np.float32)
+                cam = None
+                if gradcam is not None:
+                    try:
+                        x = images[i : i + 1].detach().clone().requires_grad_(True)
+                        cam = gradcam(x, score_fn=_score, forward_fn=_fwd)
+                    except Exception as e:
+                        print(f"[viz] grad-cam failed on a sample ({e})")
+                        gradcam = None
+                items.append(
+                    dict(
+                        image=raw,
+                        cam01=cam,
+                        boxes=pb,
+                        scores=ps,
+                        labels=[class_names[c - 1] for c in pl],
+                        gt_boxes=gt_px,
+                        title=os.path.basename(paths[i]) if i < len(paths) else "",
+                    )
+                )
+    except Exception as e:
+        print(f"[viz] sample-grid collection failed: {e}")
+    return items
+
+
+def plot_samples_grid_3row(
+    items: Sequence[Dict[str, Any]],
+    out_dir: str,
+    fname: str,
+    method: str = "DAI-Net",
+    config: Config = None,
+    title_suffix: str = "",
+) -> Optional[str]:
+
+    n = len(items)
+    if n == 0:
+        return None
+    fig, axes = plt.subplots(3, n, figsize=(3.4 * n, 10.2), squeeze=False)
+    subject = f"input / Grad-CAM / detections {title_suffix}".strip()
+    fig.suptitle(_compose_title(method, subject, config), fontsize=12)
+    row_titles = ["Input", "Grad-CAM", "Detections (pred=lime, GT=red)"]
+    for c, it in enumerate(items):
+        img = it["image"]
+        axes[0][c].imshow(img)
+        if it.get("title"):
+            axes[0][c].set_title(it["title"], fontsize=8)
+        cam = it.get("cam01")
+        if cam is not None:
+            overlay, _ = _overlay_heatmap(img, cam)
+            axes[1][c].imshow(overlay)
+        else:
+            axes[1][c].imshow(img)
+        axes[2][c].imshow(img)
+        _draw_boxes(
+            axes[2][c],
+            {
+                "boxes": it.get("boxes", []),
+                "scores": it.get("scores", []),
+                "labels": it.get("labels", []),
+            },
+        )
+        for x1, y1, x2, y2 in np.asarray(
+            it.get("gt_boxes", []), dtype=np.float32
+        ).reshape(-1, 4):
+            axes[2][c].add_patch(
+                Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1,
+                    fill=False, edgecolor="red", linewidth=1.8,
+                )
+            )
+        for r in range(3):
+            axes[r][c].set_xticks([])
+            axes[r][c].set_yticks([])
+    for r in range(3):
+        axes[r][0].set_ylabel(row_titles[r], fontsize=11, fontweight="bold")
+    fig.subplots_adjust(top=0.92, hspace=0.06, wspace=0.04)
+    return _save(fig, os.path.join(out_dir, fname))
+
 def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     if len(a) == 0 or len(b) == 0:
         return np.zeros((len(a), len(b)), dtype=np.float32)
@@ -942,11 +1078,29 @@ class GradCAM:
             h.remove()
         self._fwd_handle = None
 
-    def __call__(
+    def _eigen_2d(self, weighted: Any) -> Any:
+        """ECB/EigenCAM-style projection of weighted activations onto their
+        first principal component across channels (per image)."""
+        torch = self._torch
+        b, c, h, w = weighted.shape
+        maps = []
+        for i in range(b):
+            m = weighted[i].reshape(c, h * w).t()  # (HW, C)
+            m = m - m.mean(dim=0, keepdim=True)
+            try:
+                _u, _s, vh = torch.linalg.svd(m, full_matrices=False)
+                proj = (m @ vh[0]).reshape(h, w)
+            except Exception:
+                proj = weighted[i].sum(dim=0)
+            maps.append(proj)
+        return torch.stack(maps).unsqueeze(1)  # (B, 1, H, W)
+
+    def _compute(
         self,
         x: Any,
         score_fn: Callable[[Any], Any],
-        forward_fn: Optional[Callable[[Any, Any], Any]] = None,
+        forward_fn: Optional[Callable[[Any, Any], Any]],
+        eigen_smooth: bool,
     ) -> np.ndarray:
         torch = self._torch
         import torch.nn.functional as F
@@ -965,12 +1119,41 @@ class GradCAM:
             weights = grads.mean(dim=(2, 3), keepdim=True)
         else:
             weights = grads.mean(dim=list(range(2, grads.dim())), keepdim=True)
-        cam = (weights * acts).sum(dim=1, keepdim=True)
+        weighted = weights * acts
+        if eigen_smooth:
+            cam = self._eigen_2d(weighted)
+        else:
+            cam = weighted.sum(dim=1, keepdim=True)
         cam = torch.relu(cam)
         cam = F.interpolate(
             cam, size=x.shape[-2:], mode="bilinear", align_corners=False
         )
         cam = cam[0, 0].detach().cpu().numpy()
+        mn, mx = (float(cam.min()), float(cam.max()))
+        return (cam - mn) / (mx - mn + 1e-09)
+
+    def __call__(
+        self,
+        x: Any,
+        score_fn: Callable[[Any], Any],
+        forward_fn: Optional[Callable[[Any, Any], Any]] = None,
+        eigen_smooth: bool = False,
+        aug_smooth: bool = False,
+    ) -> np.ndarray:
+        """Compute a normalized Grad-CAM map.
+
+        ECB-style options: ``eigen_smooth`` projects the weighted activations
+        onto their first principal component; ``aug_smooth`` averages the CAM
+        over the input and its horizontal flip (test-time augmentation).
+        """
+        if not aug_smooth:
+            return self._compute(x, score_fn, forward_fn, eigen_smooth)
+        torch = self._torch
+        cams = [self._compute(x, score_fn, forward_fn, eigen_smooth)]
+        x_flip = torch.flip(x.detach(), dims=[-1]).requires_grad_(True)
+        cam_flip = self._compute(x_flip, score_fn, forward_fn, eigen_smooth)
+        cams.append(np.ascontiguousarray(cam_flip[:, ::-1]))
+        cam = np.mean(cams, axis=0)
         mn, mx = (float(cam.min()), float(cam.max()))
         return (cam - mn) / (mx - mn + 1e-09)
 
@@ -1000,6 +1183,8 @@ def plot_gradcam_comparison(
     score_fn: Optional[Callable[[Any], Any]] = None,
     forward_fn: Optional[Callable[[Any, Any], Any]] = None,
     layer_name: str = "",
+    eigen_smooth: bool = True,
+    aug_smooth: bool = True,
 ) -> Optional[str]:
     import torch
 
@@ -1034,7 +1219,10 @@ def plot_gradcam_comparison(
                 if not isinstance(x, torch.Tensor):
                     raise TypeError("items must contain 'tensor' as a torch.Tensor")
                 x = x.detach().clone().requires_grad_(True)
-                cam = extractor(x, score_fn=score_fn, forward_fn=forward_fn)
+                cam = extractor(
+                    x, score_fn=score_fn, forward_fn=forward_fn,
+                    eigen_smooth=eigen_smooth, aug_smooth=aug_smooth,
+                )
                 overlay, heat_rgb = _overlay_heatmap(rgb, cam)
                 ax0 = axes[r][c * 3 + 0]
                 ax1 = axes[r][c * 3 + 1]
