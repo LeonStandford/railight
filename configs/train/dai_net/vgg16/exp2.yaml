@@ -36,6 +36,8 @@ viz_full_every_epochs: 1
 
 kl_loss_weight: 1.0
 target_loss_weight: 0.1
-target_sup_loss_weight: 1.0
 
 box_loss: wiou_v3
+
+# Redecomposition cohering loss (L_rc, Eq.2 DAI-Net); set false to disable
+is_use_rc_loss: true
