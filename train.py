@@ -7,10 +7,11 @@ for _p in (_os.path.join(_ROOT, "src"), _os.path.join(_ROOT, "src", "models")):
     if _p not in _sys.path:
         _sys.path.insert(0, _p)
 import argparse
-import copy
 import datetime as _dt
 import glob
+from contextlib import nullcontext
 import json
+import math
 import os
 import sys
 import time
@@ -35,19 +36,17 @@ from torch.autograd import Variable
 from torchmetrics.functional.image import structural_similarity_index_measure as ssim
 from sklearn.metrics import precision_recall_fscore_support
 from tqdm import tqdm
-from data.config import cfg
+from data.config import apply_damamba_config, apply_input_config, cfg
 from data.source_domain import SourceDomainDetection, detection_collate
-from data.target_domain import (
-    TargetUnlabeledDataset,
-    resolve_target_label_paths,
-)
+from data.target_domain import TargetUnlabeledDataset
 from layers.modules import EnhanceLoss, MultiBoxLoss
 from layers.modules.enhance_loss import smooth as retinex_smooth
+from losses.align import apply_align_config
 from losses.dfl import FocalLoss, compute_focal_alpha, init_focal_bias
 from losses.weight_reg import snapshot_wreg_ref, weight_reg_loss
 from models.enhancer import RetinexNet
 from models.factory import basenet_factory, build_net
-from dainet.constants import (
+from railight.constants import (
     CHECKPOINT_LATEST,
     CHECKPOINT_BEST,
     RETINEX_WEIGHTS,
@@ -58,20 +57,44 @@ from dainet.constants import (
     MODEL_FROM_ARCH_BACKBONE,
 )
 from utils import visualize as viz
-from utils.dark_isp import build_dark_batch
-from utils.metrics import detect_metrics_from_cm
+from utils.low_light import make_night_synthesizer
+from utils.domain_tsne import (
+    TSNE_FNAME,
+    TSNE_SUPTITLE,
+    TapBank,
+    accumulate,
+    build_layer_panels,
+)
+from utils.ema import ModelEMA
+from utils.flops import measure_gflops
+from utils.metrics import (
+    class_frequencies,
+    detect_metrics_from_cm,
+    embedding_overlap_stats,
+    format_balance_table,
+    format_per_class_table,
+    macro_summary,
+    per_class_detection_metrics,
+)
+from utils.strong_aug import ensure_offline_augmented
+from utils.schedule import LRSchedule
 from utils.reporting import format_val_table, viz_config, viz_method
 from utils.predict import (
     _decode_per_image,
     _decode_predictions,
     _ensure_detect,
     _inner_net,
-    build_pseudo_targets,
     collect_target_samples,
     infer_detections,
     infer_detections_batch,
 )
-from utils.constants import _TRAIN_DEFAULTS, _WANDB_EPOCH_KEYS
+from utils.checkpoint import load_detector_state_dict
+from utils.constants import (
+    SOURCE_VIEWS,
+    _TRAIN_DEFAULTS,
+    _WANDB_EPOCH_KEYS,
+    flatten_da_block,
+)
 from utils.tee import Tee
 from utils.wandb_logger import WandbLogger, load_env_file
 
@@ -86,7 +109,7 @@ _MODEL_FROM_ARCH_BACKBONE = MODEL_FROM_ARCH_BACKBONE
 
 def resolve_arch_and_backbone(args_ns: argparse.Namespace) -> Tuple[str, str]:
     arch = args_ns.architecture or _DEFAULT_ARCH_FROM_MODEL.get(
-        args_ns.model, "dai_net"
+        args_ns.model, "railight"
     )
     backbone = _BACKBONE_FROM_MODEL.get(args_ns.model, args_ns.model)
     return (arch, backbone)
@@ -117,36 +140,106 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
             try:
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
-                # a run killed mid-write can leave one truncated line; the rest
-                # of the file is still usable
                 continue
     return rows
 
 def _measure_gflops(
     net: torch.nn.Module, input_size: int, device: Any
 ) -> Dict[str, Any]:
-    inner = net.module if hasattr(net, "module") else net
-    out: Dict[str, Any] = {
-        "gflops_forward": 0.0,
-        "flops_input_size": int(input_size),
-        "flops_note": "1x3xSxS through test_forward, torch.utils.flop_counter",
-    }
-    try:
-        from torch.utils.flop_counter import FlopCounterMode
+    inner = _inner_net(net)
 
-        was_training = inner.training
-        inner.eval()
-        x = torch.zeros(1, 3, input_size, input_size, device=device)
-        counter = FlopCounterMode(display=False)
-        with counter, torch.no_grad():
-            inner.test_forward(x)
-        out["gflops_forward"] = float(counter.get_total_flops()) / 1e9
-        if was_training:
-            inner.train()
-    except Exception as e:
-        out["flops_note"] = f"measurement failed: {type(e).__name__}: {e}"
-        print(f"[WARN] FLOPs measurement failed: {type(e).__name__}: {e}")
-    return out
+    return measure_gflops(inner, inner.test_forward, input_size, device)
+
+
+def _detection_summary(
+    per_image: List[Dict[str, Any]], nc: int, class_aware: bool
+) -> Tuple[Dict[str, Any], float, np.ndarray]:
+    scores, matched, n_gt, cm = viz.evaluate_detections(
+        per_image, iou_thr=0.5, score_thr_cm=0.5, num_classes=nc,
+        class_aware=class_aware,
+    )
+    met = detect_metrics_from_cm(cm)
+    _, _, _, mAP = viz._pr_from_scores(
+        np.asarray(scores), np.asarray(matched), n_gt
+    )
+    return met, float(mAP), cm
+
+
+@torch.no_grad()
+def _collect_gt_pred_samples(
+    loader: data.DataLoader,
+    net: torch.nn.Module,
+    max_batches: int,
+    darken: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    per_image: List[Dict[str, Any]] = []
+    for b_idx, (images, targets, _) in enumerate(loader):
+        if b_idx >= max_batches:
+            break
+        images = images.cuda() / 255.0
+        if darken is not None:
+            images = darken(images)
+        results = infer_detections_batch(net, images, conf_thr=0.5)
+        h_, w_ = (images.shape[2], images.shape[3])
+        for i in range(images.shape[0]):
+            pb, ps, pl = results[i]
+            gt = (
+                targets[i].cpu().numpy()
+                if hasattr(targets[i], "cpu")
+                else np.asarray(targets[i])
+            )
+            if gt.size:
+                gt_px = gt[:, :4] * np.array(
+                    [w_, h_, w_, h_], dtype=np.float64
+                )
+                gt_lbl = (
+                    gt[:, 4].astype(np.int32)
+                    if gt.shape[1] > 4
+                    else np.zeros(len(gt), dtype=np.int32)
+                )
+            else:
+                gt_px = np.zeros((0, 4), dtype=np.float32)
+                gt_lbl = np.zeros((0,), dtype=np.int32)
+            per_image.append(
+                dict(
+                    pred_boxes=pb,
+                    pred_scores=ps,
+                    pred_labels=pl,
+                    gt_boxes=gt_px,
+                    gt_labels=gt_lbl,
+                )
+            )
+    return per_image
+
+
+@torch.no_grad()
+def _eval_labeled_loader(
+    loader: data.DataLoader,
+    net: torch.nn.Module,
+    criterion: MultiBoxLoss,
+    desc: Optional[str] = None,
+) -> Tuple[List[Dict[str, np.ndarray]], float, float, float]:
+    test_forward = _inner_net(net).test_forward
+    per_image: List[Dict[str, np.ndarray]] = []
+    loss_sum = loc_sum = conf_sum = 0.0
+    steps = 0
+    iterable = (
+        tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, unit="batch")
+        if desc
+        else loader
+    )
+    for images, targets, _ in iterable:
+        images = images.cuda() / 255.0
+        targets_v = [t.cuda() for t in targets]
+        out, _ = test_forward(images)
+        l_loc, l_conf = criterion(out[3:], targets_v)
+        loc_sum += float(l_loc.detach().item())
+        conf_sum += float(l_conf.detach().item())
+        loss_sum += float((l_loc + l_conf).detach().item())
+        steps += 1
+        per_image.extend(_decode_per_image(out, targets, net))
+    n = max(steps, 1)
+    return (per_image, loss_sum / n, loc_sum / n, conf_sum / n)
 
 def _memory_usage() -> Dict[str, float]:
     stats: Dict[str, float] = {
@@ -204,6 +297,7 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
         cfg = yaml.safe_load(f) or {}
     if not isinstance(cfg, dict):
         raise ValueError(f"Top-level YAML must be a mapping, got {type(cfg)}")
+    cfg = flatten_da_block(cfg)
     parts = p.parts
     path_arch = parts[-3] if len(parts) >= 3 else None
     path_backbone = parts[-2] if len(parts) >= 2 else None
@@ -253,11 +347,12 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
     _float_keys = (
         "lr", "momentum", "weight_decay", "gamma",
         "kl_loss_weight", "target_loss_weight", "wreg_loss_weight",
-        "entropy_loss_weight", "mutual_loss_weight", "muon_ratio",
+        "entropy_loss_weight", "muon_ratio",
         "focal_gamma", "focal_alpha_bg",
         "stal_ref_area", "stal_max_w",
-        "pseudo_weight", "pseudo_conf", "pseudo_nms_iou", "ema_decay",
-        "pseudo_cls_weight", "supervised_target_loss_weight",
+        "supervised_target_loss_weight",
+        "lr_final_ratio", "warmup_epochs", "ema_decay",
+        "scale_jitter", "mosaic_prob",
     )
     for _k in _float_keys:
         if _k in merged and isinstance(merged[_k], str):
@@ -268,12 +363,12 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
     return argparse.Namespace(**merged)
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser("DAI-Net training driven by a YAML config.")
+    p = argparse.ArgumentParser("RAILIGHT training driven by a YAML config.")
     p.add_argument(
         "--config",
         required=True,
         type=str,
-        help="Path to YAML config, e.g. configs/train/dai_net/vgg16/exp1.yaml",
+        help="Path to YAML config, e.g. configs/train/railight/vgg16/exp1.yaml",
     )
     cli = p.parse_args()
     return load_yaml_config(cli.config, mode="train")
@@ -281,16 +376,17 @@ def parse_args() -> argparse.Namespace:
 def setup_logging(
     architecture: str, backbone: str, num_exp: str, args_ns: argparse.Namespace
 ) -> Optional[str]:
-    log_dir = os.path.join("logs", architecture, backbone)
+    log_root = str(getattr(args_ns, "log_dir", None) or "logs")
+    log_dir = os.path.join(log_root, architecture, backbone)
     os.makedirs(log_dir, exist_ok=True)
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(log_dir, f"{ts}_{num_exp}.log")
     fh = open(path, "a", buffering=1, encoding="utf-8")
-    fh.write(f"# DAI-Net training log - {_dt.datetime.now().isoformat()}\n")
+    fh.write(f"# RAILIGHT training log - {_dt.datetime.now().isoformat()}\n")
     fh.write(f"# args: {vars(args_ns)}\n")
     sys.stdout = Tee(sys.stdout, fh)
     sys.stderr = Tee(sys.stderr, fh)
-    print(f"[log] writing to {path}")
+    print(f"📝 [log] writing to {path}")
     return path
 
 def parse_gpu_ids(val: Any) -> List[int]:
@@ -312,17 +408,29 @@ def setup_distributed(local_rank: int, use_cuda: bool) -> None:
         torch.set_default_tensor_type("torch.FloatTensor")
         return
     gpu_num = torch.cuda.device_count()
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > gpu_num:
+        raise SystemExit(
+            f"WORLD_SIZE={world_size} exceeds visible GPUs={gpu_num} "
+            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}); "
+            f"nproc_per_node must equal the number of gpu_ids in the config."
+        )
     if local_rank == 0:
-        print(f"Using {gpu_num} gpus")
-    rank = int(os.environ.get("RANK", "0"))
-    torch.cuda.set_device(rank % gpu_num)
+        print(f"🖥️  Using {gpu_num} gpus")
+    device = int(os.environ.get("LOCAL_RANK", str(local_rank))) % gpu_num
+    torch.cuda.set_device(device)
+    print(
+        f"[ddp] rank {os.environ.get('RANK', '0')}/{world_size} -> cuda:{device} "
+        f"| rdzv {os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')}",
+        flush=True,
+    )
     dist.init_process_group("nccl", timeout=_dt.timedelta(hours=4))
 
 def teardown_distributed() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
-def _paths_from_dainet_txt(*txt_files: Optional[str]) -> List[str]:
+def _paths_from_railight_txt(*txt_files: Optional[str]) -> List[str]:
     seen: set = set()
     out: List[str] = []
     for f in txt_files:
@@ -339,6 +447,54 @@ def _paths_from_dainet_txt(*txt_files: Optional[str]) -> List[str]:
                 seen.add(p)
                 out.append(p)
     return out
+
+
+def present_class_mask(
+    targets: Sequence[Any], num_classes: int, device: Any
+) -> torch.Tensor:
+    mask = torch.zeros(len(targets), int(num_classes), device=device)
+    for i, target in enumerate(targets):
+        labels = None
+        if target is not None and getattr(target, "numel", lambda: 0)() and target.shape[-1] > 4:
+            labels = target[:, 4].long() - 1
+            labels = labels[(labels >= 0) & (labels < int(num_classes))]
+        if labels is None or labels.numel() == 0:
+            mask[i] = 1.0
+        else:
+            mask[i, labels.to(device)] = 1.0
+    return mask
+
+
+def prepare_offline_augmentation(
+    args_ns: argparse.Namespace, local_rank: int
+) -> None:
+    out_dir = getattr(args_ns, "offline_aug_dir", None)
+    if not out_dir:
+        return
+    if local_rank == 0:
+        out_txt = ensure_offline_augmented(
+            args_ns.source_train_file,
+            tuple(str(x) for x in args_ns.names),
+            str(out_dir),
+            mode=str(getattr(args_ns, "offline_aug_mode", "crop") or "crop"),
+            crop_size=int(getattr(args_ns, "input_size", 640) or 640),
+            seed=int(getattr(args_ns, "seed", 42) or 42),
+        )
+    else:
+        out_txt = str(
+            Path(args_ns.source_train_file).with_name(
+                Path(args_ns.source_train_file).stem + "_strong.txt"
+            )
+        )
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    args_ns.source_train_file = out_txt
+
+
+def build_target_sampler(dataset: data.Dataset) -> data.Sampler:
+    return data.RandomSampler(
+        dataset, replacement=True, num_samples=int(1000000000000.0)
+    )
 
 
 def build_data_loaders(
@@ -385,30 +541,18 @@ def build_data_loaders(
                 "is_use_supervised_target_loss: true requires a labelled "
                 f"target_train_file; got {target_train_file!r}"
             )
-        # train split only — the unlabeled path also pools target val/test,
-        # which would leak the evaluation labels into training here.
         target_ds = SourceDomainDetection(target_train_file, mode="train")
     else:
-        target_paths = _paths_from_dainet_txt(
+        target_paths = _paths_from_railight_txt(
             getattr(args_ns, "target_train_file", None),
             getattr(args_ns, "target_val_file", None),
             getattr(args_ns, "target_test_file", None),
         )
         if target_paths:
             target_ds = TargetUnlabeledDataset(size=cfg.INPUT_SIZE, paths=target_paths)
-        else:
-            fallback = getattr(args_ns, "target_folder4unsupervised", None)
-            if fallback and os.path.isdir(fallback):
-                unsup_dir, _ = resolve_target_label_paths(fallback)
-                unsup_dir = unsup_dir or fallback
-                target_ds = TargetUnlabeledDataset(
-                    target_folder=unsup_dir, size=cfg.INPUT_SIZE
-                )
     if target_ds is not None:
         if len(target_ds) > 0:
-            tgt_sampler = data.RandomSampler(
-                target_ds, replacement=True, num_samples=int(1000000000000.0)
-            )
+            tgt_sampler = build_target_sampler(target_ds)
             target_loader = data.DataLoader(
                 target_ds,
                 args_ns.batch_size,
@@ -523,7 +667,21 @@ def apply_focal_class_weights(
     return alpha
 
 
-def build_param_groups(dsfd_net: torch.nn.Module, lr: float) -> List[Dict[str, Any]]:
+def align_modules(dsfd_net: torch.nn.Module) -> List[torch.nn.Module]:
+    names = (
+        "align_heads", "align_local", "align_swap", "align_reflectance",
+        "da_disc_img", "da_disc_obj",
+    )
+    return [
+        module
+        for module in (getattr(dsfd_net, name, None) for name in names)
+        if module is not None
+    ]
+
+
+def build_param_groups(
+    dsfd_net: torch.nn.Module, lr: float, align_lr_mult: float = 1.0
+) -> List[Dict[str, Any]]:
     if getattr(dsfd_net, "backbone", None) is not None:
         main_groups = [dsfd_net.backbone]
     else:
@@ -540,8 +698,25 @@ def build_param_groups(dsfd_net: torch.nn.Module, lr: float) -> List[Dict[str, A
     ]
     if getattr(dsfd_net, "enhance", False):
         main_groups += [dsfd_net.sppf, dsfd_net.psa]
-    groups = [{"params": m.parameters(), "lr": lr} for m in main_groups]
-    groups.append({"params": dsfd_net.ref.parameters(), "lr": lr / 10.0})
+    groups = [{"params": list(m.parameters()), "lr": lr} for m in main_groups]
+    groups.append({"params": list(dsfd_net.ref.parameters()), "lr": lr / 10.0})
+    discriminators = [
+        p for m in align_modules(dsfd_net) for p in m.parameters() if p.requires_grad
+    ]
+    if discriminators:
+        groups.append(
+            {
+                "params": discriminators,
+                "lr": lr * float(align_lr_mult),
+                "weight_decay": 0.0,
+            }
+        )
+    grouped = {id(p) for g in groups for p in g["params"]}
+    remaining = [
+        p for p in dsfd_net.parameters() if p.requires_grad and id(p) not in grouped
+    ]
+    if remaining:
+        groups.append({"params": remaining, "lr": lr})
     return groups
 
 
@@ -589,8 +764,12 @@ def build_optimizer(
         )
         print(f"[optim] MuonSGD (muon={r:.2f}, sgd={1 - r:.2f}, momentum={max(mom, 0.95)})")
         return opt
+    align_lr_mult = float(getattr(args_ns, "align_disc_lr_mult", 1.0))
+    if align_lr_mult != 1.0:
+        print(f"[optim] domain discriminators at lr x{align_lr_mult:g} (no weight decay)")
     return optim.SGD(
-        build_param_groups(dsfd_net, lr), lr=lr, momentum=mom, weight_decay=wd
+        build_param_groups(dsfd_net, lr, align_lr_mult),
+        lr=lr, momentum=mom, weight_decay=wd,
     )
 
 LOSS_COMPONENT_KEYS: Tuple[str, ...] = (
@@ -600,10 +779,10 @@ LOSS_COMPONENT_KEYS: Tuple[str, ...] = (
     "pal2_conf",
     "enhance",
     "enhance_l1ssim",
-    "mutual",
     "target_unsup",
     "target_sup",
-    "pseudo",
+    "da_img_adv",
+    "da_obj_adv",
     "kl_st",
     "wreg",
     "entropy",
@@ -622,7 +801,13 @@ def history_factory() -> History:
         "val_recall": [],
         "val_f1": [],
         "val_map": [],
+        "val_macro_map": [],
+        "target_macro_map": [],
+        "target_macro_f1": [],
         "val_kl_st": [],
+        "val_align_mmd": [],
+        "val_align_gap": [],
+        "val_align_auc": [],
         "val_entropy": [],
         "train_precision": [],
         "train_recall": [],
@@ -681,6 +866,9 @@ def _history_from_records(train_jsonl: str, val_jsonl: str) -> History:
             ("f1", "val_f1"),
             ("mAP", "val_map"),
             ("val_kl_st", "val_kl_st"),
+            ("val_align_mmd", "val_align_mmd"),
+            ("val_align_gap", "val_align_gap"),
+            ("val_align_auc", "val_align_auc"),
             ("val_entropy", "val_entropy"),
             ("target_val_loss", "target_val_loss"),
             ("target_precision", "target_precision"),
@@ -736,11 +924,13 @@ class TrainingContext:
             )
         self.class_names = tuple(str(x) for x in cfg_names)
         args_ns.nc = len(self.class_names)
+        self.night_synthesis, self.synthesize_night = make_night_synthesizer(args_ns)
         if local_rank == 0:
             print(
                 f"[data] class names from config "
                 f"({len(self.class_names)}): {list(self.class_names)}"
             )
+            print(f"[data] night synthesis: {self.night_synthesis}")
         self.save_folder = os.path.join(
             args_ns.save_folder, self.architecture, self.backbone, args_ns.num_exp
         )
@@ -758,6 +948,7 @@ class TrainingContext:
             self.backbone,
             args_ns.num_exp,
         )
+        prepare_offline_augmentation(args_ns, local_rank)
         (
             self.train_dataset,
             self.train_loader,
@@ -769,6 +960,10 @@ class TrainingContext:
             self.target_test_loader,
         ) = build_data_loaders(args_ns)
         self._target_iter: Optional[Any] = None
+        self.train_sampler = self.train_loader.sampler
+        self.lr_schedule: Optional[LRSchedule] = None
+        self.ema: Optional[ModelEMA] = None
+        self.accumulate = 1
         self.target_labeled = bool(
             getattr(args_ns, "is_use_supervised_target_loss", False)
         ) and self.target_dataset is not None
@@ -797,12 +992,6 @@ class TrainingContext:
                     f"(weight={getattr(args_ns, 'supervised_target_loss_weight', 1.0)})"
                     " — this is no longer unsupervised domain adaptation."
                 )
-                if float(getattr(args_ns, "pseudo_weight", 0.0)) > 0:
-                    print(
-                        "[WARN] pseudo_weight > 0 with supervised target labels — "
-                        "the teacher's pseudo GT competes with the real labels; "
-                        "set pseudo_weight: 0 unless you know you want both."
-                    )
         self.history: History = history_factory()
 
         if getattr(args_ns, "resume", None):
@@ -840,9 +1029,7 @@ class TrainingContext:
             dist.get_world_size() if dist.is_available() and dist.is_initialized()
             else 1
         )
-        # measured once in main() after the net is built
         self.flops_stats: Dict[str, Any] = {}
-        # resumed runs continue the clock instead of restarting it at 0
         prev_rows = (
             _read_jsonl(self.train_records_path)
             if getattr(args_ns, "resume", None) else []
@@ -859,14 +1046,13 @@ class TrainingContext:
         self.best_f1 = -1.0
         self.best_map = -1.0
         self.wreg_ref: Dict[str, torch.Tensor] = {}
-        # EMA mean-teacher for pseudo-labeling; lazily built at burn-in end.
-        self.teacher: Optional[torch.nn.Module] = None
         self.wandb = WandbLogger(
             enabled=bool(getattr(args_ns, "use_wandb", False)) and local_rank == 0,
-            project=str(getattr(args_ns, "wandb_project", "dainet-railway")),
+            project=str(getattr(args_ns, "wandb_project", "railight-railway")),
             run_name=f"{self.architecture}/{self.backbone}/{args_ns.num_exp}",
             config=vars(args_ns),
             entity=getattr(args_ns, "wandb_entity", None),
+            dir=getattr(args_ns, "wandb_dir", None),
         )
 
     def next_target_batch(
@@ -882,6 +1068,34 @@ class TrainingContext:
             return (images, targets)
         return (batch, None)
 
+def save_latest_checkpoint(
+    ctx: TrainingContext, dsfd_net: torch.nn.Module, epoch: int
+) -> None:
+    if ctx.ema is not None and ctx.ema.backup is not None:
+        weights = ctx.ema.backup
+    else:
+        weights = dsfd_net.state_dict()
+    payload: Dict[str, Any] = {"epoch": epoch, "weight": weights}
+    if ctx.ema is not None:
+        payload["ema"] = ctx.ema.shadow
+        payload["ema_updates"] = ctx.ema.updates
+    torch.save(payload, os.path.join(ctx.save_folder, CHECKPOINT_LATEST))
+
+
+def run_validation(
+    ctx: TrainingContext,
+    epoch: int,
+    net: torch.nn.Module,
+    dsfd_net: torch.nn.Module,
+    net_enh: torch.nn.Module,
+    criterion: MultiBoxLoss,
+) -> Optional[float]:
+    if ctx.ema is None:
+        return validate(ctx, epoch, net, dsfd_net, net_enh, criterion)
+    with ctx.ema.applied(dsfd_net):
+        return validate(ctx, epoch, net, dsfd_net, net_enh, criterion)
+
+
 def update_loss_plot(ctx: TrainingContext, extra: Dict[str, Any]) -> None:
     if ctx.local_rank != 0:
         return
@@ -895,6 +1109,48 @@ def update_loss_plot(ctx: TrainingContext, extra: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"[viz] loss plot failed: {e}")
 
+@torch.no_grad()
+def render_layer_tsne(
+    ctx: TrainingContext,
+    net_inner: torch.nn.Module,
+    method: str,
+    config: Dict[str, Any],
+) -> Optional[str]:
+    if not hasattr(net_inner, "embed_tap_features"):
+        return None
+    source_view = str(getattr(net_inner.align_spec, "source_view", "light")).lower()
+    max_batches = int(getattr(ctx.args, "viz_max_target_batches", 30))
+    source_bank, target_bank = (TapBank(), TapBank())
+    src_iter = iter(ctx.val_loader)
+    for _ in range(max_batches):
+        try:
+            s_imgs, _t, _p = next(src_iter)
+        except StopIteration:
+            break
+        t_batch = ctx.next_target_batch()
+        if t_batch is None:
+            break
+        s_imgs = s_imgs.cuda() / 255.0
+        t_imgs = t_batch[0].cuda(non_blocking=True) / 255.0
+        s_view = ctx.synthesize_night(s_imgs) if source_view != "light" else s_imgs
+        accumulate(net_inner, s_imgs, s_view, source_bank)
+        accumulate(net_inner, t_imgs, t_imgs, target_bank)
+    panels = build_layer_panels(
+        list(getattr(net_inner, "align_tap_labels", [])), source_bank, target_bank
+    )
+    if not panels:
+        return None
+
+    return viz.plot_domain_tsne_pair(
+        panels,
+        ctx.charts_dir,
+        TSNE_FNAME,
+        method=method,
+        config=config,
+        suptitle=f"{TSNE_SUPTITLE} — source view: {source_view}",
+    )
+
+
 def run_full_visualisation(
     ctx: TrainingContext, net: torch.nn.Module, extra: Dict[str, Any]
 ) -> None:
@@ -906,62 +1162,21 @@ def run_full_visualisation(
 
     method = viz_method()
     config = viz_config(ctx.args, backbone=ctx.backbone, extra=extra)
-    print(f"[viz] === full visualisation -> {ctx.charts_dir} ===", flush=True)
-    # losses.png already bundles the per-iter loss components AND the
-    # train-vs-val loss + train/val/target metric panels (precision/recall/
-    # f1/mAP) as subplots, so the standalone train_vs_val.png /
-    # train_val_metrics.png are redundant and no longer drawn.
+    print(f"📊 [viz] === full visualisation -> {ctx.charts_dir} ===", flush=True)
     _p("loss + train/val metric curves (losses.png)")
     viz.plot_losses(ctx.history, ctx.charts_dir, method=method, config=config)
     net.eval()
-    net_inner = net.module if hasattr(net, "module") else net
+    net_inner = _inner_net(net)
     n_show = max(1, ctx.args.viz_num_samples)
-    per_image: List[Dict[str, Any]] = []
     max_eval_batches = int(getattr(ctx.args, "viz_max_source_batches", 30))
+    class_aware = bool(getattr(ctx.args, "eval_class_aware", True))
 
     _p(f"detection samples (<= {max_eval_batches} batches)")
-    with torch.no_grad():
-        for b_idx, (images, targets, img_paths) in enumerate(ctx.val_loader):
-            if b_idx >= max_eval_batches:
-                break
-            images = images.cuda() / 255.0
-            img_dark = build_dark_batch(images)
-            dark_res = infer_detections_batch(net, img_dark, conf_thr=0.5)
-            for i in range(images.shape[0]):
-                pb, ps, pl = dark_res[i]
-                h_, w_ = (img_dark.shape[2], img_dark.shape[3])
-                gt = (
-                    targets[i].cpu().numpy()
-                    if hasattr(targets[i], "cpu")
-                    else np.asarray(targets[i])
-                )
-                if gt.size:
-                    gt_px = gt[:, :4].copy()
-                    gt_px[:, 0] *= w_
-                    gt_px[:, 2] *= w_
-                    gt_px[:, 1] *= h_
-                    gt_px[:, 3] *= h_
-                    gt_lbl = (
-                        gt[:, 4].astype(np.int32)
-                        if gt.shape[1] > 4
-                        else np.zeros(len(gt), dtype=np.int32)
-                    )
-                else:
-                    gt_px = np.zeros((0, 4), dtype=np.float32)
-                    gt_lbl = np.zeros((0,), dtype=np.int32)
-                per_image.append(
-                    dict(
-                        pred_boxes=pb,
-                        pred_scores=ps,
-                        pred_labels=pl,
-                        gt_boxes=gt_px,
-                        gt_labels=gt_lbl,
-                    )
-                )
-    _p("confusion matrix / PR / F1 curves")
-    scores, matched, n_gt, cm = viz.evaluate_detections(
-        per_image, iou_thr=0.5, score_thr_cm=0.5, num_classes=ctx.args.nc
+    per_image = _collect_gt_pred_samples(
+        ctx.val_loader, net, max_eval_batches, darken=ctx.synthesize_night
     )
+    _p("confusion matrix / PR / F1 curves")
+    _, _, cm = _detection_summary(per_image, ctx.args.nc, class_aware)
     viz.plot_confusion_matrix(
         cm,
         ctx.charts_dir,
@@ -972,45 +1187,14 @@ def run_full_visualisation(
     )
     if ctx.target_val_loader is not None:
         _p("target val: confusion matrix / PR / F1 (real night)")
-        tgt_per_image: List[Dict[str, Any]] = []
-        max_tgt = int(getattr(ctx.args, "viz_max_target_batches", 30))
-        with torch.no_grad():
-            for tb_idx, (tvi, ttgt, _tpaths) in enumerate(ctx.target_val_loader):
-                if tb_idx >= max_tgt:
-                    break
-                tgt_res = infer_detections_batch(net, tvi.cuda() / 255.0, conf_thr=0.5)
-                for i in range(tvi.shape[0]):
-                    pb, ps, pl = tgt_res[i]
-                    h_, w_ = (tvi.shape[2], tvi.shape[3])
-                    gt = (
-                        ttgt[i].cpu().numpy()
-                        if hasattr(ttgt[i], "cpu")
-                        else np.asarray(ttgt[i])
-                    )
-                    if gt.size:
-                        gpx = gt[:, :4].copy()
-                        gpx[:, 0] *= w_
-                        gpx[:, 2] *= w_
-                        gpx[:, 1] *= h_
-                        gpx[:, 3] *= h_
-                        glb = (
-                            gt[:, 4].astype(np.int32)
-                            if gt.shape[1] > 4
-                            else np.zeros(len(gt), dtype=np.int32)
-                        )
-                    else:
-                        gpx = np.zeros((0, 4), dtype=np.float32)
-                        glb = np.zeros((0,), dtype=np.int32)
-                    tgt_per_image.append(
-                        dict(
-                            pred_boxes=pb, pred_scores=ps, pred_labels=pl,
-                            gt_boxes=gpx, gt_labels=glb,
-                        )
-                    )
+        tgt_per_image = _collect_gt_pred_samples(
+            ctx.target_val_loader,
+            net,
+            int(getattr(ctx.args, "viz_max_target_batches", 30)),
+        )
         if tgt_per_image:
-            tscores, tmatched, tn_gt, tcm = viz.evaluate_detections(
-                tgt_per_image, iou_thr=0.5, score_thr_cm=0.5,
-                num_classes=ctx.args.nc,
+            _, _, tcm = _detection_summary(
+                tgt_per_image, ctx.args.nc, class_aware
             )
             viz.plot_confusion_matrix(
                 tcm,
@@ -1044,6 +1228,11 @@ def run_full_visualisation(
     if gradcam is not None:
         gradcam.remove()
     try:
+        _p("per-layer source/target t-SNE")
+        render_layer_tsne(ctx, net_inner, method, config)
+    except Exception as e:
+        print(f"[WARN] per-layer t-SNE failed: {e}")
+    try:
         _p("domain-adaptation metric curves")
         viz.plot_domain_metrics(
             ctx.history, ctx.charts_dir, method=method, config=config
@@ -1063,7 +1252,7 @@ def run_full_visualisation(
         print(f"[WARN] wandb image log failed: {e}")
     with open(os.path.join(ctx.charts_dir, "history.json"), "w") as fh:
         json.dump(dict(ctx.history), fh, indent=2)
-    print(f"[viz] saved charts to {ctx.charts_dir}", flush=True)
+    print(f"🖼️  [viz] saved charts to {ctx.charts_dir}", flush=True)
     net.train()
 
 
@@ -1091,57 +1280,40 @@ def _log_wandb_images(ctx: "TrainingContext") -> None:
             "charts/losses": os.path.join(d, "losses.png"),
             "charts/confusion_source": os.path.join(d, "confusion_matrix_source.png"),
             "charts/confusion_target": os.path.join(d, "confusion_matrix_target.png"),
+            "charts/tsne_layers": os.path.join(d, TSNE_FNAME),
         }
     )
 
 
 
-def clone_teacher(net_inner: torch.nn.Module) -> torch.nn.Module:
-    cached = {}
-    for attr in ("_eval_detect", "_eval_softmax"):
-        if hasattr(net_inner, attr):
-            cached[attr] = getattr(net_inner, attr)
-            delattr(net_inner, attr)
-    try:
-        teacher = copy.deepcopy(net_inner)
-    finally:
-        for attr, val in cached.items():
-            setattr(net_inner, attr, val)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    return teacher
+SourceView = Tuple[str, torch.Tensor, torch.Tensor]
 
 
-@torch.no_grad()
-def ema_update(
-    teacher: torch.nn.Module, student: torch.nn.Module, decay: float
-) -> None:
-    t_params = dict(teacher.named_parameters())
-    for name, p in student.named_parameters():
-        t_params[name].mul_(decay).add_(p.detach(), alpha=1.0 - decay)
-    t_bufs = dict(teacher.named_buffers())
-    for name, b in student.named_buffers():
-        if name not in t_bufs:
-            continue
-        if b.dtype.is_floating_point:
-            t_bufs[name].mul_(decay).add_(b.detach(), alpha=1.0 - decay)
-        else:
-            t_bufs[name].copy_(b)
+def grl_lambda_at(iteration: int, max_steps: int, gamma: float) -> float:
+    if gamma <= 0.0:
+        return 1.0
+    progress = min(max(float(iteration) / float(max(max_steps, 1)), 0.0), 1.0)
+
+    return float(2.0 / (1.0 + math.exp(-gamma * progress)) - 1.0)
 
 
-def strong_photometric_aug(images: torch.Tensor) -> torch.Tensor:
-    b, dev = images.size(0), images.device
+def align_source_views(
+    source_view: str,
+    source_images: torch.Tensor,
+    source_illumination: torch.Tensor,
+    source_dark: torch.Tensor,
+    source_dark_illumination: torch.Tensor,
+) -> List[SourceView]:
+    if source_view not in SOURCE_VIEWS:
+        raise ValueError(
+            f"align_source_view must be one of {list(SOURCE_VIEWS)}, "
+            f"got {source_view!r}"
+        )
 
-    def _rf(lo: float, hi: float) -> torch.Tensor:
-        return torch.rand(b, 1, 1, 1, device=dev) * (hi - lo) + lo
+    light = ("light", source_images, source_illumination)
+    dark = ("dark", source_dark, source_dark_illumination)
 
-    x = images * _rf(0.6, 1.4)                         # brightness
-    mean = x.mean(dim=(1, 2, 3), keepdim=True)
-    x = (x - mean) * _rf(0.6, 1.4) + mean              # contrast
-    gray = x.mean(dim=1, keepdim=True)
-    x = (x - gray) * _rf(0.5, 1.5) + gray              # saturation
-    return x.clamp_(0.0, 1.0)
+    return {"light": [light], "dark": [dark], "both": [dark, light]}[source_view]
 
 
 def validate(
@@ -1178,7 +1350,7 @@ def validate(
     pbar = tqdm(
         ctx.val_loader,
         total=len(ctx.val_loader),
-        desc=f"Epoch {epoch} [val]",
+        desc=f"🔍 Epoch {epoch} [val]",
         leave=False,
         position=1,
         dynamic_ncols=True,
@@ -1187,10 +1359,8 @@ def validate(
         colour="green",
     )
     
-    test_forward = (
-        net.module.test_forward if hasattr(net, "module") else net.test_forward
-    )
-    
+    test_forward = _inner_net(net).test_forward
+
     with torch.no_grad():
         for images, targets, _ in pbar:
             if vprof_on:
@@ -1200,7 +1370,7 @@ def validate(
                 
             images = images.cuda() / 255.0
             targets_v = [t.cuda() for t in targets]
-            img_dark = build_dark_batch(images)
+            img_dark = ctx.synthesize_night(images)
             if vprof_on:
                 _vlap("val_dark_isp")
                 
@@ -1238,10 +1408,15 @@ def validate(
     pbar.close()
     kl_sum = torch.tensor(0.0, device="cuda")
     ent_sum = torch.tensor(0.0, device="cuda")
+    mmd_sum = torch.tensor(0.0, device="cuda")
+    gap_sum = torch.tensor(0.0, device="cuda")
+    per_tap_gap: Dict[str, float] = {}
     dom_step = 0
-    net_inner = net.module if hasattr(net, "module") else net
-    enh_inner = net_enh.module if hasattr(net_enh, "module") else net_enh
-    max_dom_batches = 10
+    net_inner = _inner_net(net)
+    enh_inner = _inner_net(net_enh)
+    max_dom_batches = int(getattr(ctx.args, "align_eval_batches", 10))
+    src_embeddings: List[torch.Tensor] = []
+    tgt_embeddings: List[torch.Tensor] = []
     if vprof_on:
         if _vcuda:
             torch.cuda.synchronize()
@@ -1269,11 +1444,28 @@ def validate(
                 if n == 0:
                     continue
                 s_imgs, t_imgs = (s_imgs[:n], t_imgs[:n])
-                _, I_s = enh_inner(s_imgs)
+                s_view = (
+                    ctx.synthesize_night(s_imgs)
+                    if net_inner.align_spec.source_view != "light"
+                    else s_imgs
+                )
+                _, I_s = enh_inner(s_view)
                 _, I_t = enh_inner(t_imgs)
                 _, _, kl = net_inner.extract_features(
-                    s_imgs, t_imgs, I_s.detach(), I_t.detach()
+                    s_view, t_imgs, I_s.detach(), I_t.detach()
                 )
+                src_embeddings.append(
+                    net_inner.embed_align_features(s_view).float().cpu()
+                )
+                tgt_embeddings.append(
+                    net_inner.embed_align_features(t_imgs).float().cpu()
+                )
+                gap_stats = net_inner.domain_gap(s_view, t_imgs)
+                mmd_sum += float(gap_stats["mmd"])
+                gap_sum += float(gap_stats["gap"])
+                for key, value in gap_stats.items():
+                    if key.endswith("_gap"):
+                        per_tap_gap[key] = per_tap_gap.get(key, 0.0) + value
                 out_t, _ = net_inner.test_forward(t_imgs)
                 conf_t = out_t[4]
                 p_t = F.softmax(conf_t, dim=-1)
@@ -1290,7 +1482,9 @@ def validate(
     dist.reduce(conf_sum, 0, op=dist.ReduceOp.SUM)
     dist.reduce(kl_sum, 0, op=dist.ReduceOp.SUM)
     dist.reduce(ent_sum, 0, op=dist.ReduceOp.SUM)
-    
+    dist.reduce(mmd_sum, 0, op=dist.ReduceOp.SUM)
+    dist.reduce(gap_sum, 0, op=dist.ReduceOp.SUM)
+
     if vprof_on:
         _vlap("val_reduce")
     n_gpus = max(torch.cuda.device_count(), 1)
@@ -1301,7 +1495,17 @@ def validate(
     dom_denom = max(dom_step, 1) * n_gpus
     val_kl_st = (kl_sum / dom_denom).item()
     val_entropy = (ent_sum / dom_denom).item()
-    
+    overlap = embedding_overlap_stats(src_embeddings, tgt_embeddings)
+    val_align_mmd = float(overlap["align_mmd"])
+    val_align_gap = float(overlap["align_gap"])
+    val_align_auc = float(overlap["align_auc"])
+    val_align_n = int(overlap["align_n_source"])
+    val_align_mmd_batch = (mmd_sum / dom_denom).item()
+    val_align_gap_batch = (gap_sum / dom_denom).item()
+    tap_gap_report = " ".join(
+        f"{k[:-4]}={v / max(dom_step, 1):.3f}" for k, v in sorted(per_tap_gap.items())
+    )
+
     if not is_rank0:
         net.train()
         return None
@@ -1310,11 +1514,11 @@ def validate(
         if _vcuda:
             torch.cuda.synchronize()
         _vmark[0] = time.perf_counter()
-    scores, matched, n_gt, cm = viz.evaluate_detections(
-        per_image, iou_thr=0.5, score_thr_cm=0.5, num_classes=ctx.args.nc
+    class_aware = bool(getattr(ctx.args, "eval_class_aware", True))
+    m, mAP, _ = _detection_summary(per_image, ctx.args.nc, class_aware)
+    src_macro = macro_summary(
+        per_class_detection_metrics(per_image, ctx.args.nc, ctx.class_names)
     )
-    m = detect_metrics_from_cm(cm)
-    _, _, _, mAP = viz._pr_from_scores(np.asarray(scores), np.asarray(matched), n_gt)
 
     tr_per_image: List[Dict[str, np.ndarray]] = []
     max_train_eval = 20
@@ -1323,20 +1527,14 @@ def validate(
             if tb >= max_train_eval:
                 break
             timg = timg.cuda() / 255.0
-            tdark = build_dark_batch(timg)
+            tdark = ctx.synthesize_night(timg)
             tout, _ = test_forward(tdark)
             tr_per_image.extend(_decode_per_image(tout, ttgt, net))
             
     if tr_per_image:
-        ts, tm_, tng, tcm = viz.evaluate_detections(
-            tr_per_image, iou_thr=0.5, score_thr_cm=0.5,
-            num_classes=ctx.args.nc,
+        tmet, tmap, _ = _detection_summary(
+            tr_per_image, ctx.args.nc, class_aware
         )
-        tmet = detect_metrics_from_cm(tcm)
-        _, _, _, tmap = viz._pr_from_scores(
-            np.asarray(ts), np.asarray(tm_), tng
-        )
-        
     else:
         tmet = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
         tmap = 0.0
@@ -1349,45 +1547,26 @@ def validate(
     target_per_image: List[Dict[str, np.ndarray]] = []
     tgt_met = {"precision": 0.0, "recall": 0.0, "f1": 0.0, "tp": 0, "fp": 0, "fn": 0}
     tgt_map = 0.0
-    tgt_val_loss = 0.0
-    tgt_val_loc = 0.0
-    tgt_val_conf = 0.0
-    tgt_val_steps = 0
-    
+    tgt_val_loss = tgt_val_loc = tgt_val_conf = 0.0
+
     if ctx.target_val_loader is not None:
-        with torch.no_grad():
-            for tvi, ttgt, _tpaths in ctx.target_val_loader:
-                tvi = tvi.cuda() / 255.0
-                ttgt_v = [t.cuda() for t in ttgt]
-                tvout, _ = test_forward(tvi)
-                t_loc, t_conf = criterion(tvout[3:], ttgt_v)
-                tgt_val_loc += float(t_loc.detach().item())
-                tgt_val_conf += float(t_conf.detach().item())
-                tgt_val_loss += float((t_loc + t_conf).detach().item())
-                tgt_val_steps += 1
-                target_per_image.extend(_decode_per_image(tvout, ttgt, net))
-    
-    if tgt_val_steps > 0:
-        tgt_val_loss /= tgt_val_steps
-        tgt_val_loc /= tgt_val_steps
-        tgt_val_conf /= tgt_val_steps
-        
+        target_per_image, tgt_val_loss, tgt_val_loc, tgt_val_conf = (
+            _eval_labeled_loader(
+                ctx.target_val_loader, net, criterion,
+                desc=f"🌙 Epoch {epoch} [target val]",
+            )
+        )
+
+    tgt_per_class: Dict[str, Dict[str, float]] = {}
+    tgt_macro = macro_summary({})
     if target_per_image:
-        tgs, tgm, tgng, tgcm = viz.evaluate_detections(
-            target_per_image, iou_thr=0.5, score_thr_cm=0.5,
-            num_classes=ctx.args.nc,
+        tgt_met, tgt_map, _ = _detection_summary(
+            target_per_image, ctx.args.nc, class_aware
         )
-        tgt_met = detect_metrics_from_cm(tgcm)
-        _, _, _, tgt_map = viz._pr_from_scores(
-            np.asarray(tgs), np.asarray(tgm), tgng
+        tgt_per_class = per_class_detection_metrics(
+            target_per_image, ctx.args.nc, ctx.class_names
         )
-        ctx._target_eval_cache = {
-            "per_image": target_per_image,
-            "scores": tgs, "matched": tgm, "n_gt": tgng, "cm": tgcm,
-        }
-        
-    else:
-        ctx._target_eval_cache = None
+        tgt_macro = macro_summary(tgt_per_class)
     ctx.history.setdefault("target_precision", []).append(
         (epoch, float(tgt_met["precision"]))
     )
@@ -1406,7 +1585,7 @@ def validate(
 
     elapsed = time.time() - t0
     table = format_val_table(
-        f"Val metrics · epoch {epoch}",
+        f"📊 Val metrics · epoch {epoch}",
         [
             ("§", "Loss"),
             ("Validation loss", f"{val_loss:.4f}"),
@@ -1434,14 +1613,31 @@ def validate(
             ("Target precision", f"{tgt_met['precision']:.4f}"),
             ("Target recall", f"{tgt_met['recall']:.4f}"),
             ("Target F1 score", f"{tgt_met['f1']:.4f}"),
-            ("Target mAP @ IoU 0.5", f"{tgt_map:.4f}"),
+            ("Target mAP @ IoU 0.5 (micro)", f"{tgt_map:.4f}"),
+            ("Target macro mAP@50 (per-class mean)", f"{tgt_macro['macro_map50']:.4f}"),
+            ("Target macro F1 (per-class mean)", f"{tgt_macro['macro_f1']:.4f}"),
             (
                 "Target TP / FP / FN",
                 f"{tgt_met['tp']} / {tgt_met['fp']} / {tgt_met['fn']}",
             ),
             ("Target n images", f"{len(target_per_image)}"),
             ("§", "Domain adaptation"),
-            ("KL divergence (source vs target)", f"{val_kl_st:.4f}"),
+            (
+                "Protocol",
+                "supervised DA (target labels in loss + selection)"
+                if ctx.target_labeled
+                else "UDA (target labels never used, monitoring only)",
+            ),
+            (
+                "best_model.pth selected on",
+                "target val F1" if ctx.target_labeled else "source val F1",
+            ),
+            ("Alignment loss (source vs target)", f"{val_kl_st:.4f}"),
+            ("Embedding MMD (0 = overlapping)", f"{val_align_mmd:.4f}"),
+            ("Embedding gap, std units (<0.2 = overlapping)", f"{val_align_gap:.4f}"),
+            ("Domain AUC (0.5 = indistinguishable)", f"{val_align_auc:.4f}"),
+            ("Embeddings per domain", f"{val_align_n}"),
+            ("Per-tap gap", tap_gap_report or "n/a"),
             ("Target detection entropy", f"{val_entropy:.4f}"),
             ("§", "Timing"),
             ("Elapsed (seconds)", f"{elapsed:.2f}"),
@@ -1449,6 +1645,15 @@ def validate(
     )
     
     print(table)
+    if tgt_per_class:
+        print(
+            format_per_class_table(
+                tgt_per_class, f"🌙 Per-class target metrics · epoch {epoch}"
+            )
+        )
+    ctx.history["val_macro_map"].append((epoch, float(src_macro["macro_map50"])))
+    ctx.history["target_macro_map"].append((epoch, float(tgt_macro["macro_map50"])))
+    ctx.history["target_macro_f1"].append((epoch, float(tgt_macro["macro_f1"])))
     ctx.history["val_accuracy"].append((epoch, float(m["accuracy"])))
     ctx.history["val_precision"].append((epoch, float(m["precision"])))
     ctx.history["val_recall"].append((epoch, float(m["recall"])))
@@ -1456,6 +1661,9 @@ def validate(
     ctx.history["val_map"].append((epoch, float(mAP)))
     ctx.history["val_kl_st"].append((epoch, float(val_kl_st)))
     ctx.history["val_entropy"].append((epoch, float(val_entropy)))
+    ctx.history["val_align_mmd"].append((epoch, float(val_align_mmd)))
+    ctx.history["val_align_gap"].append((epoch, float(val_align_gap)))
+    ctx.history["val_align_auc"].append((epoch, float(val_align_auc)))
     
     _append_record_row(
         ctx.val_records_path,
@@ -1473,6 +1681,12 @@ def validate(
             "fp": int(m["fp"]),
             "fn": int(m["fn"]),
             "val_kl_st": round(float(val_kl_st), 6),
+            "val_align_mmd": round(float(val_align_mmd), 6),
+            "val_align_gap": round(float(val_align_gap), 6),
+            "val_align_auc": round(float(val_align_auc), 6),
+            "val_align_n": val_align_n,
+            "val_align_mmd_batch": round(float(val_align_mmd_batch), 6),
+            "val_align_gap_batch": round(float(val_align_gap_batch), 6),
             "val_entropy": round(float(val_entropy), 6),
             "target_val_loss": round(float(tgt_val_loss), 6),
             "target_val_pal2_loc": round(float(tgt_val_loc), 6),
@@ -1485,17 +1699,40 @@ def validate(
             "target_fp": int(tgt_met["fp"]),
             "target_fn": int(tgt_met["fn"]),
             "target_n": len(target_per_image),
+            "val_macro_mAP": round(float(src_macro["macro_map50"]), 6),
+            "target_macro_mAP": round(float(tgt_macro["macro_map50"]), 6),
+            "target_macro_f1": round(float(tgt_macro["macro_f1"]), 6),
+            **{
+                f"target_ap50_{name}": round(float(stats["ap50"]), 6)
+                for name, stats in tgt_per_class.items()
+            },
+            **{
+                f"target_f1_{name}": round(float(stats["f1"]), 6)
+                for name, stats in tgt_per_class.items()
+            },
             "elapsed_s": round(float(elapsed), 2),
             "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
         },
     )
 
-    has_target = bool(target_per_image)
-    sel_f1 = float(tgt_met["f1"] if has_target else m["f1"])
-    sel_name = "target val F1" if has_target else "source val F1"
+    select_on_target = bool(target_per_image) and ctx.target_labeled
+    selection = str(getattr(ctx.args, "model_selection", "micro_f1")).lower()
+    if select_on_target:
+        candidates = {
+            "micro_f1": (float(tgt_met["f1"]), "target val micro F1"),
+            "macro_f1": (float(tgt_macro["macro_f1"]), "target val macro F1"),
+            "macro_map": (float(tgt_macro["macro_map50"]), "target val macro mAP@50"),
+        }
+    else:
+        candidates = {
+            "micro_f1": (float(m["f1"]), "source val micro F1"),
+            "macro_f1": (float(src_macro["macro_f1"]), "source val macro F1"),
+            "macro_map": (float(src_macro["macro_map50"]), "source val macro mAP@50"),
+        }
+    sel_f1, sel_name = candidates.get(selection, candidates["micro_f1"])
     if sel_f1 > ctx.best_f1:
         print(
-            f"[ckpt] saving best_model.pth, epoch {epoch} "
+            f"🏆 [ckpt] saving best_model.pth, epoch {epoch} "
             f"({sel_name} {sel_f1:.4f} > {max(ctx.best_f1, 0.0):.4f})"
         )
         torch.save(
@@ -1503,15 +1740,12 @@ def validate(
         )
         ctx.best_f1 = sel_f1
 
-    sel_map = float(tgt_map if has_target else mAP)
+    sel_map = float(tgt_map if select_on_target else mAP)
     if sel_map > ctx.best_map:
         ctx.best_map = sel_map
     if val_loss < ctx.min_loss:
         ctx.min_loss = val_loss
-    torch.save(
-        {"epoch": epoch, "weight": dsfd_net.state_dict()},
-        os.path.join(ctx.save_folder, CHECKPOINT_LATEST),
-    )
+    save_latest_checkpoint(ctx, dsfd_net, epoch)
     if vprof_on:
         _vlap("val_post_eval")
         _write_profile_csv(ctx, _vprof, epoch)
@@ -1584,27 +1818,36 @@ def train_one_epoch(
     entropy_loss_weight = float(getattr(ctx.args, "entropy_loss_weight", 0.0))
     kl_loss_weight = float(getattr(ctx.args, "kl_loss_weight", 1.0))
     prog_warmup = int(getattr(ctx.args, "prog_warmup_iters", 0))
-    mutual_loss_weight = float(getattr(ctx.args, "mutual_loss_weight", 0.0))
-    pseudo_weight = float(getattr(ctx.args, "pseudo_weight", 0.0))
-    pseudo_conf = float(getattr(ctx.args, "pseudo_conf", 0.7))
-    pseudo_start = int(getattr(ctx.args, "pseudo_start_iters", 0))
-    pseudo_nms = float(getattr(ctx.args, "pseudo_nms_iou", 0.35))
-    ema_decay = float(getattr(ctx.args, "ema_decay", 0.9996))
-    strong_aug = bool(getattr(ctx.args, "pseudo_strong_aug", True))
-    pseudo_ramp_iters = int(getattr(ctx.args, "pseudo_ramp_iters", 1000))
-    pseudo_cls_weight = float(getattr(ctx.args, "pseudo_cls_weight", 0.25))
+    lambda_gamma = float(getattr(ctx.args, "align_lambda_gamma", 0.0))
+    max_steps = int(getattr(ctx.args, "max_steps", 0) or cfg.MAX_STEPS)
+    grl_sum, grl_batches = (0.0, 0)
+    adv_acc_sums: Dict[str, float] = {}
     sup_target_on = bool(getattr(ctx.args, "is_use_supervised_target_loss", False))
     sup_target_weight = float(
         getattr(ctx.args, "supervised_target_loss_weight", 1.0)
     )
+    net_inner = _inner_net(net)
+    da_img_weight = float(getattr(ctx.args, "da_img_adv_weight", 1.0))
+    da_obj_weight = float(getattr(ctx.args, "da_obj_adv_weight", 0.5))
+    da_grl_gamma = float(getattr(ctx.args, "da_grl_gamma", 10.0))
+    da_on = bool(getattr(net_inner, "da_enabled", False)) and (
+        da_img_weight > 0.0 or da_obj_weight > 0.0
+    )
+    da_mask_present = da_on and bool(
+        getattr(ctx.args, "da_prototype_mask_present", False)
+    )
+    num_fg_classes = int(getattr(ctx.args, "nc", 1) or 1)
+    class_seen = np.zeros(num_fg_classes, dtype=np.int64)
     epoch_start = time.time()
     batch_idx = 0
     is_rank0 = ctx.local_rank == 0
+    if hasattr(ctx.train_sampler, "set_epoch"):
+        ctx.train_sampler.set_epoch(epoch)
     n_batches_est = len(ctx.train_loader)
     pbar = tqdm(
         ctx.train_loader,
         total=n_batches_est,
-        desc=f"Epoch {epoch} [train]",
+        desc=f"🔥 Epoch {epoch} [train]",
         leave=False,
         position=1,
         dynamic_ncols=True,
@@ -1613,10 +1856,9 @@ def train_one_epoch(
         colour="green",
     )
     
-    net_inner = net.module if hasattr(net, "module") else net
-    prof_iters = int(os.environ.get("DAINET_PROFILE_ITERS", "0") or "0")
+    prof_iters = int(os.environ.get("RAILIGHT_PROFILE_ITERS", "0") or "0")
 
-    prof_full = os.environ.get("DAINET_PROFILE", "1").strip().lower() not in (
+    prof_full = os.environ.get("RAILIGHT_PROFILE", "1").strip().lower() not in (
         "0", "false", "no", "off",
     )
     
@@ -1656,6 +1898,15 @@ def train_one_epoch(
                 )
             _tmark[0] = _t_now
             
+        if is_rank0:
+            for t in source_targets:
+                if t.numel():
+                    lbl = t[:, 4].long() - 1
+                    lbl = lbl[(lbl >= 0) & (lbl < num_fg_classes)]
+                    if lbl.numel():
+                        class_seen += np.bincount(
+                            lbl.numpy(), minlength=num_fg_classes
+                        )
         source_images = Variable(source_images.cuda() / 255.0)
         source_targets_v = [
             Variable(ann.cuda(), requires_grad=False) for ann in source_targets
@@ -1666,21 +1917,21 @@ def train_one_epoch(
         )
         has_target = target_images is not None
         prog = 1.0 if prog_warmup <= 0 else min(1.0, iteration / float(prog_warmup))
+        grl_lambda = grl_lambda_at(iteration, max_steps, lambda_gamma)
 
         if has_target:
             target_images = target_images.cuda(non_blocking=True) / 255.0
             
         if prof_active:
             _lap("data_to_gpu")
-        source_dark = build_dark_batch(source_images)
+        source_dark = ctx.synthesize_night(source_images)
         
         if prof_active:
             _lap("dark_isp")
             
-        if iteration in cfg.LR_STEPS:
-            step_index += 1
-            adjust_learning_rate(optimizer, ctx.args.gamma)
-            
+        if ctx.lr_schedule is not None:
+            ctx.lr_schedule.step(iteration)
+
         t0 = time.time()
 
         with torch.no_grad():
@@ -1693,19 +1944,19 @@ def train_one_epoch(
         if prof_active:
             _lap("retinex_net_enh")
             
-        out, out2, loss_mutual_net = net(
-            source_dark, source_images, I_source_dark.detach(), I_source.detach()
+        present_source = (
+            present_class_mask(source_targets, num_fg_classes, source_images.device)
+            if da_mask_present
+            else None
         )
+        with net_inner.da_capture("source", present=present_source):
+            out, out2 = net(
+                source_dark, source_images, I_source_dark.detach(), I_source.detach()
+            )
         R_source_dark_inner, R_source_inner, R_dark_swap, R_light_swap = out2
         if prof_active:
             _lap("net_forward")
 
-        if mutual_loss_weight > 0:
-            loss_mutual_src_srcdark = loss_mutual_net * mutual_loss_weight * prog
-        else:
-            loss_mutual_src_srcdark = torch.zeros((), device=source_images.device)
-        optimizer.zero_grad()
-        
         loss_l_pa1l, loss_c_pal1 = criterion(out[:3], source_targets_v)
         
         if prof_active:
@@ -1716,17 +1967,35 @@ def train_one_epoch(
             _lap("loss_det_pal2")
         loss_kl_src_tgt = torch.zeros((), device=source_images.device)
         R_target_train = None
-        
-        if has_target:
+        align_parts: Dict[str, torch.Tensor] = {}
 
-            _, _, loss_kl_src_tgt, R_target_train = net_inner.extract_features(
-                source_images, target_images,
-                I_source.detach(), I_target.detach(),
-                return_reflectance=True,
+        if has_target:
+            views = align_source_views(
+                net_inner.align_spec.source_view,
+                source_images, I_source, source_dark, I_source_dark,
             )
-            
-            loss_kl_src_tgt = loss_kl_src_tgt * kl_loss_weight * prog
-            
+            for view_name, view_images, view_illum in views:
+                _, _, view_loss, R_target_train, view_parts = (
+                    net_inner.extract_features(
+                        view_images, target_images,
+                        view_illum.detach(), I_target.detach(),
+                        return_reflectance=True,
+                        return_parts=True,
+                        grl_lambda=grl_lambda,
+                    )
+                )
+                loss_kl_src_tgt = loss_kl_src_tgt + view_loss / len(views)
+                align_parts.update(
+                    {f"{view_name}/{k}": v for k, v in view_parts.items()}
+                )
+            grl_sum += grl_lambda
+            grl_batches += 1
+            for key, value in align_parts.items():
+                if key.endswith("_acc"):
+                    adv_acc_sums[key] = adv_acc_sums.get(key, 0.0) + float(value)
+
+            loss_kl_src_tgt = loss_kl_src_tgt * kl_loss_weight
+
         if prof_active:
             _lap("loss_kl")
             
@@ -1780,20 +2049,23 @@ def train_one_epoch(
             _lap("loss_wreg")
             
         loss_entropy = torch.zeros((), device=source_images.device)
-        loss_pseudo = torch.zeros((), device=source_images.device)
         loss_target_sup = torch.zeros((), device=source_images.device)
-        pseudo_on = (
-            has_target and pseudo_weight > 0 and iteration >= pseudo_start
-        )
+        loss_da_img = torch.zeros((), device=source_images.device)
+        loss_da_obj = torch.zeros((), device=source_images.device)
         sup_on = sup_target_on and has_target and target_labels is not None
-        if has_target and (entropy_loss_weight > 0 or pseudo_on or sup_on):
-            out_t, _ = net_inner.test_forward(target_images)
+        if has_target and (entropy_loss_weight > 0 or sup_on or da_on):
+            present_target = (
+                present_class_mask(target_labels, num_fg_classes, source_images.device)
+                if (da_mask_present and target_labels is not None)
+                else None
+            )
+            with net_inner.da_capture("target", present=present_target):
+                out_t, _ = net_inner.test_forward(target_images)
             if sup_on:
                 target_labels_v = [
                     Variable(ann.cuda(), requires_grad=False) for ann in target_labels
                 ]
-                # same recipe as the source supervised loss: both PAL heads,
-                # loc + conf, no warm-up ramp
+         
                 loss_ts_l1, loss_ts_c1 = criterion(out_t[:3], target_labels_v)
                 loss_ts_l2, loss_ts_c2 = criterion(out_t[3:], target_labels_v)
                 loss_target_sup = (
@@ -1806,46 +2078,17 @@ def train_one_epoch(
                 loss_entropy = (
                     -(p_t * logp_t).sum(dim=-1).mean() * entropy_loss_weight * prog
                 )
-            if pseudo_on:
-
-                if ctx.teacher is None:
-                    ctx.teacher = clone_teacher(net_inner)
-                    if is_rank0:
-                        print(
-                            f"[mean-teacher] EMA teacher initialised at iter "
-                            f"{iteration} (decay={ema_decay}, strong_aug={strong_aug})"
+            if da_on:
+                da_grl = grl_lambda_at(iteration, max_steps, da_grl_gamma)
+                da_img, da_obj, da_parts = net_inner.damamba_align_loss(da_grl)
+                loss_da_img = da_img * da_img_weight * prog
+                loss_da_obj = da_obj * da_obj_weight * prog
+                align_parts.update({f"da_{k}": v for k, v in da_parts.items()})
+                for key, value in da_parts.items():
+                    if key.endswith("_acc"):
+                        adv_acc_sums[f"da_{key}"] = (
+                            adv_acc_sums.get(f"da_{key}", 0.0) + float(value)
                         )
-                ctx.teacher.eval()
-                with torch.no_grad():
-                    out_teacher, _ = ctx.teacher.test_forward(target_images)
-                    pl_t = build_pseudo_targets(
-                        ctx.teacher, out_teacher, pseudo_conf, pseudo_nms,
-                        source_images.device,
-                    )
-                keep = [i for i, t in enumerate(pl_t) if t.shape[0] > 0]
-                if keep:
-                    if strong_aug:
-                        out_s, _ = net_inner.test_forward(
-                            strong_photometric_aug(target_images)
-                        )
-                    else:
-                        out_s = out_t
-                    kt = torch.as_tensor(keep, device=source_images.device, dtype=torch.long)
-                    pred = (
-                        out_s[3].index_select(0, kt),
-                        out_s[4].index_select(0, kt),
-                        out_s[5],
-                    )
-                    lp_l, lp_c = criterion(pred, [pl_t[i] for i in keep])
-                    # ease pseudo loss in over pseudo_ramp_iters after burn-in
-                    pseudo_ramp = (
-                        1.0 if pseudo_ramp_iters <= 0
-                        else min(1.0, (iteration - pseudo_start) / float(pseudo_ramp_iters))
-                    )
-
-                    loss_pseudo = (
-                        (lp_l + pseudo_cls_weight * lp_c) * pseudo_weight * pseudo_ramp
-                    )
 
         if prof_active:
             _lap("loss_entropy")
@@ -1857,10 +2100,10 @@ def train_one_epoch(
             "pal2_conf": loss_c_pal2,
             "enhance": loss_enhance,
             "enhance_l1ssim": loss_enhance2,
-            "mutual": loss_mutual_src_srcdark,
             "target_unsup": loss_target_unsup,
             "target_sup": loss_target_sup,
-            "pseudo": loss_pseudo,
+            "da_img_adv": loss_da_img,
+            "da_obj_adv": loss_da_obj,
             "kl_st": loss_kl_src_tgt,
             "wreg": loss_wreg,
             "entropy": loss_entropy,
@@ -1900,17 +2143,25 @@ def train_one_epoch(
         if prof_active:
             _lap("loss_misc")
             
-        loss.backward()
-        
+        accumulate = max(1, int(getattr(ctx, "accumulate", 1)))
+        is_step = (iteration + 1) % accumulate == 0
+        sync_ctx = (
+            net.no_sync()
+            if (not is_step and hasattr(net, "no_sync"))
+            else nullcontext()
+        )
+        with sync_ctx:
+            (loss / accumulate).backward()
+
         if prof_active:
             _lap("backward")
-            
-        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=35, norm_type=2)
-        optimizer.step()
 
-        # Mean-teacher: slide the EMA teacher toward the updated student.
-        if ctx.teacher is not None:
-            ema_update(ctx.teacher, net_inner, ema_decay)
+        if is_step:
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=35, norm_type=2)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if ctx.ema is not None:
+                ctx.ema.update(net)
 
         if prof_active:
             _lap("optim_step")
@@ -1929,6 +2180,11 @@ def train_one_epoch(
             pbar.set_postfix(
                 {
                     "loss": f"{loss.item():.3f}",
+                    **(
+                        {"bal": f"{class_seen.max() / max(class_seen.min(), 1):.1f}x"}
+                        if class_seen.sum()
+                        else {}
+                    ),
                     "avg": f"{tloss_running:.3f}",
                     "p1_c": f"{loss_c_pal1.item():.3f}",
                     "p1_l": f"{loss_l_pa1l.item():.3f}",
@@ -1939,6 +2195,8 @@ def train_one_epoch(
                     "kl_st": f"{loss_kl_src_tgt.item():.3f}",
                     "tgt": f"{loss_target_unsup.item():.3f}",
                     "tsup": f"{loss_target_sup.item():.3f}",
+                    "da_i": f"{loss_da_img.item():.3f}",
+                    "da_o": f"{loss_da_obj.item():.3f}",
                     "wreg": f"{loss_wreg.item():.3f}",
                     "ent": f"{loss_entropy.item():.3f}",
                     "lr": f"{cur_lr:.2e}",
@@ -1950,8 +2208,12 @@ def train_one_epoch(
         if iteration % PRINT_EVERY == 0 and is_rank0:
             tloss = float(losses_sum) / (batch_idx + 1)
             cur_lr = optimizer.param_groups[0]["lr"]
+            aug_note = (
+                f" ⚖️bal:{class_seen.max() / max(class_seen.min(), 1):.1f}x"
+                if class_seen.sum() else ""
+            )
             tqdm.write(
-                f"[train] ep:{epoch} it:{iteration} loss(avg):{tloss:.4f} p1[c:{loss_c_pal1.item():.4f} l:{loss_l_pa1l.item():.4f}] p2[c:{loss_c_pal2.item():.4f} l:{loss_l_pa12.item():.4f}] enh:{loss_enhance.item():.4f} enh2:{loss_enhance2.item():.4f} mut_ssd:{loss_mutual_src_srcdark.item():.4f} kl_st:{loss_kl_src_tgt.item():.4f} tgt:{loss_target_unsup.item():.4f} tsup:{loss_target_sup.item():.4f} wreg:{loss_wreg.item():.4f} ent:{loss_entropy.item():.4f} lr:{cur_lr:.2e} dt:{t1 - t0:.3f}s"
+                f"[train] ep:{epoch} it:{iteration} loss(avg):{tloss:.4f} p1[c:{loss_c_pal1.item():.4f} l:{loss_l_pa1l.item():.4f}] p2[c:{loss_c_pal2.item():.4f} l:{loss_l_pa12.item():.4f}] enh:{loss_enhance.item():.4f} enh2:{loss_enhance2.item():.4f} kl_st:{loss_kl_src_tgt.item():.4f} tgt:{loss_target_unsup.item():.4f} tsup:{loss_target_sup.item():.4f} da_i:{loss_da_img.item():.4f} da_o:{loss_da_obj.item():.4f} wreg:{loss_wreg.item():.4f} ent:{loss_entropy.item():.4f} lr:{cur_lr:.2e}{aug_note} dt:{t1 - t0:.3f}s"
             )
             record_iter_losses(ctx.history, iteration, tloss, loss_components)
 
@@ -1970,16 +2232,13 @@ def train_one_epoch(
                             f"train_iter/{k}": float(v.detach())
                             for k, v in loss_components.items()
                         },
+                        **{
+                            f"align/{k}": float(v)
+                            for k, v in align_parts.items()
+                        },
                     }
                 )
 
-        if (
-            is_rank0
-            and ctx.args.viz_every_iters > 0
-            and (iteration > 0)
-            and (iteration % ctx.args.viz_every_iters == 0)
-        ):
-            update_loss_plot(ctx, {"iter": iteration, "epoch": epoch})
         iteration += 1
     pbar.close()
     
@@ -2013,18 +2272,53 @@ def train_one_epoch(
             "imgs_seen": imgs_seen,
             "world_size": ctx.world_size,
             "batch_size": int(ctx.args.batch_size),
+            "grl_lambda": round(grl_sum / max(grl_batches, 1), 6),
+            **{
+                f"seen_boxes_{name}": int(count)
+                for name, count in zip(ctx.class_names, class_seen)
+            },
+            **{
+                f"align_{k.replace('/', '_')}": round(v / max(grl_batches, 1), 6)
+                for k, v in adv_acc_sums.items()
+            },
             **_memory_usage(),
             **ctx.flops_stats,
             "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
         }
         _append_record_row(ctx.train_records_path, row)
         print(
-            f"[epoch {epoch}] {epoch_elapsed:.1f}s | total "
+            f"🚆 [epoch {epoch}] {epoch_elapsed:.1f}s | total "
             f"{row['total_training_time_h']:.3f}h | "
             f"{row['throughput_img_s']:.2f} img/s | "
             f"{row['latency_ms_per_iter']:.1f} ms/iter | GPU peak "
             f"{row['gpu_mem_peak_alloc_mb']:.0f} MB"
         )
+        if class_seen.sum():
+            balance_ratio = float(class_seen.max() / max(class_seen.min(), 1))
+            dataset_counts = class_frequencies(
+                ctx.train_dataset.labels, num_fg_classes
+            )[1:].astype(np.int64)
+            print(
+                format_balance_table(
+                    ctx.class_names,
+                    dataset_counts.tolist(),
+                    class_seen.tolist(),
+                    title=(
+                        f"⚖️  Class balance · epoch {epoch} "
+                        f"(GT boxes, rank0 shard)"
+                    ),
+                )
+            )
+            ctx.wandb.log(
+                {
+                    "epoch": epoch,
+                    "balance/max_min_ratio": balance_ratio,
+                    **{
+                        f"balance/{name}": int(count)
+                        for name, count in zip(ctx.class_names, class_seen)
+                    },
+                }
+            )
     return (iteration, step_index)
 
 def evaluate_target_test(
@@ -2041,48 +2335,24 @@ def evaluate_target_test(
     best_path = os.path.join(ctx.save_folder, CHECKPOINT_BEST)
     if os.path.isfile(best_path):
         state = torch.load(best_path, map_location="cuda", weights_only=False)
-        dsfd_net.load_state_dict(state)
+        load_detector_state_dict(dsfd_net, state)
         print(f"[test] loaded {best_path} for target-test eval")
     net.eval()
-    
-    test_forward = (
-        net.module.test_forward if hasattr(net, "module") else net.test_forward
+
+    per_image, loss_sum, loc_sum, conf_sum = _eval_labeled_loader(
+        ctx.target_test_loader, net, criterion, desc="🧪 [target test]"
     )
-    
-    per_image: List[Dict[str, np.ndarray]] = []
-    loss_sum = 0.0
-    loc_sum = 0.0
-    conf_sum = 0.0
-    steps = 0
-    
-    with torch.no_grad():
-        for tvi, ttgt, _ in ctx.target_test_loader:
-            tvi = tvi.cuda() / 255.0
-            ttgt_v = [t.cuda() for t in ttgt]
-            out, _ = test_forward(tvi)
-            l_loc, l_conf = criterion(out[3:], ttgt_v)
-            loc_sum += float(l_loc.item())
-            conf_sum += float(l_conf.item())
-            loss_sum += float((l_loc + l_conf).item())
-            steps += 1
-            per_image.extend(_decode_per_image(out, ttgt, net))
-            
-    if steps > 0:
-        loss_sum /= steps
-        loc_sum /= steps
-        conf_sum /= steps
-        
-    scores, matched, n_gt, cm = viz.evaluate_detections(
-        per_image, iou_thr=0.5, score_thr_cm=0.5, num_classes=ctx.args.nc
+    met, mAP, _ = _detection_summary(
+        per_image, ctx.args.nc,
+        bool(getattr(ctx.args, "eval_class_aware", True)),
     )
-    
-    met = detect_metrics_from_cm(cm)
-    _, _, _, mAP = viz._pr_from_scores(
-        np.asarray(scores), np.asarray(matched), n_gt
+    per_class = per_class_detection_metrics(
+        per_image, ctx.args.nc, ctx.class_names
     )
-    
+    macro = macro_summary(per_class)
+
     table = format_val_table(
-        "Target test metrics · best_model.pth",
+        "🧪 Target test metrics · best_model.pth",
         [
             ("§", "TARGET TEST (best_model.pth)"),
             ("n images", f"{len(per_image)}"),
@@ -2092,16 +2362,23 @@ def evaluate_target_test(
             ("Precision", f"{met['precision']:.4f}"),
             ("Recall", f"{met['recall']:.4f}"),
             ("F1 score", f"{met['f1']:.4f}"),
-            ("mAP @ IoU 0.5", f"{mAP:.4f}"),
+            ("mAP @ IoU 0.5 (micro)", f"{mAP:.4f}"),
+            ("macro mAP@50 (per-class mean)", f"{macro['macro_map50']:.4f}"),
+            ("macro F1 (per-class mean)", f"{macro['macro_f1']:.4f}"),
             ("TP / FP / FN", f"{met['tp']} / {met['fp']} / {met['fn']}"),
         ],
     )
-    
+    table = table + "\n\n" + format_per_class_table(
+        per_class, "Per-class target-test metrics"
+    )
+
     print(table)
     out_path = os.path.join(ctx.charts_dir, "target_test_metrics.txt")
-    
+
     with open(out_path, "w") as fh:
         fh.write(table + "\n")
+    with open(os.path.join(ctx.charts_dir, "target_test_per_class.json"), "w") as fh:
+        json.dump({"per_class": per_class, "macro": macro}, fh, indent=2)
     print(f"[test] saved target test metrics -> {out_path}")
 
 def train(ctx: TrainingContext) -> None:
@@ -2117,6 +2394,8 @@ def train(ctx: TrainingContext) -> None:
     if args_ns.lr_steps:
         cfg.LR_STEPS = tuple((int(s) for s in args_ns.lr_steps))
         
+    if hasattr(cfg, "ALIGN"):
+        apply_align_config(cfg.ALIGN, args_ns)
     if hasattr(cfg, "FOCAL"):
         cfg.FOCAL.ENABLED = bool(getattr(args_ns, "focal_enabled", cfg.FOCAL.ENABLED))
         cfg.FOCAL.GAMMA = float(getattr(args_ns, "focal_gamma", cfg.FOCAL.GAMMA))
@@ -2142,6 +2421,12 @@ def train(ctx: TrainingContext) -> None:
             or getattr(args_ns, "backbone_weights", "auto")
         ),
     )
+    if ctx.local_rank == 0 and hasattr(dsfd_net, "align_spec"):
+        print(
+            dsfd_net.align_spec.describe(
+                dsfd_net.align_tap_labels, dsfd_net.align_tap_dims
+            )
+        )
     net = dsfd_net
     net_enh = RetinexNet()
     retinex_path = os.path.join(args_ns.save_folder, RETINEX_WEIGHTS)
@@ -2185,10 +2470,22 @@ def train(ctx: TrainingContext) -> None:
         print(
             f"[wReg] anchored {len(ctx.wreg_ref)} backbone tensors (weight={getattr(args_ns, 'wreg_loss_weight', 0.0)})"
         )
-    lr = float(args_ns.lr) * np.round(
-        np.sqrt(float(args_ns.batch_size) / 4 * n_gpus), 4
+    nominal_batch = int(getattr(args_ns, "nominal_batch_size", 0) or 0)
+    device_batch = int(args_ns.batch_size) * max(ctx.world_size, 1)
+    ctx.accumulate = (
+        max(1, int(round(nominal_batch / float(device_batch)))) if nominal_batch > 0 else 1
     )
+    lr_batch = float(args_ns.batch_size)
+    if bool(getattr(args_ns, "lr_scale_by_effective_batch", False)):
+        lr_batch = lr_batch * ctx.accumulate
+    lr = float(args_ns.lr) * np.round(np.sqrt(lr_batch / 4 * n_gpus), 4)
     optimizer = build_optimizer(dsfd_net, lr, args_ns)
+    if ctx.local_rank == 0 and ctx.accumulate > 1:
+        print(
+            f"[optim] gradient accumulation x{ctx.accumulate} "
+            f"(device batch {device_batch} -> effective {device_batch * ctx.accumulate}), "
+            f"lr={lr:.3e}"
+        )
     multigpu = len(parse_gpu_ids(getattr(args_ns, "gpu_ids", 0))) > 1
     if args_ns.cuda:
         net = net.cuda()
@@ -2202,9 +2499,19 @@ def train(ctx: TrainingContext) -> None:
     focal_loss_fn = None
     
     if getattr(cfg, "FOCAL", None) is not None and cfg.FOCAL.ENABLED:
+        alpha_files = [args_ns.source_train_file]
+        target_train_file = getattr(args_ns, "target_train_file", None)
+        if (
+            bool(getattr(args_ns, "focal_alpha_include_target", False))
+            and target_train_file
+            and os.path.isfile(target_train_file)
+        ):
+            alpha_files.append(target_train_file)
         alpha = compute_focal_alpha(
-            args_ns.source_train_file, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
+            alpha_files, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
         )
+        if ctx.local_rank == 0:
+            print(f"[focal] class prior estimated from {alpha_files}")
         class_weights = getattr(args_ns, "focal_class_weights", None) or dict(
             getattr(cfg.FOCAL, "CLASS_WEIGHTS", {}) or {}
         )
@@ -2219,7 +2526,7 @@ def train(ctx: TrainingContext) -> None:
                 None if alpha is None else [round(float(a), 4) for a in alpha]
             )
             print(
-                f"[focal] enabled gamma={cfg.FOCAL.GAMMA} "
+                f"🎯 [focal] enabled gamma={cfg.FOCAL.GAMMA} "
                 f"alpha(bg,fg...)={shown} (None=uniform)"
             )
             if class_weights:
@@ -2253,26 +2560,64 @@ def train(ctx: TrainingContext) -> None:
         print(args_ns)
         print(f"Charts dir: {ctx.charts_dir}")
         print(f"Num classes: {num_classes} (= {args_ns.nc} fg + 1 bg)")
-    ctx.flops_stats = _measure_gflops(
-        net, int(cfg.INPUT_SIZE), next(net.parameters()).device
+    if ctx.local_rank == 0:
+        ctx.flops_stats = _measure_gflops(
+            net, int(cfg.INPUT_SIZE), next(net.parameters()).device
+        )
+        print(
+            f"⚡ [flops] {ctx.flops_stats['gflops_forward']:.2f} GFLOPs/forward "
+            f"@ {ctx.flops_stats['flops_input_size']}x"
+            f"{ctx.flops_stats['flops_input_size']} "
+            f"({ctx.flops_stats['flops_note']})"
+        )
+    step_index = 0
+    total_iters = max(per_epoch_size * int(cfg.EPOCHES), 1)
+    if cfg.MAX_STEPS > 0:
+        total_iters = min(total_iters, int(cfg.MAX_STEPS))
+    warmup_iters = int(getattr(args_ns, "warmup_iters", 0) or 0)
+    if warmup_iters <= 0:
+        warmup_iters = int(
+            float(getattr(args_ns, "warmup_epochs", 0.0) or 0.0) * per_epoch_size
+        )
+    ctx.lr_schedule = LRSchedule(
+        optimizer,
+        mode=str(getattr(args_ns, "lr_schedule", "step")),
+        max_iters=total_iters,
+        warmup_iters=warmup_iters,
+        final_ratio=float(getattr(args_ns, "lr_final_ratio", 0.01)),
+        gamma=float(args_ns.gamma),
+        steps=cfg.LR_STEPS,
+        start_iteration=iteration,
     )
     if ctx.local_rank == 0:
         print(
-            f"[flops] {ctx.flops_stats['gflops_forward']:.2f} GFLOPs/forward "
-            f"@ {ctx.flops_stats['flops_input_size']}x"
-            f"{ctx.flops_stats['flops_input_size']}"
+            f"📉 [lr] {ctx.lr_schedule.describe()} | base={lr:.3e} "
+            f"| total_iters={total_iters} ({per_epoch_size} it/epoch)"
         )
-    step_index = 0
-    for step in cfg.LR_STEPS:
-        if iteration > step:
-            step_index += 1
-            adjust_learning_rate(optimizer, args_ns.gamma)
+    if bool(getattr(args_ns, "ema_enabled", False)):
+        ctx.ema = ModelEMA(
+            dsfd_net,
+            decay=float(getattr(args_ns, "ema_decay", 0.9999)),
+            warmup_iters=int(getattr(args_ns, "ema_warmup_iters", 2000)),
+            updates=iteration // max(ctx.accumulate, 1),
+        )
+        if args_ns.resume and os.path.isfile(str(args_ns.resume)):
+            saved = torch.load(args_ns.resume, map_location="cpu", weights_only=False)
+            if isinstance(saved, dict) and saved.get("ema"):
+                ctx.ema.load_shadow(saved["ema"], int(saved.get("ema_updates", 0)))
+                if ctx.local_rank == 0:
+                    print(f"[ema] restored shadow ({ctx.ema.updates} updates)")
+        if ctx.local_rank == 0:
+            print(
+                f"✨ [ema] enabled (decay={getattr(args_ns, 'ema_decay', 0.9999)}, "
+                f"warmup={getattr(args_ns, 'ema_warmup_iters', 2000)} updates)"
+            )
     net_enh.eval()
     net.train()
     is_rank0 = ctx.local_rank == 0
     epoch_pbar = tqdm(
         range(start_epoch, cfg.EPOCHES),
-        desc="Epochs",
+        desc="🚂 Epochs",
         total=cfg.EPOCHES - start_epoch,
         leave=True,
         position=0,
@@ -2297,7 +2642,7 @@ def train(ctx: TrainingContext) -> None:
         val_every = max(1, int(getattr(args_ns, "val_every_epochs", 1)))
         do_val = ((epoch + 1) % val_every == 0) or (epoch + 1 >= cfg.EPOCHES)
         if do_val:
-            val_loss = validate(ctx, epoch, net, dsfd_net, net_enh, criterion)
+            val_loss = run_validation(ctx, epoch, net, dsfd_net, net_enh, criterion)
             if is_rank0 and val_loss is not None:
                 ctx.history["val_loss"].append((epoch, float(val_loss)))
                 epoch_pbar.set_postfix(
@@ -2309,12 +2654,7 @@ def train(ctx: TrainingContext) -> None:
                     }
                 )
         elif is_rank0:
-            # Validation skipped this epoch — still persist the latest
-            # checkpoint so a resume never loses trained epochs.
-            torch.save(
-                {"epoch": epoch, "weight": dsfd_net.state_dict()},
-                os.path.join(ctx.save_folder, CHECKPOINT_LATEST),
-            )
+            save_latest_checkpoint(ctx, dsfd_net, epoch)
             epoch_pbar.set_postfix(
                 {
                     "val": "skip",
@@ -2369,24 +2709,29 @@ def _peek_architecture(config_path: str) -> str:
     return str(arch or "").lower()
 
 def main() -> None:
-    p = argparse.ArgumentParser("Unified DAI-Net / YOLO trainer (YAML-driven)")
+    p = argparse.ArgumentParser("Unified RAILIGHT / YOLO trainer (YAML-driven)")
     p.add_argument("--config", required=True, type=str)
     cli = p.parse_args()
 
     arch = _peek_architecture(cli.config)
     if arch.startswith("yolo"):
-        from dainet.yolo_runner import run_from_config
+        from railight.yolo_runner import run_from_config
 
         run_from_config(cli.config)
         return
 
     args_ns = load_yaml_config(cli.config, mode="train")
+    data_cfg = apply_input_config(args_ns)
+    da_cfg = apply_damamba_config(args_ns)
     local_rank = args_ns.local_rank
     if "LOCAL_RANK" not in os.environ:
         os.environ["LOCAL_RANK"] = str(local_rank)
     if local_rank == 0:
         arch, backbone = resolve_arch_and_backbone(args_ns)
         setup_logging(arch, backbone, args_ns.num_exp, args_ns)
+        print(f"[data] geometry config: {data_cfg}")
+        if da_cfg.get("ENABLED"):
+            print(f"[da-align] {da_cfg}")
     setup_distributed(local_rank, args_ns.cuda)
     try:
         ctx = TrainingContext(args_ns, local_rank)

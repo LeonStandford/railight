@@ -19,7 +19,6 @@ __all__ = [
     "decode_image_instances",
     "infer_detections",
     "infer_detections_batch",
-    "build_pseudo_targets",
     "_decode_per_image",
     "collect_target_samples",
 ]
@@ -168,25 +167,6 @@ def infer_detections_batch(
         decode_image_instances(det[b_i], conf_thr, nms_iou_thr, scale=scale)
         for b_i in range(det.shape[0])
     ]
-
-
-def build_pseudo_targets(
-    net: torch.nn.Module,
-    out_tuple: Tuple[torch.Tensor, ...],
-    conf_thr: float,
-    nms_iou_thr: float,
-    device: torch.device,
-) -> List[torch.Tensor]:
-    det = _decode_predictions(net, out_tuple).detach().cpu().numpy()
-    out: List[torch.Tensor] = []
-    for b in range(det.shape[0]):
-        pb, _ps, pl = decode_image_instances(det[b], conf_thr, nms_iou_thr)
-        if len(pl):
-            t = np.concatenate([pb, pl.reshape(-1, 1).astype(np.float32)], axis=1)
-            out.append(torch.from_numpy(t).float().to(device))
-        else:
-            out.append(torch.zeros((0, 5), dtype=torch.float32, device=device))
-    return out
 
 
 def _decode_per_image(

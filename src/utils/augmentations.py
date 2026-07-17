@@ -988,15 +988,97 @@ def anchor_crop_image_sampling2(
         return (image, dark_image, sampled_labels)
 
 
-def preprocess(img, bbox_labels, mode, image_path):
+def letterbox_sample(
+    img,
+    labels,
+    out_size,
+    jitter=0.0,
+    train=False,
+    fill=114,
+    min_visibility=None,
+    min_side=2.0,
+):
+    if min_visibility is None:
+        min_visibility = float(getattr(cfg, "MIN_BOX_VISIBILITY", 0.3))
+    out_size = int(out_size)
+    h, w = img.shape[:2]
+    ratio = min(out_size / float(w), out_size / float(h))
+    if train and jitter > 0.0:
+        ratio *= random.uniform(1.0 - jitter, 1.0 + jitter)
+    nw = max(int(round(w * ratio)), 1)
+    nh = max(int(round(h * ratio)), 1)
+    interp = cv2.INTER_LINEAR if ratio > 1.0 else cv2.INTER_AREA
+    resized = cv2.resize(img, (nw, nh), interpolation=interp)
+    canvas = np.full((out_size, out_size, 3), fill, dtype=img.dtype)
+    if train:
+        x0 = random.randint(min(0, out_size - nw), max(0, out_size - nw))
+        y0 = random.randint(min(0, out_size - nh), max(0, out_size - nh))
+    else:
+        x0 = (out_size - nw) // 2
+        y0 = (out_size - nh) // 2
+    src_x, src_y = (max(0, -x0), max(0, -y0))
+    dst_x, dst_y = (max(0, x0), max(0, y0))
+    copy_w = min(nw - src_x, out_size - dst_x)
+    copy_h = min(nh - src_y, out_size - dst_y)
+    if copy_w > 0 and copy_h > 0:
+        canvas[dst_y : dst_y + copy_h, dst_x : dst_x + copy_w] = resized[
+            src_y : src_y + copy_h, src_x : src_x + copy_w
+        ]
+    out_labels = []
+    for label in labels:
+        bx1 = label[1] * nw + x0
+        by1 = label[2] * nh + y0
+        bx2 = label[3] * nw + x0
+        by2 = label[4] * nh + y0
+        full_area = max(bx2 - bx1, 0.0) * max(by2 - by1, 0.0)
+        cx1, cy1 = (max(bx1, 0.0), max(by1, 0.0))
+        cx2, cy2 = (min(bx2, float(out_size)), min(by2, float(out_size)))
+        vis_w, vis_h = (cx2 - cx1, cy2 - cy1)
+        if vis_w < min_side or vis_h < min_side:
+            continue
+        if full_area > 0.0 and vis_w * vis_h / full_area < min_visibility:
+            continue
+        out_labels.append(
+            [label[0], cx1 / out_size, cy1 / out_size, cx2 / out_size, cy2 / out_size]
+            + list(label[5:])
+        )
+    return (canvas, out_labels)
+
+
+def mosaic4(images, labels_list, out_size, jitter=0.0, fill=114):
+    out_size = int(out_size)
+    half = out_size // 2
+    canvas = np.full((out_size, out_size, 3), fill, dtype=np.uint8)
+    merged = []
+    offsets = ((0, 0), (half, 0), (0, half), (half, half))
+    for img, labels, (ox, oy) in zip(images, labels_list, offsets):
+        tile, tile_labels = letterbox_sample(
+            img, labels, half, jitter=jitter, train=True, fill=fill
+        )
+        canvas[oy : oy + half, ox : ox + half] = tile
+        for label in tile_labels:
+            merged.append(
+                [
+                    label[0],
+                    (label[1] * half + ox) / out_size,
+                    (label[2] * half + oy) / out_size,
+                    (label[3] * half + ox) / out_size,
+                    (label[4] * half + oy) / out_size,
+                ]
+                + list(label[5:])
+            )
+    return (canvas, merged)
+
+
+def preprocess(img, bbox_labels, mode, image_path, geometry=True):
     img_width, img_height = img.size
     sampled_labels = bbox_labels
-    
-    if mode == "train":
-        
-        if cfg.apply_distort:
-            img = distort_image(img)
-            
+
+    if mode == "train" and cfg.apply_distort:
+        img = distort_image(img)
+
+    if mode == "train" and geometry:
+
         if cfg.apply_expand:
             img, bbox_labels, img_width, img_height = expand_image(
                 img, bbox_labels, img_width, img_height
@@ -1049,25 +1131,39 @@ def preprocess(img, bbox_labels, mode, image_path):
                     cfg.min_face_size,
                 )
             img = Image.fromarray(img)
-            
-    interp_mode = [
-        Image.BILINEAR,
-        Image.HAMMING,
-        Image.NEAREST,
-        Image.BICUBIC,
-        Image.LANCZOS,
-    ]
-    
-    interp_indx = np.random.randint(0, 5)
-    
-    img = img.resize(
-        (cfg.resize_width, cfg.resize_height), resample=interp_mode[interp_indx]
-    )
-    
-    img = np.array(img)
+
+    if not geometry:
+        img = np.array(img)
+
+    elif getattr(cfg, "LETTERBOX", False):
+        img, sampled_labels = letterbox_sample(
+            np.array(img),
+            sampled_labels,
+            int(cfg.resize_width),
+            jitter=float(getattr(cfg, "SCALE_JITTER", 0.0)),
+            train=(mode == "train"),
+        )
+
+    else:
+        interp_mode = [
+            Image.BILINEAR,
+            Image.HAMMING,
+            Image.NEAREST,
+            Image.BICUBIC,
+            Image.LANCZOS,
+        ]
+
+        interp_indx = np.random.randint(0, 5)
+
+        img = img.resize(
+            (cfg.resize_width, cfg.resize_height), resample=interp_mode[interp_indx]
+        )
+
+        img = np.array(img)
+
     if mode == "train":
         mirror = int(np.random.uniform(0, 2))
-        
+
         if mirror == 1:
             img = img[:, ::-1, :]
             swap = {int(a): int(b) for a, b in cfg.FLIP_LABEL_SWAP}

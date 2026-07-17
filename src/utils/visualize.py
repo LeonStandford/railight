@@ -45,11 +45,9 @@ _PRETTY_LOSS_NAME: Dict[str, str] = {
     "pal2_conf": "Second shot classification loss",
     "enhance": "Retinex decomposition loss",
     "enhance_l1ssim": "Reflectance reconstruction loss",
-    "mutual": "Mutual learning loss",
     "kl_st": "Feature alignment loss",
     "target_unsup": "Target reconstruction loss",
     "target_sup": "Target supervised detection loss",
-    "pseudo": "Pseudo label loss",
     "wreg": "Weight regularisation loss",
     "entropy": "Target prediction entropy loss",
     "train_loss_epoch": "Training loss",
@@ -64,11 +62,9 @@ _LOSS_SUBTITLE: Dict[str, str] = {
     "pal2_conf": "Class prediction on the second, refined detection head, source images only",
     "enhance": "Retinex split of the image into reflectance and illumination",
     "enhance_l1ssim": "Reflectance predicted inside the network versus the frozen RetinexNet",
-    "mutual": "Agreement between the daylight branch and the synthetic dark branch",
     "kl_st": "Divergence between source and target features, pulls the two domains together",
     "target_unsup": "Rebuilds the target image from its reflectance and illumination, needs no labels",
     "target_sup": "Detection loss on real target labels, both heads, same recipe as the source loss",
-    "pseudo": "Detection loss on boxes invented by the mean teacher for unlabelled target images",
     "wreg": "Keeps the backbone close to its pretrained weights",
     "entropy": "Pushes target predictions to be confident rather than undecided",
 }
@@ -80,7 +76,6 @@ _LOSS_ORDER: Tuple[str, ...] = (
     "pal2_conf",
     "enhance",
     "enhance_l1ssim",
-    "mutual",
 )
 _EPOCH_KEYS = frozenset({"train_loss_epoch", "val_loss"})
 
@@ -132,7 +127,7 @@ def _save(fig: Figure, path: str) -> str:
 def plot_losses(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     x_key: str = "iter",
 ) -> Optional[str]:
@@ -140,7 +135,7 @@ def plot_losses(
         return None
 
     loss_fn_keys = list(_LOSS_ORDER) + [
-        "target_unsup", "target_sup", "pseudo", "kl_st", "wreg", "entropy"
+        "target_unsup", "target_sup", "kl_st", "wreg", "entropy"
     ]
     iter_panels = [k for k in loss_fn_keys if history.get(k)]
 
@@ -257,7 +252,7 @@ def plot_train_vs_val(
     train_pts: Sequence[Point],
     val_pts: Sequence[Point],
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "train_vs_val.png",
 ) -> Optional[str]:
@@ -302,7 +297,7 @@ def plot_train_vs_val(
 def plot_train_val_metrics(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "train_val_metrics.png",
 ) -> Optional[str]:
@@ -366,7 +361,7 @@ def plot_train_val_metrics(
 def plot_confusion_matrix(
     cm: np.ndarray,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     classes: Sequence[str] = ("object", "background"),
     normalize: bool = True,
@@ -433,7 +428,7 @@ def plot_pr_curve(
     matched: np.ndarray,
     n_gt: int,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "pr_curve.png",
 ) -> Tuple[str, float]:
@@ -458,7 +453,7 @@ def plot_recall_f1_curve(
     matched: np.ndarray,
     n_gt: int,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "recall_f1.png",
 ) -> str:
@@ -502,7 +497,7 @@ def plot_test_distributions(
     kl_vals,
     ce_vals,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "test_distributions.png",
     feat_before_day=None,
@@ -586,28 +581,63 @@ def plot_test_distributions(
     fig.subplots_adjust(top=0.84)
     return _save(fig, os.path.join(out_dir, fname))
 
+def _finite_rows_mask(feats: np.ndarray) -> np.ndarray:
+    x = np.asarray(feats)
+    x = x.reshape(len(x), -1) if x.ndim != 2 else x
+    return np.isfinite(x).all(axis=1)
+
+
+def _pca_2d(feats: np.ndarray) -> Tuple[np.ndarray, str]:
+    x = feats - feats.mean(axis=0, keepdims=True)
+    try:
+        _, _, vt = np.linalg.svd(x, full_matrices=False)
+        return (np.ascontiguousarray(x @ vt[:2].T), "PCA")
+    except Exception:
+        pad = np.zeros((x.shape[0], 2), dtype=np.float64)
+        pad[:, : min(2, x.shape[1])] = x[:, : min(2, x.shape[1])]
+        return (pad, "PCA(raw)")
+
+
+def _tsne_2d(feats: np.ndarray, init: Any, perplexity: float) -> Optional[np.ndarray]:
+    from sklearn.manifold import TSNE
+
+    xy = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        init=init,
+        learning_rate="auto",
+    ).fit_transform(feats)
+
+    return xy if np.isfinite(xy).all() else None
+
+
 def _project_2d(feats: np.ndarray) -> Tuple[np.ndarray, str]:
     feats = np.asarray(feats, dtype=np.float64)
-    if feats.shape[0] < 3:
-        return (
-            feats[:, :2] if feats.shape[1] >= 2 else np.zeros((feats.shape[0], 2)),
-            "raw",
-        )
-    try:
-        from sklearn.manifold import TSNE
-
-        perp = max(5, min(30, (feats.shape[0] - 1) // 3))
-        xy = TSNE(
-            n_components=2, perplexity=perp, init="pca", learning_rate="auto"
-        ).fit_transform(feats)
-        return (xy, "t-SNE")
-    except Exception:
-        x = feats - feats.mean(axis=0, keepdims=True)
+    feats = feats.reshape(len(feats), -1) if feats.ndim != 2 else feats
+    if feats.shape[0] < 4 or feats.shape[1] == 0:
+        out = np.zeros((feats.shape[0], 2), dtype=np.float64)
+        if feats.shape[1] >= 1:
+            out[:, : min(2, feats.shape[1])] = feats[:, : min(2, feats.shape[1])]
+        return (np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0), "raw")
+    feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+    n = feats.shape[0]
+    perplexity = float(min(30.0, max(2.0, (n - 1) / 3.0)))
+    pca_init, _ = _pca_2d(feats)
+    scale = float(np.std(pca_init[:, 0]))
+    inits: List[Any] = []
+    if np.isfinite(scale) and scale > 1e-12:
+        seeded = (pca_init / scale * 1e-4).astype(np.float32, copy=False)
+        if np.isfinite(seeded).all():
+            inits.append(seeded)
+    inits.append("random")
+    for init in inits:
         try:
-            _, _, vt = np.linalg.svd(x, full_matrices=False)
-            return (x @ vt[:2].T, "PCA")
+            xy = _tsne_2d(feats, init, perplexity)
         except Exception:
-            return (x[:, :2], "PCA(raw)")
+            continue
+        if xy is not None:
+            return (np.asarray(xy, dtype=np.float64), "t-SNE")
+    return (pca_init, "t-SNE unavailable (PCA fallback)")
 
 def plot_tsne_features(
     feats: np.ndarray,
@@ -615,12 +645,16 @@ def plot_tsne_features(
     class_names: Sequence[str],
     out_dir: str,
     fname: str = "tsne_source_features.png",
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
 ) -> Optional[str]:
     feats = np.asarray(feats, dtype=np.float32)
     labels = np.asarray(labels, dtype=np.int64)
     if feats.size == 0 or feats.shape[0] == 0:
+        return None
+    keep = _finite_rows_mask(feats)
+    feats, labels = (feats[keep], labels[keep])
+    if feats.shape[0] == 0:
         return None
     xy, proj = _project_2d(feats)
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -646,29 +680,44 @@ def plot_tsne_features(
     ax.legend(loc="best", framealpha=0.9)
     return _save(fig, os.path.join(out_dir, fname))
 
+def _unit_scale(xy: np.ndarray) -> np.ndarray:
+    xy = np.nan_to_num(
+        np.asarray(xy, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    mn = xy.min(axis=0, keepdims=True)
+    mx = xy.max(axis=0, keepdims=True)
+    span = mx - mn
+    span[span < 1e-12] = 1.0
+    return (xy - mn) / span
+
+
 def _subsample(a: np.ndarray, cap: int, seed: int) -> np.ndarray:
     if a is None or len(a) <= cap:
         return a
     idx = np.random.RandomState(seed).choice(len(a), size=cap, replace=False)
     return a[idx]
 
-def _domain_scatter(ax, xy: np.ndarray, n_src: int, proj: str, title: str) -> None:
+def _domain_scatter(
+    ax, xy: np.ndarray, n_src: int, proj: str, title: str, legend: bool = True
+) -> None:
     # ECB-style domain t-SNE: source=red, target=blue, 'o' markers, alpha 0.5.
     ax.scatter(
         xy[:n_src, 0], xy[:n_src, 1],
-        s=18, alpha=0.5, color="red", marker="o", label="Source Domain",
+        s=8, alpha=0.5, color="red", marker="o", label="Source",
         edgecolors="none",
     )
     ax.scatter(
         xy[n_src:, 0], xy[n_src:, 1],
-        s=18, alpha=0.5, color="blue", marker="o", label="Target Domain",
+        s=8, alpha=0.5, color="blue", marker="o", label="Target",
         edgecolors="none",
     )
-    ax.set_title(title, fontsize=11, fontweight="bold")
-    ax.set_xlabel(f"{proj}-1")
-    ax.set_ylabel(f"{proj}-2")
+    ax.set_title(title, fontsize=9, fontweight="bold")
+    ax.set_xlabel(f"{proj}-1", fontsize=8)
+    ax.set_ylabel(f"{proj}-2", fontsize=8)
+    ax.tick_params(labelsize=7)
     ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend(loc="upper right", framealpha=0.9, markerscale=1.6)
+    if legend:
+        ax.legend(loc="upper right", framealpha=0.9, markerscale=1.6, fontsize=7)
 
 def plot_domain_tsne(
     feats_src: Optional[np.ndarray],
@@ -676,7 +725,7 @@ def plot_domain_tsne(
     out_dir: str,
     fname: str,
     subject: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     cap_per_domain: int = 1500,
 ) -> Optional[str]:
@@ -684,25 +733,70 @@ def plot_domain_tsne(
         return None
     s = np.asarray(feats_src, dtype=np.float32).reshape(len(feats_src), -1)
     t = np.asarray(feats_tgt, dtype=np.float32).reshape(len(feats_tgt), -1)
+    s = s[_finite_rows_mask(s)]
+    t = t[_finite_rows_mask(t)]
     if s.shape[0] == 0 or t.shape[0] == 0:
         return None
     s = _subsample(s, cap_per_domain, seed=0)
     t = _subsample(t, cap_per_domain, seed=1)
     xy, proj = _project_2d(np.concatenate([s, t], axis=0))
     # ECB-style min-max scaling of the 2D embedding to [0, 1] per axis.
-    mn = xy.min(axis=0, keepdims=True)
-    mx = xy.max(axis=0, keepdims=True)
-    xy = (xy - mn) / (mx - mn + 1e-9)
+    xy = _unit_scale(xy)
     fig, ax = plt.subplots(figsize=(10, 8))
     _domain_scatter(
         ax, xy, len(s), proj, _compose_title(method, subject, config)
     )
     return _save(fig, os.path.join(out_dir, fname))
 
+def plot_domain_tsne_pair(
+    panels: Sequence[Tuple[str, Optional[np.ndarray], Optional[np.ndarray]]],
+    out_dir: str,
+    fname: str,
+    method: str = "RAILIGHT",
+    config: Config = None,
+    cap_per_domain: int = 1500,
+    suptitle: Optional[str] = None,
+    ncols: int = 3,
+) -> Optional[str]:
+    prepared: List[Tuple[str, np.ndarray, int, Any]] = []
+    for subject, feats_src, feats_tgt in panels:
+        if feats_src is None or feats_tgt is None:
+            continue
+        s = np.asarray(feats_src, dtype=np.float32).reshape(len(feats_src), -1)
+        t = np.asarray(feats_tgt, dtype=np.float32).reshape(len(feats_tgt), -1)
+        s = s[_finite_rows_mask(s)]
+        t = t[_finite_rows_mask(t)]
+        if s.shape[0] == 0 or t.shape[0] == 0:
+            continue
+        s = _subsample(s, cap_per_domain, seed=0)
+        t = _subsample(t, cap_per_domain, seed=1)
+        xy, proj = _project_2d(np.concatenate([s, t], axis=0))
+        prepared.append((subject, _unit_scale(xy), len(s), proj))
+    if not prepared:
+        return None
+    cols = max(1, min(int(ncols), len(prepared)))
+    rows = (len(prepared) + cols - 1) // cols
+    fig, axes = plt.subplots(
+        rows, cols, figsize=(6.0 * cols, 4.6 * rows), squeeze=False
+    )
+    flat = [ax for row in axes for ax in row]
+    for idx, (ax, (subject, xy, n_src, proj)) in enumerate(zip(flat, prepared)):
+        _domain_scatter(ax, xy, n_src, proj, subject, legend=idx == 0)
+    for ax in flat[len(prepared):]:
+        ax.axis("off")
+    header = suptitle or method
+    sub = _config_suffix(config)
+    fig.suptitle(
+        f"{header}\n{sub}" if sub else header,
+        fontsize=11,
+        fontweight="bold",
+    )
+    return _save(fig, os.path.join(out_dir, fname))
+
 def plot_target_metrics(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "target_metrics.png",
 ) -> Optional[str]:
@@ -762,15 +856,17 @@ def plot_target_metrics(
 def plot_domain_metrics(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "domain_metrics.png",
 ) -> Optional[str]:
     kl_pts = history.get("val_kl_st", [])
     ent_pts = history.get("val_entropy", [])
-    if not kl_pts and (not ent_pts):
+    mmd_pts = history.get("val_align_mmd", [])
+    gap_pts = history.get("val_align_gap", [])
+    if not kl_pts and not ent_pts and not mmd_pts and not gap_pts:
         return None
-    fig, ax1 = plt.subplots(figsize=(8, 5))
+    fig, (ax1, ax3) = plt.subplots(1, 2, figsize=(15, 5))
     ax1.set_facecolor("#ECECEC")
     if kl_pts:
         xs, ys = zip(*kl_pts)
@@ -781,10 +877,10 @@ def plot_domain_metrics(
             linewidth=2.0,
             marker="o",
             markersize=5,
-            label="val KL (source↔target)",
+            label="val alignment loss (source↔target)",
         )
     ax1.set_xlabel("Epoch", fontweight="bold")
-    ax1.set_ylabel("KL divergence", color=_BLUE, fontweight="bold")
+    ax1.set_ylabel("Alignment loss", color=_BLUE, fontweight="bold")
     ax1.tick_params(axis="y", labelcolor=_BLUE)
     ax1.grid(True, linestyle="--", alpha=0.5, color="white", linewidth=1.2)
     ax1.set_axisbelow(True)
@@ -802,17 +898,56 @@ def plot_domain_metrics(
         )
         ax2.set_ylabel("Target detection entropy", color=_RED, fontweight="bold")
         ax2.tick_params(axis="y", labelcolor=_RED)
-    run_tag = _run_tag(method, config)
-    title = "Domain adaptation metrics"
-    if run_tag:
-        title = f"{title}\n{run_tag}"
-    ax1.set_title(title, fontweight="bold", fontsize=13, pad=10)
+    ax1.set_title("Optimised objective", fontweight="bold", fontsize=12, pad=10)
     lines, labs = ax1.get_legend_handles_labels()
     if ent_pts:
         l2, lb2 = ax2.get_legend_handles_labels()
         lines += l2
         labs += lb2
     ax1.legend(lines, labs, loc="best", framealpha=0.9)
+
+    ax3.set_facecolor("#ECECEC")
+    ax3.grid(True, linestyle="--", alpha=0.5, color="white", linewidth=1.2)
+    ax3.set_axisbelow(True)
+    ax3.set_xlabel("Epoch", fontweight="bold")
+    ax3.set_ylabel("Embedding gap (std units)", color=_BLUE, fontweight="bold")
+    ax3.tick_params(axis="y", labelcolor=_BLUE)
+    if gap_pts:
+        xs, ys = zip(*gap_pts)
+        ax3.plot(
+            xs, ys, color=_BLUE, linewidth=2.0, marker="o", markersize=5,
+            label="source↔target mean gap",
+        )
+        ax3.axhline(
+            0.2, color="#009E73", linestyle="--", linewidth=1.8,
+            label="overlap threshold (0.2)",
+        )
+    if mmd_pts:
+        ax4 = ax3.twinx()
+        xs, ys = zip(*mmd_pts)
+        ax4.plot(
+            xs, ys, color="#CC79A7", linewidth=2.0, marker="^", markersize=5,
+            label="source↔target MMD",
+        )
+        ax4.set_ylabel("MMD", color="#CC79A7", fontweight="bold")
+        ax4.tick_params(axis="y", labelcolor="#CC79A7")
+    ax3.set_title(
+        "Actual embedding overlap (what t-SNE shows)",
+        fontweight="bold", fontsize=12, pad=10,
+    )
+    lines3, labs3 = ax3.get_legend_handles_labels()
+    if mmd_pts:
+        l4, lb4 = ax4.get_legend_handles_labels()
+        lines3 += l4
+        labs3 += lb4
+    ax3.legend(lines3, labs3, loc="best", framealpha=0.9)
+
+    run_tag = _run_tag(method, config)
+    suptitle = "Domain adaptation metrics"
+    if run_tag:
+        suptitle = f"{suptitle}  ·  {run_tag}"
+    fig.suptitle(suptitle, fontweight="bold", fontsize=13)
+    fig.subplots_adjust(top=0.86)
     return _save(fig, os.path.join(out_dir, fname))
 
 def _draw_boxes(ax: "plt.Axes", sample: Dict[str, Any]) -> None:
@@ -838,7 +973,7 @@ def plot_sample_predictions(
     samples: Sequence[Dict[str, Any]],
     out_dir: str,
     fname: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     title_suffix: str = "",
 ) -> Optional[str]:
@@ -955,7 +1090,7 @@ def plot_samples_grid_3row(
     items: Sequence[Dict[str, Any]],
     out_dir: str,
     fname: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     title_suffix: str = "",
 ) -> Optional[str]:
@@ -1026,6 +1161,7 @@ def evaluate_detections(
     iou_thr: float = 0.5,
     score_thr_cm: float = 0.5,
     num_classes: int = 1,
+    class_aware: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, int, np.ndarray]:
     nc = max(int(num_classes), 1)
     cm = np.zeros((nc + 1, nc + 1), dtype=np.int64)
@@ -1053,6 +1189,8 @@ def evaluate_detections(
         matched_pred = np.zeros(len(pb_o), dtype=np.int32)
         if len(pb_o) and len(gb):
             ious = _iou_matrix(pb_o, gb)
+            if class_aware:
+                ious = np.where(pl_o[:, None] == gl[None, :], ious, -1.0)
             for i in range(len(pb_o)):
                 j = int(np.argmax(ious[i]))
                 if ious[i, j] >= iou_thr and (not gt_used[j]):
@@ -1215,7 +1353,7 @@ def plot_gradcam_comparison(
     target_items: Sequence[Dict[str, Any]],
     out_dir: str,
     fname: str = "gradcam_source_vs_target.png",
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     score_fn: Optional[Callable[[Any], Any]] = None,
     forward_fn: Optional[Callable[[Any, Any], Any]] = None,
@@ -1287,13 +1425,13 @@ def _parse_main_args(argv: Optional[Sequence[str]] = None) -> Any:
     import argparse
 
     p = argparse.ArgumentParser(
-        description="Standalone Grad-CAM (source day vs target night) for DAI-Net"
+        description="Standalone Grad-CAM (source day vs target night) for RAILIGHT"
     )
     p.add_argument("cmd", nargs="?", default="gradcam", choices=["gradcam"])
     p.add_argument("--weights", required=True, type=str)
     p.add_argument(
         "--architecture",
-        default="dai_net",
+        default="railight",
         type=str,
         help="Detection architecture name (used in charts path).",
     )
@@ -1396,7 +1534,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         net = net.cuda()
     if not hasattr(net, "vgg"):
         raise RuntimeError(
-            "Backbone has no `.vgg` ModuleList; this Grad-CAM helper is wired for VGG-style DAI-Net only."
+            "Backbone has no `.vgg` ModuleList; this Grad-CAM helper is wired for VGG-style RAILIGHT only."
         )
     target_idx = min(args.target_layer_idx, len(net.vgg) - 1)
     end = min(args.forward_end_idx, len(net.vgg))
@@ -1442,7 +1580,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     out_dir = make_charts_dir(
         args.charts_dir, args.mode_name, args.architecture, args.model, args.num_exp
     )
-    method = f"DAI-Net ({args.model}, {os.path.basename(args.weights)})"
+    method = f"RAILIGHT ({args.model}, {os.path.basename(args.weights)})"
     config = {
         "backbone": args.model,
         "weights": os.path.basename(args.weights),

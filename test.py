@@ -11,7 +11,8 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 import warnings as _warnings
@@ -25,28 +26,46 @@ import yaml
 from tqdm import tqdm
 import torch.nn.functional as F
 
-from data.config import cfg
-from data.source_domain import SourceDomainDetection, detection_collate
-from data.target_domain import (
-    TargetLabeledDataset,
-    TargetUnlabeledDataset,
-    resolve_target_label_paths,
+from data.config import apply_damamba_config, apply_input_config, cfg
+from data.source_domain import (
+    SourceDomainDetection,
+    detection_collate,
+    normalize_list_files,
 )
+from railight.constants import BACKBONE_FROM_MODEL, MODEL_FROM_ARCH_BACKBONE
+from data.meta import load_dataset_meta
+from losses.align import DistillKLAlign, apply_align_config
 from models.factory import build_net
 from utils import visualize as viz
-from train import (
-    _BACKBONE_FROM_MODEL,
-    _MODEL_FROM_ARCH_BACKBONE,
-    _detect_metrics_from_cm,
-    _format_val_table,
-    build_dark_batch,
-    collect_target_samples,
-    load_dataset_meta,
-    viz_config,
-    viz_method,
+from utils.checkpoint import load_detector_state_dict
+from utils.constants import _TEST_DEFAULTS, flatten_da_block
+from utils.low_light import make_night_synthesizer
+from utils.domain_tsne import (
+    TSNE_FNAME,
+    TSNE_SUPTITLE,
+    TapBank,
+    accumulate,
+    build_layer_panels,
 )
-from utils.predict import _decode_per_image, infer_detections
-from utils.constants import _TEST_DEFAULTS
+from utils.error_analysis import (
+    BoxConverter,
+    DetectionMatcher,
+    FpFnSampleExporter,
+    FpFnStreamWriter,
+)
+from utils.metrics import (
+    detect_metrics_from_cm,
+    embedding_overlap_stats,
+    format_per_class_table,
+    macro_summary,
+    per_class_detection_metrics,
+)
+from utils.predict import (
+    _decode_per_image,
+    infer_detections,
+    infer_detections_batch,
+)
+from utils.reporting import format_val_table, viz_config, viz_method
 
 def load_test_config(config_path: str) -> argparse.Namespace:
     p = Path(config_path)
@@ -56,6 +75,7 @@ def load_test_config(config_path: str) -> argparse.Namespace:
         cfg_yaml = yaml.safe_load(f) or {}
     if not isinstance(cfg_yaml, dict):
         raise ValueError(f"Top-level YAML must be a mapping, got {type(cfg_yaml)}")
+    cfg_yaml = flatten_da_block(cfg_yaml)
     parts = p.parts
     path_arch = parts[-3] if len(parts) >= 3 else None
     path_backbone = parts[-2] if len(parts) >= 2 else None
@@ -63,7 +83,7 @@ def load_test_config(config_path: str) -> argparse.Namespace:
     arch = cfg_yaml.get("architecture") or path_arch
     backbone = cfg_yaml.get("backbone") or path_backbone
     num_exp = cfg_yaml.get("num_exp") or path_num_exp
-    model = cfg_yaml.get("model") or _MODEL_FROM_ARCH_BACKBONE.get((arch, backbone))
+    model = cfg_yaml.get("model") or MODEL_FROM_ARCH_BACKBONE.get((arch, backbone))
     if model is None and str(backbone or "").startswith("yolo26"):
         model = str(backbone)
     if model is None:
@@ -74,7 +94,9 @@ def load_test_config(config_path: str) -> argparse.Namespace:
     legacy_aliases = {
         "train_file": "source_train_file",
         "val_file": "source_val_file",
-        "test_file": "source_test_file",
+        "test_file": "source_test_files",
+        "source_test_file": "source_test_files",
+        "target_test_file": "target_test_files",
     }
     for k, v in cfg_yaml.items():
         if k in ("architecture", "backbone", "num_exp", "model"):
@@ -83,6 +105,8 @@ def load_test_config(config_path: str) -> argparse.Namespace:
             merged[legacy_aliases[k]] = v
         else:
             merged[k] = v
+    for list_key in ("source_test_files", "target_test_files"):
+        merged[list_key] = normalize_list_files(merged.get(list_key))
     merged.update(
         dict(
             architecture=arch,
@@ -104,84 +128,167 @@ def _load_state_dict(net: torch.nn.Module, weights_path: str) -> None:
     state = torch.load(weights_path, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "weight" in state:
         state = state["weight"]
-    net.load_state_dict(state)
+    load_detector_state_dict(net, state)
 
-def _bgr_chw_to_rgb_uint8(tensor_chw: torch.Tensor) -> np.ndarray:
-    return (
-        (tensor_chw.detach().cpu().numpy().transpose(1, 2, 0)[:, :, ::-1] * 255)
-        .clip(0, 255)
-        .astype(np.uint8)
+def _param_group_of(child_name: str) -> str:
+    if child_name in ("vgg", "backbone"):
+        return "backbone"
+    if child_name.startswith(("extras", "fpn", "L2Norm")):
+        return "neck"
+    if child_name.startswith(("loc_", "conf_")):
+        return "head"
+    if child_name == "ref":
+        return "retinex_ref"
+    return "other"
+
+def _count_parameters(net: torch.nn.Module) -> Dict[str, Any]:
+    params = list(net.parameters())
+    buffers = list(net.buffers())
+    bytes_total = sum(p.numel() * p.element_size() for p in params) + sum(
+        b.numel() * b.element_size() for b in buffers
     )
+    by_component: Dict[str, int] = {}
+    by_group: Dict[str, int] = {
+        "backbone": 0, "neck": 0, "head": 0, "retinex_ref": 0, "other": 0,
+    }
+    for name, child in net.named_children():
+        n = int(sum(p.numel() for p in child.parameters()))
+        by_component[name] = n
+        by_group[_param_group_of(name)] += n
+    total = int(sum(p.numel() for p in params))
+    # params held directly on the net rather than in any child module
+    loose = total - sum(by_component.values())
+    if loose:
+        by_component["<direct>"] = int(loose)
+        by_group["other"] += int(loose)
+    return {
+        "params_total": total,
+        "params_trainable": int(sum(p.numel() for p in params if p.requires_grad)),
+        "params_buffers": int(sum(b.numel() for b in buffers)),
+        "model_size_mb": float(bytes_total / (1024.0 ** 2)),
+        # `ref` (Retinex reflectance decoder) runs in test_forward but the
+        # detection output does not depend on it — this is the detector-only
+        # count to quote against other detectors.
+        "params_detector": int(total - by_group["retinex_ref"]),
+        "params_backbone": int(by_group["backbone"]),
+        "params_neck": int(by_group["neck"]),
+        "params_head": int(by_group["head"]),
+        "params_retinex_ref": int(by_group["retinex_ref"]),
+        "params_other": int(by_group["other"]),
+        "params_by_component": by_component,
+    }
 
-@torch.no_grad()
-def extract_backbone_features(
-    net: torch.nn.Module,
-    image: torch.Tensor,
-    layer_idx: int | None = None,
-) -> torch.Tensor:
-    if image.dim() == 3:
-        image = image.unsqueeze(0)
-    vgg = getattr(net, "vgg", None)
-    if vgg is not None:
-        # VGG-DSFD: a flat ModuleList that can be run slice-by-slice.
-        n = len(vgg) if layer_idx is None else int(layer_idx)
-        gf = image
-        for k in range(n):
-            gf = vgg[k](gf)
-        return gf
-    # Backbone-agnostic path (YOLO26 etc.): run only the backbone (not the
-    # detection head) and return one of its feature taps. YOLO26nBackbone
-    # returns (shallow, of1, of2, of3, of4); pick the deepest tap by default.
-    backbone = getattr(net, "backbone", None)
-    if backbone is None or not hasattr(backbone, "stages"):
-        raise AttributeError("net has neither `.vgg` nor a `.backbone.stages()` for feature heatmap")
-    feats = backbone.stages(image)
-    if isinstance(feats, (tuple, list)):
-        idx = len(feats) - 1 if layer_idx is None else min(int(layer_idx), len(feats) - 1)
-        return feats[idx]
-    return feats
+_MAP_IOU_THRS: Tuple[float, ...] = tuple(
+    round(0.5 + 0.05 * i, 2) for i in range(10)
+)
 
-def features_to_single_channel(
-    gf: torch.Tensor, normalize: bool = True
-) -> torch.Tensor:
-    if gf.dim() == 3:
-        gf = gf.unsqueeze(0)
-    smap = gf.mean(dim=1, keepdim=True)
-    if normalize:
-        b = smap.shape[0]
-        flat = smap.reshape(b, -1).float()
-        mn = flat.min(dim=1, keepdim=True)[0]
-        mx = flat.max(dim=1, keepdim=True)[0]
-        flat = (flat - mn) / (mx - mn + 1e-8)
-        smap = flat.reshape_as(smap)
-    return smap
+def _map_50_95(
+    per_image: List[Dict[str, np.ndarray]],
+    score_thr_cm: float,
+    num_classes: int,
+    name: str = "",
+) -> Tuple[float, Dict[str, float]]:
+    if not per_image:
+        return (0.0, {})
+    per_thr: Dict[str, float] = {}
+    bar = tqdm(
+        _MAP_IOU_THRS,
+        desc=f"mAP@50:95 ({name})" if name else "mAP@50:95",
+        dynamic_ncols=True,
+        unit="iou",
+        colour="yellow",
+    )
+    for thr in bar:
+        s, mt, ng, _cm = viz.evaluate_detections(
+            per_image,
+            iou_thr=float(thr),
+            score_thr_cm=score_thr_cm,
+            num_classes=num_classes,
+        )
+        _p, _r, _f, ap = viz._pr_from_scores(np.asarray(s), np.asarray(mt), ng)
+        per_thr[f"{thr:.2f}"] = float(ap)
+    return (float(np.mean(list(per_thr.values()))), per_thr)
 
-def backbone_feature_map(
-    net: torch.nn.Module,
-    image: torch.Tensor,
-    layer_idx: int | None = None,
-    normalize: bool = True,
-) -> torch.Tensor:
-    gf = extract_backbone_features(net, image, layer_idx=layer_idx)
-    return features_to_single_channel(gf, normalize=normalize)
+@dataclass
+class DistributionBank:
+    """Per-domain activations gathered by the distribution pass."""
 
-def save_backbone_feature_heatmap(
-    net: torch.nn.Module,
-    image: torch.Tensor,
-    out_path: str,
-    layer_idx: int | None = None,
-) -> str:
-    import cv2
+    feat: List[float] = field(default_factory=list)
+    before_feat: List[float] = field(default_factory=list)
+    embed: List[torch.Tensor] = field(default_factory=list)
+    prob: List[torch.Tensor] = field(default_factory=list)
+    tsne: TapBank = field(default_factory=TapBank)
 
-    if image.dim() == 4:
-        image = image[0]
-    smap = backbone_feature_map(net, image, layer_idx=layer_idx, normalize=True)
-    cam = smap[0, 0].detach().cpu().numpy()
-    rgb = _bgr_chw_to_rgb_uint8(image)
-    overlay, _heat = viz._overlay_heatmap(rgb, cam)
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    cv2.imwrite(out_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-    return out_path
+    @property
+    def align(self) -> List[torch.Tensor]:
+        return self.tsne.align
+
+
+@dataclass
+class DomainEvaluation:
+    """Detection metrics for one slice of data, plus the arrays the plots need."""
+
+    name: str
+    per_image: List[Dict[str, np.ndarray]]
+    scores: np.ndarray
+    matched: np.ndarray
+    n_gt: int
+    cm: Any
+    stats: Dict[str, Any]
+
+def evaluate_domain(
+    name: str,
+    per_image: List[Dict[str, np.ndarray]],
+    iou_thr: float,
+    score_thr: float,
+    nc: int,
+    class_names: Sequence[str] = (),
+) -> DomainEvaluation:
+    empty_stats: Dict[str, Any] = {
+        "n_images": 0, "n_gt": 0,
+        "accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0,
+        "mAP": 0.0, "mAP_50_95": 0.0, "mAP_per_iou": {},
+        "tp": 0, "fp": 0, "fn": 0,
+        "tp_norm": 0.0, "fp_norm": 0.0, "fn_norm": 0.0,
+    }
+    if not per_image:
+        return DomainEvaluation(
+            name, per_image, np.zeros(0, dtype=np.float32),
+            np.zeros(0, dtype=np.int32), 0, None, empty_stats,
+        )
+    scores, matched, n_gt, cm = viz.evaluate_detections(
+        per_image, iou_thr=iou_thr, score_thr_cm=score_thr, num_classes=nc
+    )
+    m = detect_metrics_from_cm(cm)
+    _p, _r, _f, mAP = viz._pr_from_scores(
+        np.asarray(scores), np.asarray(matched), n_gt
+    )
+    mAP_50_95, mAP_per_thr = _map_50_95(per_image, score_thr, nc, name)
+    total = max(m["tp"] + m["fp"] + m["fn"], 1)
+    stats = {
+        "n_images": len(per_image),
+        "n_gt": int(n_gt),
+        "accuracy": float(m["accuracy"]),
+        "precision": float(m["precision"]),
+        "recall": float(m["recall"]),
+        "f1": float(m["f1"]),
+        "mAP": float(mAP),
+        "mAP_50_95": float(mAP_50_95),
+        "mAP_per_iou": mAP_per_thr,
+        "tp": int(m["tp"]),
+        "fp": int(m["fp"]),
+        "fn": int(m["fn"]),
+        "tp_norm": round(m["tp"] / total, 6),
+        "fp_norm": round(m["fp"] / total, 6),
+        "fn_norm": round(m["fn"] / total, 6),
+    }
+    per_class = per_class_detection_metrics(
+        per_image, nc, class_names, iou_thr=iou_thr, score_thr=score_thr
+    )
+    stats["per_class"] = per_class
+    stats.update(macro_summary(per_class))
+    print(format_per_class_table(per_class, f"Per-class metrics · {name}"))
+    return DomainEvaluation(name, per_image, scores, matched, n_gt, cm, stats)
 
 def _export_yolo_predictions(
     per_image: List[Dict[str, np.ndarray]],
@@ -208,37 +315,125 @@ def _export_yolo_predictions(
             fh.write("\n".join(lines))
     return len(per_image)
 
-def _predict_target_folder(
+def _existing_list_files(list_files: Any) -> List[str]:
+    files = normalize_list_files(list_files)
+    usable = [f for f in files if os.path.isfile(f)]
+    for missing in [f for f in files if f not in usable]:
+        print(f"[WARN] list file not found, skipped: {missing}")
+    return usable
+
+
+def _build_split_loader(
+    list_files: List[str],
+    args_ns: argparse.Namespace,
+    use_cuda: bool,
+) -> Tuple[Any, data.DataLoader | None]:
+    if not list_files:
+        return (None, None)
+    dataset = SourceDomainDetection(list_files, mode="val")
+    if len(dataset) == 0:
+        return (dataset, None)
+    loader = data.DataLoader(
+        dataset,
+        batch_size=args_ns.batch_size,
+        num_workers=args_ns.num_workers,
+        collate_fn=detection_collate,
+        shuffle=False,
+        pin_memory=use_cuda,
+    )
+    return (dataset, loader)
+
+def _make_fp_fn_writer(
+    args_ns: argparse.Namespace, class_names: Sequence[str]
+) -> FpFnStreamWriter | None:
+    output_path = getattr(args_ns, "export_fp_fn_samples_path", None)
+    if not output_path:
+        return None
+    exporter = FpFnSampleExporter(
+        DetectionMatcher(
+            iou_threshold=float(args_ns.iou_thr),
+            score_threshold=float(args_ns.score_thr_cm),
+        ),
+        BoxConverter(),
+        class_names,
+    )
+    return FpFnStreamWriter(exporter, str(output_path))
+
+
+def _run_source_pass(
     net: torch.nn.Module,
-    target_folder: str,
+    val_loader: data.DataLoader | None,
+    use_cuda: bool,
+    synthesize_night: Callable[[torch.Tensor], torch.Tensor],
+    fp_fn_writer: FpFnStreamWriter | None = None,
+) -> Tuple[List[Dict[str, np.ndarray]], List[str], float, float, int]:
+    per_image: List[Dict[str, np.ndarray]] = []
+    img_paths_all: List[str] = []
+    infer_s = 0.0
+    n_imgs_timed = 0
+    if val_loader is None:
+        return (per_image, img_paths_all, 0.0, infer_s, n_imgs_timed)
+    pbar = tqdm(
+        val_loader,
+        total=len(val_loader),
+        desc="Evaluating",
+        dynamic_ncols=True,
+        unit="batch",
+        colour="green",
+    )
+    t0 = time.time()
+    with torch.no_grad():
+        for b_i, (images, targets, img_paths) in enumerate(pbar):
+            if use_cuda:
+                images = images.cuda()
+            images = images / 255.0
+            img_dark = synthesize_night(images)
+            # first batch carries cuDNN autotune/alloc warm-up — exclude it so
+            # the reported speed reflects steady state
+            timed = b_i > 0
+            if timed and use_cuda:
+                torch.cuda.synchronize()
+            _t_fwd = time.perf_counter()
+            out, _ = net.test_forward(img_dark)
+            if timed:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                infer_s += time.perf_counter() - _t_fwd
+                n_imgs_timed += int(images.size(0))
+            batch_items = _decode_per_image(out, targets, net)
+            per_image.extend(batch_items)
+            img_paths_all.extend(list(img_paths))
+            if fp_fn_writer is not None:
+                fp_fn_writer.add("source", list(img_paths), batch_items)
+    return (
+        per_image,
+        img_paths_all,
+        time.time() - t0,
+        infer_s,
+        n_imgs_timed,
+    )
+
+
+def _predict_target_loader(
+    net: torch.nn.Module,
+    target_loader: data.DataLoader,
     args_ns: argparse.Namespace,
     use_cuda: bool,
 ) -> Tuple[List[Dict[str, np.ndarray]], List[str]]:
-    tgt_ds = TargetUnlabeledDataset(target_folder, size=cfg.INPUT_SIZE)
-    if len(tgt_ds) == 0:
-        return ([], [])
-    tgt_loader = data.DataLoader(
-        tgt_ds,
-        batch_size=args_ns.batch_size,
-        shuffle=False,
-        num_workers=args_ns.num_workers,
-        drop_last=False,
-    )
-
     conf_thr = float(args_ns.score_thr_cm)
     nms_iou_thr = float(args_ns.nms_iou_thr)
     inv_size = 1.0 / float(cfg.INPUT_SIZE)
     per_image: List[Dict[str, np.ndarray]] = []
-    paths = list(tgt_ds.paths)
+    paths: List[str] = []
     pbar = tqdm(
-        tgt_loader,
-        total=len(tgt_loader),
+        target_loader,
+        total=len(target_loader),
         desc="Predicting target",
         dynamic_ncols=True,
         unit="batch",
         colour="magenta",
     )
-    for t_imgs in pbar:
+    for t_imgs, _t, t_paths in pbar:
         if use_cuda:
             t_imgs = t_imgs.cuda()
         t_imgs = t_imgs / 255.0
@@ -257,6 +452,7 @@ def _predict_target_folder(
                     "gt_labels": np.zeros((0,), dtype=np.int32),
                 }
             )
+        paths.extend(list(t_paths))
     return (per_image, paths[: len(per_image)])
 
 def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
@@ -272,18 +468,19 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         args_ns.nc = len(class_names)
         print(f"[data] class names from config: {list(class_names)}")
     else:
-        nc_yaml, class_names = load_dataset_meta(
-            args_ns.source_folder, args_ns.nc
-        )
-        if nc_yaml != args_ns.nc:
+        meta = load_dataset_meta(args_ns.source_folder, args_ns.nc)
+        class_names = meta.class_names
+        if meta.nc != args_ns.nc:
             print(
                 f"[WARN] nc mismatch: config nc={args_ns.nc} but "
-                f"{args_ns.source_folder}/data.yaml has nc={nc_yaml}. "
+                f"{args_ns.source_folder}/data.yaml has nc={meta.nc}. "
                 f"Using data.yaml."
             )
-        args_ns.nc = nc_yaml
+        args_ns.nc = meta.nc
     num_classes = args_ns.nc + 1
     cfg.NUM_CLASSES = num_classes
+    if hasattr(cfg, "ALIGN"):
+        apply_align_config(cfg.ALIGN, args_ns)
     if hasattr(cfg, "FOCAL"):
         cfg.FOCAL.ENABLED = bool(getattr(args_ns, "focal_enabled", cfg.FOCAL.ENABLED))
         cfg.FOCAL.GAMMA = float(getattr(args_ns, "focal_gamma", cfg.FOCAL.GAMMA))
@@ -291,53 +488,71 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             getattr(args_ns, "focal_alpha_bg", cfg.FOCAL.ALPHA_BG)
         )
     print(f"[data] classes ({len(class_names)}): {list(class_names)}")
+    night_synthesis, synthesize_night = make_night_synthesizer(args_ns)
+    print(f"[data] night synthesis: {night_synthesis}")
     print(f"[net] building {args_ns.architecture}/{args_ns.model}")
-    net = build_net("train", num_classes, args_ns.model)
+    net = build_net(
+        "train",
+        num_classes,
+        backbone=args_ns.backbone,
+        architecture=args_ns.architecture,
+    )
     _load_state_dict(net, args_ns.weights)
     print(f"[net] loaded weights from {args_ns.weights}")
     if use_cuda:
         net = net.cuda()
     net.eval()
-    eval_file = (
-        getattr(args_ns, "source_test_file", None)
-        or getattr(args_ns, "source_val_file", None)
+    eval_files = _existing_list_files(getattr(args_ns, "source_test_files", None))
+    val_ds, val_loader = _build_split_loader(eval_files, args_ns, use_cuda)
+    if val_loader is None:
+        print("[data] source set: <none> — source eval skipped")
+    else:
+        print(
+            f"[data] source set: {eval_files} | {len(val_ds)} samples "
+            f"| batch_size: {args_ns.batch_size}"
+        )
+    target_test_files = _existing_list_files(
+        getattr(args_ns, "target_test_files", None)
     )
-    if not eval_file or not os.path.isfile(eval_file):
-        raise FileNotFoundError(f"source test/val list not found: {eval_file}")
-    val_ds = SourceDomainDetection(eval_file, mode="val")
-    val_loader = data.DataLoader(
-        val_ds,
-        batch_size=args_ns.batch_size,
-        num_workers=args_ns.num_workers,
-        collate_fn=detection_collate,
-        shuffle=False,
-        pin_memory=use_cuda,
+    target_ds, target_loader = _build_split_loader(
+        target_test_files, args_ns, use_cuda
+    )
+    if target_loader is None:
+        print(f"[WARN] target test list not usable: {target_test_files!r}")
+    else:
+        print(f"[data] target set: {target_test_files} | {len(target_ds)} samples")
+    if val_loader is None and target_loader is None:
+        raise FileNotFoundError(
+            "neither source_test_files nor target_test_files is usable — "
+            "nothing to evaluate."
+        )
+    n_val = len(val_ds) if val_ds is not None else 0
+    fp_fn_writer = _make_fp_fn_writer(args_ns, class_names)
+    per_image, all_img_paths, elapsed, infer_s, n_imgs_timed = _run_source_pass(
+        net, val_loader, use_cuda, synthesize_night, fp_fn_writer
+    )
+    fps_end2end = float(n_val / elapsed) if elapsed > 0 else 0.0
+    throughput_img_s = float(n_imgs_timed / infer_s) if infer_s > 0 else 0.0
+    latency_ms = float(infer_s / n_imgs_timed * 1000.0) if n_imgs_timed else 0.0
+    param_stats = _count_parameters(net)
+    print(
+        f"[speed] end-to-end {fps_end2end:.2f} FPS | forward-only "
+        f"{throughput_img_s:.2f} img/s ({latency_ms:.2f} ms/img, "
+        f"batch_size={args_ns.batch_size}, {n_imgs_timed} imgs timed)"
     )
     print(
-        f"[data] test set: {eval_file} | {len(val_ds)} samples "
-        f"| batch_size: {args_ns.batch_size}"
+        f"[model] params total={param_stats['params_total']:,} "
+        f"trainable={param_stats['params_trainable']:,} "
+        f"| size={param_stats['model_size_mb']:.2f} MB"
     )
-    per_image: List[Dict[str, np.ndarray]] = []
-    all_img_paths: List[str] = []
-    pbar = tqdm(
-        val_loader,
-        total=len(val_loader),
-        desc="Evaluating",
-        dynamic_ncols=True,
-        unit="batch",
-        colour="green",
+    print(
+        f"[model] backbone={param_stats['params_backbone']:,} "
+        f"neck={param_stats['params_neck']:,} "
+        f"head={param_stats['params_head']:,} "
+        f"retinex_ref={param_stats['params_retinex_ref']:,} "
+        f"other={param_stats['params_other']:,} "
+        f"| detector-only (excl. retinex_ref)={param_stats['params_detector']:,}"
     )
-    t0 = time.time()
-    with torch.no_grad():
-        for images, targets, img_paths in pbar:
-            if use_cuda:
-                images = images.cuda()
-            images = images / 255.0
-            img_dark = build_dark_batch(images)
-            out, _ = net.test_forward(img_dark)
-            per_image.extend(_decode_per_image(out, targets, net))
-            all_img_paths.extend(list(img_paths))
-    elapsed = time.time() - t0
 
     src_export_dir = getattr(args_ns, "export_predicted_source_path", None)
     if src_export_dir:
@@ -347,11 +562,10 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         print(f"[export] wrote {n} YOLO source prediction files to {src_export_dir}")
 
     tgt_export_dir = getattr(args_ns, "export_predicted_target_path", None)
-    tgt_dir_for_export = getattr(args_ns, "target_folder4unsupervised", "")
     if tgt_export_dir:
-        if tgt_dir_for_export and os.path.isdir(tgt_dir_for_export):
-            tgt_pred_per_image, tgt_pred_paths = _predict_target_folder(
-                net, tgt_dir_for_export, args_ns, use_cuda
+        if target_loader is not None:
+            tgt_pred_per_image, tgt_pred_paths = _predict_target_loader(
+                net, target_loader, args_ns, use_cuda
             )
             n = _export_yolo_predictions(
                 tgt_pred_per_image,
@@ -362,89 +576,98 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             print(f"[export] wrote {n} YOLO target prediction files to {tgt_export_dir}")
         else:
             print(
-                f"[WARN] export_predicted_target_path set but target_folder "
-                f"{tgt_dir_for_export!r} missing — skipping target export."
+                f"[WARN] export_predicted_target_path set but target list "
+                f"{target_test_files!r} unusable — skipping target export."
             )
 
-    feat_day: List[float] = []         
-    feat_night: List[float] = []      
-    feat_before_day: List[float] = []  
-    feat_before_night: List[float] = []  
     kl_vals: List[float] = []
-    ce_vals: List[float] = []          
-    _src_bank: List[torch.Tensor] = []  
-    _tgt_bank: List[torch.Tensor] = []
-    _src_before_bank: List[torch.Tensor] = []  
-    _tgt_before_bank: List[torch.Tensor] = []
-    _src_prob: List[torch.Tensor] = []  
-    _tgt_prob: List[torch.Tensor] = []
+    ce_vals: List[float] = []
+    tap_labels: List[str] = list(getattr(net, "align_tap_labels", []))
+    src_dist = DistributionBank()
+    tgt_dist = DistributionBank()
 
-    def _collect(imgs, feat_acc, fbank, pbank, before_acc, before_bank):
-        emb = net.embed_features(imgs)  
-        fbank.append(emb.detach().float().cpu())
-        before_bank.append(
-            F.adaptive_avg_pool2d(imgs, 8)
-            .flatten(start_dim=1)
-            .detach()
-            .float()
-            .cpu()
-        )
+    align_source_view = str(
+        getattr(getattr(net, "align_spec", None), "source_view", "light")
+    ).lower()
 
-        before_acc.extend(
+    def _source_align_view(imgs: torch.Tensor) -> torch.Tensor:
+        if align_source_view == "light":
+            return imgs
+        return synthesize_night(imgs)
+
+    def _collect(imgs: torch.Tensor, view: torch.Tensor, bank: DistributionBank):
+        emb = net.embed_features(view)
+        bank.embed.append(emb.detach().float().cpu())
+        accumulate(net, imgs, view, bank.tsne)
+
+        bank.before_feat.extend(
             imgs.flatten(start_dim=1).mean(dim=1).detach().cpu().tolist()
         )
-        feat_acc += emb.mean(dim=1).detach().cpu().tolist()
-        o, _o2 = net.test_forward(imgs)
-        c = o[4]                   
-       
-        pbank.append(
+        bank.feat += emb.mean(dim=1).detach().cpu().tolist()
+        o, _o2 = net.test_forward(view)
+        c = o[4]
+
+        bank.prob.append(
             F.softmax(c, dim=-1).mean(dim=1).detach().float().cpu()
         )
 
+    run_domain_gap = bool(getattr(args_ns, "is_run_domain_gap", True))
+    run_tsne = bool(getattr(args_ns, "is_run_tsne_reflectance", True))
+    run_dist_pass = run_domain_gap or run_tsne
+    if not run_dist_pass:
+        print(
+            "[dist] skipped (is_run_domain_gap and is_run_tsne_reflectance "
+            "are both off)"
+        )
+    else:
+        print(
+            f"[dist] align source view: {align_source_view} "
+            f"({'synthetic dark, matches training' if align_source_view != 'light' else 'raw daylight'})"
+        )
     try:
-        torch.set_default_tensor_type("torch.FloatTensor") 
-        with torch.no_grad():
-            for s_imgs, _t, _p in tqdm(
-                val_loader, total=len(val_loader),
-                desc="Dist pass 1/2 (source-val / day)",
-                dynamic_ncols=True, unit="batch", colour="cyan",
-            ):
-                if use_cuda:
-                    s_imgs = s_imgs.cuda()
-                _collect(
-                    s_imgs / 255.0, feat_day, _src_bank, _src_prob,
-                    feat_before_day, _src_before_bank,
-                )
-
-        tgt_dir = getattr(args_ns, "target_folder4unsupervised", "")
-        if tgt_dir and os.path.isdir(tgt_dir):
-            tgt_ds = TargetUnlabeledDataset(tgt_dir, size=cfg.INPUT_SIZE)
-            tgt_loader = data.DataLoader(
-                tgt_ds, batch_size=args_ns.batch_size, shuffle=False,
-                num_workers=args_ns.num_workers, drop_last=False,
-            )
+        torch.set_default_tensor_type("torch.FloatTensor")
+        if run_dist_pass and val_loader is not None:
             with torch.no_grad():
-                for t_imgs in tqdm(
-                    tgt_loader, total=len(tgt_loader),
+                for s_imgs, _t, _p in tqdm(
+                    val_loader, total=len(val_loader),
+                    desc="Dist pass 1/2 (source-val / day)",
+                    dynamic_ncols=True, unit="batch", colour="cyan",
+                ):
+                    if use_cuda:
+                        s_imgs = s_imgs.cuda()
+                    s_imgs = s_imgs / 255.0
+                    _collect(s_imgs, _source_align_view(s_imgs), src_dist)
+
+        if run_dist_pass and target_loader is not None:
+            with torch.no_grad():
+                for t_imgs, _t, _p in tqdm(
+                    target_loader, total=len(target_loader),
                     desc="Dist pass 2/2 (target / night)",
                     dynamic_ncols=True, unit="batch", colour="cyan",
                 ):
                     if use_cuda:
                         t_imgs = t_imgs.cuda()
-                    _collect(
-                        t_imgs / 255.0, feat_night, _tgt_bank, _tgt_prob,
-                        feat_before_night, _tgt_before_bank,
-                    )
-        else:
+                    t_imgs = t_imgs / 255.0
+                    _collect(t_imgs, t_imgs, tgt_dist)
+        elif run_dist_pass:
             print(
-                f"[WARN] target_folder {tgt_dir!r} missing — night "
+                f"[WARN] target list {target_test_files!r} unusable — night "
                 f"distribution / KL skipped."
             )
 
-        if _src_bank and _tgt_bank:
-            src = torch.cat(_src_bank, dim=0)
-            tgt = torch.cat(_tgt_bank, dim=0)
+        if run_domain_gap and src_dist.embed and tgt_dist.embed:
+            src = torch.cat(src_dist.embed, dim=0)
+            tgt = torch.cat(tgt_dist.embed, dim=0)
             kl_dev = next(net.parameters()).device
+            kl_fn = getattr(net, "KL", None)
+            if kl_fn is None:
+                kl_fn = DistillKLAlign(
+                    float(
+                        getattr(
+                            getattr(net, "align_spec", None), "temperature", 4.0
+                        )
+                    )
+                ).to(kl_dev)
             bs = max(2, int(args_ns.batch_size))
             n_draw = min(300, max(1, min(len(src), len(tgt)) // bs))
             rng = np.random.RandomState(0)
@@ -454,12 +677,12 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                     ti = rng.randint(0, len(tgt), size=bs)
                     a = src[torch.from_numpy(si)].to(kl_dev)
                     b = tgt[torch.from_numpy(ti)].to(kl_dev)
-                    kl = net.KL(a, b) + net.KL(b, a)
+                    kl = kl_fn(a, b) + kl_fn(b, a)
                     kl_vals.append(float(kl.detach().cpu()))
 
-        if _src_prob and _tgt_prob:
-            pd = torch.cat(_src_prob, dim=0).clamp_min(1e-9)
-            pn = torch.cat(_tgt_prob, dim=0).clamp_min(1e-9)
+        if run_domain_gap and src_dist.prob and tgt_dist.prob:
+            pd = torch.cat(src_dist.prob, dim=0).clamp_min(1e-9)
+            pn = torch.cat(tgt_dist.prob, dim=0).clamp_min(1e-9)
             rng2 = np.random.RandomState(1)
             n_ce = min(2000, max(1, min(len(pd), len(pn))))
             di = rng2.randint(0, len(pd), size=n_ce)
@@ -477,11 +700,12 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             torch.set_default_tensor_type(  
                 "torch.cuda.FloatTensor"
             )
-    print(
-        f"[dist] collected: src_imgs={len(feat_day)} "
-        f"tgt_imgs={len(feat_night)} kl_draws={len(kl_vals)} "
-        f"ce_pairs={len(ce_vals)}"
-    )
+    if run_dist_pass:
+        print(
+            f"[dist] collected: src_imgs={len(src_dist.feat)} "
+            f"tgt_imgs={len(tgt_dist.feat)} kl_draws={len(kl_vals)} "
+            f"ce_pairs={len(ce_vals)}"
+        )
 
     def _stats(name, arr):
         a = np.asarray(arr, dtype=np.float64)
@@ -502,53 +726,30 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     dist_stats = {}
     dist_stats.update(_stats("kl", kl_vals))
     dist_stats.update(_stats("ce", ce_vals))
-    scores, matched, n_gt, cm = viz.evaluate_detections(
-        per_image,
-        iou_thr=float(args_ns.iou_thr),
-        score_thr_cm=float(args_ns.score_thr_cm),
-        num_classes=args_ns.nc,
+    dist_stats.update(
+        embedding_overlap_stats(src_dist.align, tgt_dist.align)
     )
-    m = _detect_metrics_from_cm(cm)
-    _, _, _, mAP = viz._pr_from_scores(np.asarray(scores), np.asarray(matched), n_gt)
+    source_eval = evaluate_domain(
+        "source", per_image, float(args_ns.iou_thr),
+        float(args_ns.score_thr_cm), int(args_ns.nc), class_names,
+    )
+    scores, matched, n_gt, cm = (
+        source_eval.scores, source_eval.matched, source_eval.n_gt, source_eval.cm
+    )
+    m = source_eval.stats
+    mAP, mAP_50_95 = m["mAP"], m["mAP_50_95"]
+    mAP_per_thr = m["mAP_per_iou"]
     _tp, _fp, _fn = m["tp"], m["fp"], m["fn"]
     _tot = max(_tp + _fp + _fn, 1)
 
     tgt_per_image: List[Dict[str, np.ndarray]] = []
-    tgt_m = {"precision": 0.0, "recall": 0.0, "f1": 0.0,
-             "accuracy": 0.0, "tp": 0, "fp": 0, "fn": 0}
-    tgt_mAP = 0.0
-    tgt_n_gt = 0
-    tgt_scores = np.zeros(0, dtype=np.float32)
-    tgt_matched = np.zeros(0, dtype=np.int32)
-    tgt_cm = None
+    tgt_img_paths: List[str] = []
     tgt_loss = 0.0
     tgt_loc_loss = 0.0
     tgt_conf_loss = 0.0
     tgt_n_imgs = 0
-    target_test_file = getattr(args_ns, "target_test_file", None)
-    tgt_images_dir, tgt_labels_dir = resolve_target_label_paths(
-        getattr(args_ns, "target_folder4unsupervised", "")
-    )
-    target_class_map = getattr(args_ns, "target_class_map", None) or {
-        i: i + 1 for i in range(int(args_ns.nc))
-    }
-    tgt_ds = None
-    tgt_source_desc = ""
-    if tgt_images_dir and tgt_labels_dir:
-        try:
-            tgt_ds = TargetLabeledDataset(
-                tgt_images_dir, tgt_labels_dir,
-                class_map=target_class_map, mode="val",
-            )
-            tgt_source_desc = tgt_labels_dir
-        except Exception as e:
-            print(f"[WARN] target labelled folder eval skipped: {e}")
-            tgt_ds = None
-    if (tgt_ds is None or len(tgt_ds) == 0) and (
-        target_test_file and os.path.isfile(target_test_file)
-    ):
-        tgt_ds = SourceDomainDetection(target_test_file, mode="val")
-        tgt_source_desc = target_test_file
+    tgt_ds = target_ds
+    tgt_source_desc = target_test_files if target_loader is not None else []
 
     if tgt_ds is not None and len(tgt_ds) > 0:
         try:
@@ -559,9 +760,9 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             cls_loss_fn = None
             if getattr(cfg, "FOCAL", None) is not None and cfg.FOCAL.ENABLED:
                 alpha = None
-                if target_test_file and os.path.isfile(target_test_file):
+                if target_test_files:
                     alpha = compute_focal_alpha(
-                        target_test_file, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
+                        target_test_files, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
                     )
                 cls_loss_fn = FocalLoss(
                     gamma=cfg.FOCAL.GAMMA, alpha=alpha, num_classes=num_classes
@@ -574,17 +775,10 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             )
 
             tgt_n_imgs = len(tgt_ds)
-            tv_loader = data.DataLoader(
-                tgt_ds,
-                args_ns.batch_size,
-                num_workers=args_ns.num_workers,
-                collate_fn=detection_collate,
-                shuffle=False,
-                pin_memory=use_cuda,
-            )
+            tv_loader = target_loader
             steps = 0
             with torch.no_grad():
-                for tvi, ttgt, _tpaths in tqdm(
+                for tvi, ttgt, tpaths in tqdm(
                     tv_loader, total=len(tv_loader),
                     desc="Evaluating target (supervised)",
                     dynamic_ncols=True, unit="batch", colour="magenta",
@@ -599,34 +793,58 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                     tgt_conf_loss += float(l_conf.item())
                     tgt_loss += float((l_loc + l_conf).item())
                     steps += 1
-                    tgt_per_image.extend(_decode_per_image(tvout, ttgt, net))
+                    batch_items = _decode_per_image(tvout, ttgt, net)
+                    tgt_per_image.extend(batch_items)
+                    tgt_img_paths.extend(list(tpaths))
+                    if fp_fn_writer is not None:
+                        fp_fn_writer.add("target", list(tpaths), batch_items)
             if steps > 0:
                 tgt_loss /= steps
                 tgt_loc_loss /= steps
                 tgt_conf_loss /= steps
-            if tgt_per_image:
-                tgt_scores, tgt_matched, tgt_n_gt, tgt_cm = (
-                    viz.evaluate_detections(
-                        tgt_per_image,
-                        iou_thr=float(args_ns.iou_thr),
-                        score_thr_cm=float(args_ns.score_thr_cm),
-                        num_classes=args_ns.nc,
-                    )
-                )
-                tgt_m = _detect_metrics_from_cm(tgt_cm)
-                _, _, _, tgt_mAP = viz._pr_from_scores(
-                    np.asarray(tgt_scores),
-                    np.asarray(tgt_matched), tgt_n_gt,
-                )
         except Exception as e:
             print(f"[WARN] target supervised eval skipped: {e}")
+
+    print("[eval] computing detection metrics (target / combined)...")
+    target_eval = evaluate_domain(
+        "target", tgt_per_image, float(args_ns.iou_thr),
+        float(args_ns.score_thr_cm), int(args_ns.nc), class_names,
+    )
+    if not per_image:
+        combined_eval = target_eval
+    elif not tgt_per_image:
+        combined_eval = source_eval
+    else:
+        combined_eval = evaluate_domain(
+            "combined", per_image + tgt_per_image, float(args_ns.iou_thr),
+            float(args_ns.score_thr_cm), int(args_ns.nc), class_names,
+        )
+    if fp_fn_writer is not None:
+        counts = fp_fn_writer.close()
+        print(f"[export] FP/FN samples -> {fp_fn_writer.output_path}")
+        for split, c in counts.items():
+            print(
+                f"[export]   {split} fp: {c['fp_boxes']} boxes / "
+                f"{c['fp_images']} images -> {c['fp_dir']}/"
+            )
+            print(
+                f"[export]   {split} fn: {c['fn_boxes']} boxes / "
+                f"{c['fn_images']} images -> {c['fn_dir']}/"
+            )
+
+    tgt_scores, tgt_matched, tgt_n_gt, tgt_cm = (
+        target_eval.scores, target_eval.matched, target_eval.n_gt, target_eval.cm
+    )
+    tgt_m = target_eval.stats
+    tgt_mAP, tgt_mAP_50_95 = tgt_m["mAP"], tgt_m["mAP_50_95"]
+    tgt_mAP_per_thr = tgt_m["mAP_per_iou"]
     _t_tot = max(tgt_m["tp"] + tgt_m["fp"] + tgt_m["fn"], 1)
-    table = _format_val_table(
-        "test",
+    table = format_val_table(
+        "Test metrics",
         [
             ("§", "Setup"),
             ("weights", os.path.basename(args_ns.weights)),
-            ("n_samples", f"{len(val_ds)}"),
+            ("n_samples", f"{n_val}"),
             ("n_gt", f"{n_gt}"),
             ("iou_thr", f"{float(args_ns.iou_thr):.2f}"),
             ("score_thr", f"{float(args_ns.score_thr_cm):.2f}"),
@@ -636,6 +854,7 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             ("recall", f"{m['recall']:.4f}"),
             ("f1", f"{m['f1']:.4f}"),
             (f"mAP@{float(args_ns.iou_thr):.2f}", f"{mAP:.4f}"),
+            ("mAP@50:95", f"{mAP_50_95:.4f}"),
             ("TP/FP/FN (count)", f"{_tp}/{_fp}/{_fn}"),
             (
                 "TP/FP/FN (normalized)",
@@ -653,6 +872,7 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             ("target_recall", f"{tgt_m['recall']:.4f}"),
             ("target_f1", f"{tgt_m['f1']:.4f}"),
             (f"target_mAP@{float(args_ns.iou_thr):.2f}", f"{tgt_mAP:.4f}"),
+            ("target_mAP@50:95", f"{tgt_mAP_50_95:.4f}"),
             (
                 "target TP/FP/FN (count)",
                 f"{tgt_m['tp']}/{tgt_m['fp']}/{tgt_m['fn']}",
@@ -662,6 +882,23 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                 f"{tgt_m['tp'] / _t_tot:.3f}/"
                 f"{tgt_m['fp'] / _t_tot:.3f}/{tgt_m['fn'] / _t_tot:.3f}",
             ),
+            ("§", "Combined metrics (source + target)"),
+            ("combined_n", f"{combined_eval.stats['n_images']}"),
+            ("combined_n_gt", f"{combined_eval.stats['n_gt']}"),
+            ("combined_accuracy", f"{combined_eval.stats['accuracy']:.4f}"),
+            ("combined_precision", f"{combined_eval.stats['precision']:.4f}"),
+            ("combined_recall", f"{combined_eval.stats['recall']:.4f}"),
+            ("combined_f1", f"{combined_eval.stats['f1']:.4f}"),
+            (
+                f"combined_mAP@{float(args_ns.iou_thr):.2f}",
+                f"{combined_eval.stats['mAP']:.4f}",
+            ),
+            ("combined_mAP@50:95", f"{combined_eval.stats['mAP_50_95']:.4f}"),
+            (
+                "combined TP/FP/FN (count)",
+                f"{combined_eval.stats['tp']}/{combined_eval.stats['fp']}/"
+                f"{combined_eval.stats['fn']}",
+            ),
             ("§", "KL divergence (source↔target)"),
             ("KL mean", f"{dist_stats['kl_mean']:.4f}"),
             ("KL median", f"{dist_stats['kl_median']:.4f}"),
@@ -669,6 +906,20 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             (
                 "KL p10/p90",
                 f"{dist_stats['kl_p10']:.4f}/{dist_stats['kl_p90']:.4f}",
+            ),
+            ("§", "Embedding overlap (whitened multi-tap space)"),
+            (
+                "gap, std units (<0.2 = overlapping)",
+                f"{dist_stats['align_gap']:.4f}",
+            ),
+            ("MMD (0 = overlapping)", f"{dist_stats['align_mmd']:.4f}"),
+            (
+                "linear domain AUC (0.5 = indistinguishable)",
+                f"{dist_stats['align_auc']:.4f}",
+            ),
+            (
+                "n source / target embeddings",
+                f"{dist_stats['align_n_source']}/{dist_stats['align_n_target']}",
             ),
             ("§", "Cross-entropy H(day, night)"),
             ("CE mean", f"{dist_stats['ce_mean']:.4f}"),
@@ -678,12 +929,29 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                 "CE p10/p90",
                 f"{dist_stats['ce_p10']:.4f}/{dist_stats['ce_p90']:.4f}",
             ),
-            ("§", "Timing"),
+            ("§", "Model"),
+            ("params (total)", f"{param_stats['params_total']:,}"),
+            ("params (trainable)", f"{param_stats['params_trainable']:,}"),
+            (
+                "params (detector, excl. retinex_ref)",
+                f"{param_stats['params_detector']:,}",
+            ),
+            ("  ├ backbone", f"{param_stats['params_backbone']:,}"),
+            ("  ├ neck (extras/fpn/l2norm)", f"{param_stats['params_neck']:,}"),
+            ("  ├ head (loc/conf pal1+pal2)", f"{param_stats['params_head']:,}"),
+            ("  ├ retinex_ref", f"{param_stats['params_retinex_ref']:,}"),
+            ("  └ other", f"{param_stats['params_other']:,}"),
+            ("model size (MB)", f"{param_stats['model_size_mb']:.2f}"),
+            ("§", "Speed"),
             ("time(s)", f"{elapsed:.2f}"),
+            ("FPS (end-to-end)", f"{fps_end2end:.2f}"),
+            ("throughput (forward, img/s)", f"{throughput_img_s:.2f}"),
+            ("latency (forward, ms/img)", f"{latency_ms:.2f}"),
+            ("batch_size", f"{args_ns.batch_size}"),
         ],
     )
     print(table)
-    backbone_dir = _BACKBONE_FROM_MODEL.get(args_ns.model, args_ns.model)
+    backbone_dir = BACKBONE_FROM_MODEL.get(args_ns.model, args_ns.model)
     charts_dir = viz.make_charts_dir(
         args_ns.charts_dir,
         args_ns.mode_name,
@@ -694,27 +962,25 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
     method = viz_method()
     config_dict = viz_config(
         args_ns,
-        {
+        backbone=args_ns.backbone,
+        extra={
             "weights": os.path.basename(args_ns.weights),
             "iou_thr": float(args_ns.iou_thr),
         },
     )
     
-    viz.plot_confusion_matrix(
-        cm,
-        charts_dir,
-        method=method,
-        config=config_dict,
-        classes=list(class_names) + ["background"],
-        fname="confusion_matrix_source.png",
-    )
-    viz.plot_pr_curve(
-        scores, matched, n_gt, charts_dir, method=method, config=config_dict
-    )
-    viz.plot_recall_f1_curve(
-        scores, matched, n_gt, charts_dir, method=method, config=config_dict
-    )
-    if tgt_per_image and tgt_cm is not None:
+    run_confusion_matrix = bool(getattr(args_ns, "is_run_confusion_matrix", True))
+    run_samples_grid = bool(getattr(args_ns, "is_run_samples_grid", True))
+    if run_confusion_matrix and cm is not None:
+        viz.plot_confusion_matrix(
+            cm,
+            charts_dir,
+            method=method,
+            config=config_dict,
+            classes=list(class_names) + ["background"],
+            fname="confusion_matrix_source.png",
+        )
+    if run_confusion_matrix and tgt_per_image and tgt_cm is not None:
         viz.plot_confusion_matrix(
             tgt_cm,
             charts_dir,
@@ -723,253 +989,90 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
             classes=list(class_names) + ["background"],
             fname="confusion_matrix_target.png",
         )
-        viz.plot_pr_curve(
-            tgt_scores, tgt_matched, tgt_n_gt, charts_dir,
-            method=method, config=config_dict,
-            fname="pr_curve_target.png",
-        )
-        viz.plot_recall_f1_curve(
-            tgt_scores, tgt_matched, tgt_n_gt, charts_dir,
-            method=method, config=config_dict,
-            fname="recall_f1_target.png",
-        )
     try:
-        if _src_before_bank and _tgt_before_bank:
-            viz.plot_domain_tsne(
-                torch.cat(_src_before_bank, dim=0).numpy(),
-                torch.cat(_tgt_before_bank, dim=0).numpy(),
-                charts_dir, "tsne_before.png",
-                "CNN representations before DSFD.extract_features",
+        tsne_panels = (
+            build_layer_panels(tap_labels, src_dist.tsne, tgt_dist.tsne)
+            if run_tsne
+            else []
+        )
+        if tsne_panels:
+            viz.plot_domain_tsne_pair(
+                tsne_panels, charts_dir, TSNE_FNAME,
                 method=method, config=config_dict,
-            )
-        if _src_bank and _tgt_bank:
-            viz.plot_domain_tsne(
-                torch.cat(_src_bank, dim=0).numpy(),
-                torch.cat(_tgt_bank, dim=0).numpy(),
-                charts_dir, "tsne_after.png",
-                "CNN representations after DSFD.extract_features",
-                method=method, config=config_dict,
+                suptitle=f"{TSNE_SUPTITLE} — source view: {align_source_view}",
             )
     except Exception as e:
         print(f"[WARN] before/after t-SNE scatter failed: {e}")
 
-    try:
-        import torch.nn as _nn
-
-        _bb = getattr(net, "vgg", None)
-        if _bb is None:
-            _bb = getattr(net, "backbone", None)
-        conv_layers = (
-            [m for m in _bb.modules() if isinstance(m, _nn.Conv2d)]
-            if _bb is not None else []
+    print("[viz] rendering sample grids...")
+    gradcam = viz.make_gradcam(net) if run_samples_grid else None
+    detect_fn = lambda imgs: infer_detections_batch(
+        net, imgs,
+        conf_thr=float(args_ns.score_thr_cm),
+        nms_iou_thr=float(args_ns.nms_iou_thr),
+    )
+    n_show = max(1, int(args_ns.viz_num_samples))
+    day_items = (
+        viz.collect_grid_items(val_loader, detect_fn, class_names, n_show, gradcam)
+        if run_samples_grid and val_loader is not None
+        else []
+    )
+    if day_items:
+        viz.plot_samples_grid_3row(
+            day_items, charts_dir, "samples_day.png",
+            method=method, config=config_dict,
+            title_suffix="(source test / day)",
         )
-        if conv_layers:
-            target_layer = conv_layers[-1]
-
-            n_show = 1
-
-            def _add(items, batch, tag):
-                for i in range(batch.size(0)):
-                    if len(items) >= n_show:
-                        break
-                    items.append({
-                        "image": _bgr_chw_to_rgb_uint8(batch[i]),
-                        "tensor": batch[i:i + 1].detach().clone(),
-                        "title": f"{tag}{len(items)}",
-                    })
-
-            src_items: list = []
-            for s_b, _t, _p in val_loader:
-                if use_cuda:
-                    s_b = s_b.cuda()
-                _add(src_items, s_b / 255.0, "src")
-                if len(src_items) >= n_show:
-                    break
-
-            tgt_items: list = []
-            tgt_dir = getattr(args_ns, "target_folder4unsupervised", "")
-            if tgt_dir and os.path.isdir(tgt_dir):
-                _tds = TargetUnlabeledDataset(tgt_dir, size=cfg.INPUT_SIZE)
-                _tl = data.DataLoader(
-                    _tds, batch_size=args_ns.batch_size,
-                    shuffle=False, num_workers=0,
-                )
-                for t_b in _tl:
-                    if use_cuda:
-                        t_b = t_b.cuda()
-                    _add(tgt_items, t_b / 255.0, "tgt")
-                    if len(tgt_items) >= n_show:
-                        break
-
-            viz.plot_gradcam_comparison(
-                net, target_layer, src_items, tgt_items,
-                charts_dir,
-                fname="gradcam_source_vs_target.png",
+    if run_samples_grid and target_loader is not None:
+        night_items = viz.collect_grid_items(
+            target_loader, detect_fn, class_names, n_show, gradcam
+        )
+        if night_items:
+            viz.plot_samples_grid_3row(
+                night_items, charts_dir, "samples_real_night.png",
                 method=method, config=config_dict,
-                score_fn=lambda o: o[..., 1:].max(),
-                forward_fn=lambda m, t: m.test_forward(t)[0][4],
-                layer_name="vgg last conv",
+                title_suffix="(real target / night)",
             )
-    except Exception as e:
-        print(f"[WARN] grad-cam viz failed: {e}")
+    if gradcam is not None:
+        gradcam.remove()
 
-    try:
-        s_img = None
-        for s_b, _t, _p in val_loader:
-            if use_cuda:
-                s_b = s_b.cuda()
-            s_img = (s_b / 255.0)[0]
-            break
-        if s_img is not None:
-            save_backbone_feature_heatmap(
-                net, s_img,
-                os.path.join(charts_dir, "gf_heatmap_source.png"),
-            )
-
-        tgt_dir = getattr(args_ns, "target_folder4unsupervised", "")
-        if tgt_dir and os.path.isdir(tgt_dir):
-            _tds = TargetUnlabeledDataset(tgt_dir, size=cfg.INPUT_SIZE)
-            _tl = data.DataLoader(
-                _tds, batch_size=args_ns.batch_size,
-                shuffle=False, num_workers=0,
-            )
-            for t_b in _tl:
-                if use_cuda:
-                    t_b = t_b.cuda()
-                save_backbone_feature_heatmap(
-                    net, (t_b / 255.0)[0],
-                    os.path.join(charts_dir, "gf_heatmap_target.png"),
-                )
-                break
-        print(f"[viz] backbone feature heatmaps saved to {charts_dir}")
-    except Exception as e:
-        print(f"[WARN] backbone feature heatmap failed: {e}")
-
-    day_samples, synth_night_samples = _collect_paired_samples(
-        net,
-        val_loader,
-        args_ns.viz_num_samples,
-        float(args_ns.score_thr_cm),
-        float(args_ns.nms_iou_thr),
-        use_cuda,
-        class_names,
+    target_stats = dict(target_eval.stats)
+    target_stats.update(
+        loss=float(tgt_loss),
+        pal2_loc_loss=float(tgt_loc_loss),
+        pal2_conf_loss=float(tgt_conf_loss),
     )
-    if day_samples:
-        viz.plot_sample_predictions(
-            day_samples,
-            charts_dir,
-            "samples_day.png",
-            method=method,
-            config=config_dict,
-            title_suffix="(val / day)",
-        )
-    if synth_night_samples:
-        viz.plot_sample_predictions(
-            synth_night_samples,
-            charts_dir,
-            "samples_synth_night.png",
-            method=method,
-            config=config_dict,
-            title_suffix="(val + Dark ISP)",
-        )
-
-    if getattr(args_ns, "target_folder4unsupervised", "") and os.path.isdir(
-        args_ns.target_folder4unsupervised
-    ):
-        real_night_samples = collect_target_samples(
-            net,
-            args_ns.target_folder4unsupervised,
-            args_ns.viz_num_samples,
-            class_names,
-            conf_thr=float(args_ns.score_thr_cm),
-            nms_iou_thr=float(args_ns.nms_iou_thr),
-        )
-        if real_night_samples:
-            viz.plot_sample_predictions(
-                real_night_samples,
-                charts_dir,
-                "samples_real_night.png",
-                method=method,
-                config=config_dict,
-                title_suffix="(real target / night — qualitative)",
-            )
-
-    if target_test_file and os.path.isfile(target_test_file):
-        try:
-            tt_ds = SourceDomainDetection(target_test_file, mode="val")
-            tt_loader = data.DataLoader(
-                tt_ds,
-                args_ns.batch_size,
-                num_workers=0,
-                collate_fn=detection_collate,
-                shuffle=False,
-                pin_memory=use_cuda,
-            )
-            tt_samples: List[Dict[str, Any]] = []
-            need = max(1, int(args_ns.viz_num_samples))
-            with torch.no_grad():
-                for images, _t, img_paths in tt_loader:
-                    if use_cuda:
-                        images = images.cuda()
-                    images = images / 255.0
-                    for i in range(images.shape[0]):
-                        if len(tt_samples) >= need:
-                            break
-                        base = (
-                            os.path.basename(img_paths[i])
-                            if i < len(img_paths) else ""
-                        )
-                        tt_samples.append(
-                            _build_viz_sample(
-                                net, images[i], base,
-                                float(args_ns.score_thr_cm),
-                                float(args_ns.nms_iou_thr),
-                                class_names,
-                            )
-                        )
-                    if len(tt_samples) >= need:
-                        break
-            if tt_samples:
-                viz.plot_sample_predictions(
-                    tt_samples,
-                    charts_dir,
-                    "samples_target_test.png",
-                    method=method,
-                    config=config_dict,
-                    title_suffix="(target test — real night, with GT)",
-                )
-        except Exception as e:
-            print(f"[WARN] target-test sample viz failed: {e}")
-
-    metrics = dict(
-        accuracy=m["accuracy"],
-        precision=m["precision"],
-        recall=m["recall"],
-        f1=m["f1"],
-        mAP=float(mAP),
-        tp=m["tp"],
-        fp=m["fp"],
-        fn=m["fn"],
-        n_gt=int(n_gt),
-        iou_thr=float(args_ns.iou_thr),
-        score_thr=float(args_ns.score_thr_cm),
-        weights=str(args_ns.weights),
-        elapsed_s=elapsed,
-        target_n=len(tgt_per_image),
-        target_n_gt=int(tgt_n_gt),
-        target_loss=float(tgt_loss),
-        target_pal2_loc_loss=float(tgt_loc_loss),
-        target_pal2_conf_loss=float(tgt_conf_loss),
-        target_accuracy=float(tgt_m["accuracy"]),
-        target_precision=float(tgt_m["precision"]),
-        target_recall=float(tgt_m["recall"]),
-        target_f1=float(tgt_m["f1"]),
-        target_mAP=float(tgt_mAP),
-        target_tp=int(tgt_m["tp"]),
-        target_fp=int(tgt_m["fp"]),
-        target_fn=int(tgt_m["fn"]),
-        target_test_file=str(tgt_source_desc or ""),
-    )
+    metrics = {
+        "combined": combined_eval.stats,
+        "source": source_eval.stats,
+        "target": target_stats,
+        "setup": {
+            "weights": str(args_ns.weights),
+            "iou_thr": float(args_ns.iou_thr),
+            "score_thr": float(args_ns.score_thr_cm),
+            "nms_iou_thr": float(args_ns.nms_iou_thr),
+            "batch_size": int(args_ns.batch_size),
+            "nc": int(args_ns.nc),
+            "class_names": list(class_names),
+            "source_test_files": list(eval_files),
+            "target_test_files": list(tgt_source_desc),
+            "align_source_view": align_source_view,
+            "night_synthesis": night_synthesis,
+        },
+        "model": param_stats,
+        "speed": {
+            "elapsed_s": float(elapsed),
+            "fps_end2end": float(fps_end2end),
+            "throughput_img_s": float(throughput_img_s),
+            "latency_ms_per_img": float(latency_ms),
+            "infer_s": float(infer_s),
+            "n_imgs_timed": int(n_imgs_timed),
+        },
+        "domain_gap": {
+            k: (int(v) if k.endswith("_n") else float(v))
+            for k, v in dist_stats.items()
+        },
+    }
     with open(os.path.join(charts_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
@@ -979,152 +1082,70 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         backbone_dir,
     )
     os.makedirs(rec_dir, exist_ok=True)
-    rec_path = os.path.join(rec_dir, f"{args_ns.num_exp}_test.csv")
-    import csv as _csv
+    rec_path = os.path.join(rec_dir, f"{args_ns.num_exp}_test.jsonl")
     import datetime as _dt
 
-    _tot_cnt = max(m["tp"] + m["fp"] + m["fn"], 1)
-    stat_keys = [
-        "kl_mean", "kl_median", "kl_std", "kl_p10", "kl_p90",
-        "ce_mean", "ce_median", "ce_std", "ce_p10", "ce_p90",
-    ]
-    cols = [
-        "timestamp", "weights", "n_samples", "n_gt",
-        "accuracy", "precision", "recall", "f1", "mAP",
-        "tp", "fp", "fn", "tp_norm", "fp_norm", "fn_norm",
-        "target_n", "target_n_gt",
-        "target_loss", "target_pal2_loc_loss", "target_pal2_conf_loss",
-        "target_accuracy", "target_precision", "target_recall",
-        "target_f1", "target_mAP",
-        "target_tp", "target_fp", "target_fn",
-        "target_tp_norm", "target_fp_norm", "target_fn_norm",
-        *stat_keys,
-        "iou_thr", "score_thr", "elapsed_s",
-    ]
+    def _prefixed(stats: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+        return {f"{prefix}{k}": v for k, v in stats.items()}
+
     row = {
         "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
-        "weights": os.path.basename(args_ns.weights),
-        "n_samples": len(val_ds),
-        "n_gt": int(n_gt),
-        "accuracy": f"{m['accuracy']:.6f}",
-        "precision": f"{m['precision']:.6f}",
-        "recall": f"{m['recall']:.6f}",
-        "f1": f"{m['f1']:.6f}",
-        "mAP": f"{float(mAP):.6f}",
-        "tp": m["tp"], "fp": m["fp"], "fn": m["fn"],
-        "tp_norm": f"{m['tp'] / _tot_cnt:.6f}",
-        "fp_norm": f"{m['fp'] / _tot_cnt:.6f}",
-        "fn_norm": f"{m['fn'] / _tot_cnt:.6f}",
-        "target_n": len(tgt_per_image),
-        "target_n_gt": int(tgt_n_gt),
-        "target_loss": f"{tgt_loss:.6f}",
-        "target_pal2_loc_loss": f"{tgt_loc_loss:.6f}",
-        "target_pal2_conf_loss": f"{tgt_conf_loss:.6f}",
-        "target_accuracy": f"{tgt_m['accuracy']:.6f}",
-        "target_precision": f"{tgt_m['precision']:.6f}",
-        "target_recall": f"{tgt_m['recall']:.6f}",
-        "target_f1": f"{tgt_m['f1']:.6f}",
-        "target_mAP": f"{float(tgt_mAP):.6f}",
-        "target_tp": tgt_m["tp"],
-        "target_fp": tgt_m["fp"],
-        "target_fn": tgt_m["fn"],
-        "target_tp_norm": f"{tgt_m['tp'] / _t_tot:.6f}",
-        "target_fp_norm": f"{tgt_m['fp'] / _t_tot:.6f}",
-        "target_fn_norm": f"{tgt_m['fn'] / _t_tot:.6f}",
-        **{k: f"{dist_stats.get(k, 0.0):.6f}" for k in stat_keys},
-        "iou_thr": float(args_ns.iou_thr),
-        "score_thr": float(args_ns.score_thr_cm),
-        "elapsed_s": f"{elapsed:.2f}",
+        "n_samples": n_val,
+        **metrics["setup"],
+        **metrics["speed"],
+        **param_stats,
+        **_prefixed(metrics["source"], ""),
+        **_prefixed(target_stats, "target_"),
+        **_prefixed(combined_eval.stats, "combined_"),
+        **{k: round(float(v), 6) for k, v in dist_stats.items()},
     }
-    is_new = not os.path.exists(rec_path)
-    with open(rec_path, "a", newline="") as f:
-        w = _csv.DictWriter(f, fieldnames=cols)
-        if is_new:
-            w.writeheader()
-        w.writerow(row)
+    with open(rec_path, "a") as f:
+        f.write(json.dumps(row, default=str) + "\n")
 
     print(f"[viz] charts saved to {charts_dir}")
-    print(f"[metrics] f1/precision/recall appended to {rec_path}")
+    print(f"[metrics] appended to {rec_path}")
     return metrics
 
-def _build_viz_sample(
-    net: torch.nn.Module,
-    tensor_chw_01: torch.Tensor,
-    title: str,
-    conf_thr: float,
-    nms_iou_thr: float,
-    class_names: Sequence[str],
-) -> Dict[str, Any]:
-    pb, ps, pl = infer_detections(
-        net, tensor_chw_01, conf_thr=conf_thr, nms_iou_thr=nms_iou_thr
-    )
-    labels = [
-        class_names[c - 1] if class_names and 1 <= c <= len(class_names) else str(c)
-        for c in pl
-    ]
-    return {
-        "image": _bgr_chw_to_rgb_uint8(tensor_chw_01),
-        "boxes": pb,
-        "scores": ps,
-        "labels": labels,
-        "title": title,
-    }
+def setup_logging(
+    architecture: str, backbone: str, num_exp: str, args_ns: argparse.Namespace
+) -> str:
+    import datetime as _dt
 
-def _collect_paired_samples(
-    net: torch.nn.Module,
-    val_loader: data.DataLoader,
-    n_show: int,
-    conf_thr: float,
-    nms_iou_thr: float,
-    use_cuda: bool,
-    class_names: Sequence[str] = (),
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    day: List[Dict[str, Any]] = []
-    synth: List[Dict[str, Any]] = []
-    if n_show <= 0:
-        return (day, synth)
-    with torch.no_grad():
-        for images, _targets, img_paths in val_loader:
-            if use_cuda:
-                images = images.cuda()
-            images = images / 255.0
-            img_dark = build_dark_batch(images)
-            for i in range(images.shape[0]):
-                base = os.path.basename(img_paths[i]) if i < len(img_paths) else ""
-                if len(day) < n_show:
-                    day.append(
-                        _build_viz_sample(
-                            net, images[i], base, conf_thr, nms_iou_thr, class_names
-                        )
-                    )
-                if len(synth) < n_show:
-                    synth.append(
-                        _build_viz_sample(
-                            net,
-                            img_dark[i],
-                            f"synth/{base}",
-                            conf_thr,
-                            nms_iou_thr,
-                            class_names,
-                        )
-                    )
-            if len(day) >= n_show and len(synth) >= n_show:
-                break
-    return (day, synth)
+    from utils.tee import Tee
+
+    log_root = str(getattr(args_ns, "log_dir", None) or "logs")
+    log_dir = os.path.join(log_root, architecture, backbone)
+    os.makedirs(log_dir, exist_ok=True)
+    ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(log_dir, f"{ts}_{num_exp}_test.log")
+    fh = open(path, "a", buffering=1, encoding="utf-8")
+    fh.write(f"# RAILIGHT evaluation log - {_dt.datetime.now().isoformat()}\n")
+    fh.write(f"# args: {vars(args_ns)}\n")
+    _sys.stdout = Tee(_sys.stdout, fh)
+    _sys.stderr = Tee(_sys.stderr, fh)
+    print(f"[log] writing to {path}")
+    return path
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser("DAI-Net evaluation driven by a YAML config.")
+    p = argparse.ArgumentParser("RAILIGHT evaluation driven by a YAML config.")
     p.add_argument(
         "--config",
         required=True,
         type=str,
-        help="Path to YAML config, e.g. configs/test/dai_net/vgg16/exp1.yaml",
+        help="Path to YAML config, e.g. configs/test/railight/vgg16/exp1.yaml",
     )
     cli = p.parse_args()
     return load_test_config(cli.config)
 
 def main() -> None:
     args_ns = parse_args()
+    data_cfg = apply_input_config(args_ns)
+    da_cfg = apply_damamba_config(args_ns)
+    backbone_dir = BACKBONE_FROM_MODEL.get(args_ns.model, args_ns.model)
+    setup_logging(args_ns.architecture, backbone_dir, args_ns.num_exp, args_ns)
+    print(f"[data] geometry config: {data_cfg}")
+    if da_cfg.get("ENABLED"):
+        print(f"[da-align] {da_cfg}")
     evaluate(args_ns)
 
 if __name__ == "__main__":

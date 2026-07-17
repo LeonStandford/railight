@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
-from .dai_net import build_net_dark
-from .dainet.constants import MODEL_FROM_ARCH_BACKBONE
+from .railight.net import build_net_dark
+from .railight.constants import MODEL_FROM_ARCH_BACKBONE
 from .dsfd_resnet import build_net_resnet
 from .dsfd_vgg import build_net_vgg
 
@@ -12,7 +12,7 @@ Weights = Union[str, bool, None]
 
 PHASES: Tuple[str, ...] = ("train", "test")
 VGG_BASENET: str = "vgg16_reducedfc.pth"
-DEFAULT_ARCHITECTURE: str = "dai_net"
+DEFAULT_ARCHITECTURE: str = "railight"
 DEFAULT_BACKBONE: str = "vgg16"
 AUTO_WEIGHTS: Tuple[Weights, ...] = ("auto", None)
 

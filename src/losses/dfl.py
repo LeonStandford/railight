@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -65,21 +65,25 @@ class FocalLoss(nn.Module):
 
 
 def compute_focal_alpha(
-    list_file: str, num_classes: int, bg_weight: float = 0.25
+    list_file: Union[str, Sequence[str]],
+    num_classes: int,
+    bg_weight: float = 0.25,
 ) -> Optional[torch.Tensor]:
 
     try:
         counts = np.zeros(num_classes, dtype=np.float64)
-        with open(list_file) as f:
-            for line in f:
-                p = line.split()
-                if len(p) < 2:
-                    continue
-                n = int(p[1])
-                for i in range(n):
-                    c = int(p[6 + 5 * i])
-                    if 0 < c < num_classes:
-                        counts[c] += 1
+        paths = [list_file] if isinstance(list_file, str) else list(list_file)
+        for path in paths:
+            with open(path) as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) < 2:
+                        continue
+                    n = int(p[1])
+                    for i in range(n):
+                        c = int(p[6 + 5 * i])
+                        if 0 < c < num_classes:
+                            counts[c] += 1
         fg = counts[1:]
         if fg.sum() == 0:
             return None
