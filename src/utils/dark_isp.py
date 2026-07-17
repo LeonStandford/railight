@@ -23,6 +23,11 @@ _RGB2XYZ = torch.tensor(
 )
 
 
+def build_dark_batch(images):
+    """Turn a batch of daylight images into synthetic low-light ones."""
+    return run_batch_run_low_illumination_degrading(images)
+
+
 @torch.no_grad()
 def run_batch_run_low_illumination_degrading(imgs):
     device = imgs.device
