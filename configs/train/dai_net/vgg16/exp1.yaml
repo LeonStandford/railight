@@ -30,6 +30,7 @@ names: ['crack', 'missing_items', 'broken_sleeper']
 
 save_folder: weights/
 charts_dir:  ./charts
+records_dir: ./records
 resume: false
 
 viz_num_samples: 6
@@ -38,6 +39,8 @@ viz_full_every_epochs: 1
 
 kl_loss_weight: 1.0
 target_loss_weight: 0.05
+is_use_supervised_target_loss: false
+supervised_target_loss_weight: 1.0
 
 box_loss: smooth_l1
 

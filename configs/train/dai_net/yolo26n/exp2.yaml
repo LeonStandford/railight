@@ -10,7 +10,7 @@ lr: 5.0e-4
 momentum: 0.9
 weight_decay: 1e-6
 gamma: 0.1
-epochs: 100
+epochs: 1
 max_steps: 340000
 lr_steps: [170000, 250000, 310000]
 optimizer: muon
@@ -21,7 +21,7 @@ stal_ref_area: 0.02
 stal_max_w: 4.0
 
 cuda: true
-gpu_ids: 0,1
+gpu_ids: 5,7
 num_workers: 2
 local_rank: 0
 
@@ -38,15 +38,18 @@ names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 
 
 kl_loss_weight: 1.0
 target_loss_weight: 0.1
+is_use_supervised_target_loss: false
+supervised_target_loss_weight: 1.0
 mutual_loss_weight: 0.5
 
-pseudo_weight: 1.0
-pseudo_conf: 0.8           # teacher confidence floor for a detection -> pseudo GT
+pseudo_weight: 0.4         # gentle: pseudo was collapsing target recall at weight 1.0
+pseudo_conf: 0.7           # teacher confidence floor (lower = more, less-sparse pseudo GT)
+pseudo_cls_weight: 0.25    # down-weight pseudo classification loss (avoids "all background")
 pseudo_start_iters: 15000  # burn-in: student trains supervised-only until here
 pseudo_nms_iou: 0.5
 ema_decay: 0.9996          # teacher = 0.9996*teacher + 0.0004*student per step
 pseudo_strong_aug: true    # student sees photometric-jittered target
-pseudo_ramp_iters: 1000    # ease the pseudo loss in over 1000 iters after burn-in
+pseudo_ramp_iters: 2000    # ease the pseudo loss in over 2000 iters after burn-in
 
 focal_enabled: true
 focal_gamma: 2.0
@@ -68,6 +71,7 @@ wandb_project: uda-rdd-idayolo
 
 save_folder: weights/
 charts_dir:  ./charts
+records_dir: ./records
 resume: true
 
 val_every_epochs: 3
