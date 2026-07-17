@@ -30,6 +30,7 @@ names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 
 
 save_folder: weights/
 charts_dir:  ./charts
+records_dir: ./records
 resume: true
 
 viz_num_samples: 6
@@ -38,6 +39,8 @@ viz_full_every_epochs: 1
 
 kl_loss_weight: 1.0
 target_loss_weight: 0.1
+is_use_supervised_target_loss: false
+supervised_target_loss_weight: 1.0
 
 focal_enabled: true
 focal_gamma: 2.0
