@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import glob
+import os
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
+from PIL import Image
 
 from data.config import cfg
+from utils.augmentations import to_chw_bgr
 from utils.nms import multiclass_nms
 
 __all__ = [
@@ -17,7 +21,61 @@ __all__ = [
     "infer_detections_batch",
     "build_pseudo_targets",
     "_decode_per_image",
+    "collect_target_samples",
 ]
+
+IMAGE_SUFFIXES: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+def collect_target_samples(
+    net: torch.nn.Module,
+    target_source: Any,
+    n_show: int,
+    class_names: Sequence[str] = (),
+    conf_thr: float = 0.5,
+    nms_iou_thr: float = 0.35,
+) -> List[Dict[str, Any]]:
+    """Run detection on target images and return samples ready for plotting.
+
+    ``target_source`` is either a folder path or an iterable of image paths.
+    """
+    if isinstance(target_source, str):
+        if not os.path.isdir(target_source):
+            return []
+        candidates = [
+            p for p in sorted(glob.glob(os.path.join(target_source, "*")))
+            if p.lower().endswith(IMAGE_SUFFIXES)
+        ]
+    else:
+        candidates = [p for p in (target_source or []) if p]
+
+    samples: List[Dict[str, Any]] = []
+    for path in candidates[:n_show]:
+        img = (
+            Image.open(path)
+            .convert("RGB")
+            .resize((cfg.INPUT_SIZE, cfg.INPUT_SIZE), Image.BILINEAR)
+        )
+        rgb = np.asarray(img, dtype=np.float32)
+        tensor = torch.from_numpy((to_chw_bgr(rgb) / 255.0).copy()).float().cuda()
+
+        boxes, scores, labels = infer_detections(
+            net, tensor, conf_thr=conf_thr, nms_iou_thr=nms_iou_thr
+        )
+        text_labels = (
+            [class_names[c - 1] for c in labels] if class_names
+            else [str(c) for c in labels]
+        )
+        samples.append(
+            {
+                "image": np.asarray(img).astype(np.uint8),
+                "boxes": boxes,
+                "scores": scores,
+                "labels": text_labels,
+                "title": os.path.basename(path),
+            }
+        )
+    return samples
 
 
 def _inner_net(net: torch.nn.Module) -> torch.nn.Module:
