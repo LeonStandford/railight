@@ -43,11 +43,12 @@ from data.target_domain import (
 )
 from layers.modules import EnhanceLoss, MultiBoxLoss
 from layers.modules.enhance_loss import smooth as retinex_smooth
+from losses.align import apply_align_config
 from losses.dfl import FocalLoss, compute_focal_alpha, init_focal_bias
 from losses.weight_reg import snapshot_wreg_ref, weight_reg_loss
 from models.enhancer import RetinexNet
 from models.factory import basenet_factory, build_net
-from dainet.constants import (
+from railight.constants import (
     CHECKPOINT_LATEST,
     CHECKPOINT_BEST,
     RETINEX_WEIGHTS,
@@ -59,6 +60,7 @@ from dainet.constants import (
 )
 from utils import visualize as viz
 from utils.dark_isp import build_dark_batch
+from utils.flops import measure_gflops
 from utils.metrics import detect_metrics_from_cm
 from utils.reporting import format_val_table, viz_config, viz_method
 from utils.predict import (
@@ -71,7 +73,8 @@ from utils.predict import (
     infer_detections,
     infer_detections_batch,
 )
-from utils.constants import _TRAIN_DEFAULTS, _WANDB_EPOCH_KEYS
+from utils.checkpoint import load_detector_state_dict
+from utils.constants import SOURCE_VIEWS, _TRAIN_DEFAULTS, _WANDB_EPOCH_KEYS
 from utils.tee import Tee
 from utils.wandb_logger import WandbLogger, load_env_file
 
@@ -86,7 +89,7 @@ _MODEL_FROM_ARCH_BACKBONE = MODEL_FROM_ARCH_BACKBONE
 
 def resolve_arch_and_backbone(args_ns: argparse.Namespace) -> Tuple[str, str]:
     arch = args_ns.architecture or _DEFAULT_ARCH_FROM_MODEL.get(
-        args_ns.model, "dai_net"
+        args_ns.model, "railight"
     )
     backbone = _BACKBONE_FROM_MODEL.get(args_ns.model, args_ns.model)
     return (arch, backbone)
@@ -126,27 +129,8 @@ def _measure_gflops(
     net: torch.nn.Module, input_size: int, device: Any
 ) -> Dict[str, Any]:
     inner = net.module if hasattr(net, "module") else net
-    out: Dict[str, Any] = {
-        "gflops_forward": 0.0,
-        "flops_input_size": int(input_size),
-        "flops_note": "1x3xSxS through test_forward, torch.utils.flop_counter",
-    }
-    try:
-        from torch.utils.flop_counter import FlopCounterMode
 
-        was_training = inner.training
-        inner.eval()
-        x = torch.zeros(1, 3, input_size, input_size, device=device)
-        counter = FlopCounterMode(display=False)
-        with counter, torch.no_grad():
-            inner.test_forward(x)
-        out["gflops_forward"] = float(counter.get_total_flops()) / 1e9
-        if was_training:
-            inner.train()
-    except Exception as e:
-        out["flops_note"] = f"measurement failed: {type(e).__name__}: {e}"
-        print(f"[WARN] FLOPs measurement failed: {type(e).__name__}: {e}")
-    return out
+    return measure_gflops(inner, inner.test_forward, input_size, device)
 
 def _memory_usage() -> Dict[str, float]:
     stats: Dict[str, float] = {
@@ -268,12 +252,12 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
     return argparse.Namespace(**merged)
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser("DAI-Net training driven by a YAML config.")
+    p = argparse.ArgumentParser("RAILIGHT training driven by a YAML config.")
     p.add_argument(
         "--config",
         required=True,
         type=str,
-        help="Path to YAML config, e.g. configs/train/dai_net/vgg16/exp1.yaml",
+        help="Path to YAML config, e.g. configs/train/railight/vgg16/exp1.yaml",
     )
     cli = p.parse_args()
     return load_yaml_config(cli.config, mode="train")
@@ -281,12 +265,13 @@ def parse_args() -> argparse.Namespace:
 def setup_logging(
     architecture: str, backbone: str, num_exp: str, args_ns: argparse.Namespace
 ) -> Optional[str]:
-    log_dir = os.path.join("logs", architecture, backbone)
+    log_root = str(getattr(args_ns, "log_dir", None) or "logs")
+    log_dir = os.path.join(log_root, architecture, backbone)
     os.makedirs(log_dir, exist_ok=True)
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(log_dir, f"{ts}_{num_exp}.log")
     fh = open(path, "a", buffering=1, encoding="utf-8")
-    fh.write(f"# DAI-Net training log - {_dt.datetime.now().isoformat()}\n")
+    fh.write(f"# RAILIGHT training log - {_dt.datetime.now().isoformat()}\n")
     fh.write(f"# args: {vars(args_ns)}\n")
     sys.stdout = Tee(sys.stdout, fh)
     sys.stderr = Tee(sys.stderr, fh)
@@ -322,7 +307,7 @@ def teardown_distributed() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
-def _paths_from_dainet_txt(*txt_files: Optional[str]) -> List[str]:
+def _paths_from_railight_txt(*txt_files: Optional[str]) -> List[str]:
     seen: set = set()
     out: List[str] = []
     for f in txt_files:
@@ -389,7 +374,7 @@ def build_data_loaders(
         # which would leak the evaluation labels into training here.
         target_ds = SourceDomainDetection(target_train_file, mode="train")
     else:
-        target_paths = _paths_from_dainet_txt(
+        target_paths = _paths_from_railight_txt(
             getattr(args_ns, "target_train_file", None),
             getattr(args_ns, "target_val_file", None),
             getattr(args_ns, "target_test_file", None),
@@ -623,6 +608,8 @@ def history_factory() -> History:
         "val_f1": [],
         "val_map": [],
         "val_kl_st": [],
+        "val_align_mmd": [],
+        "val_align_gap": [],
         "val_entropy": [],
         "train_precision": [],
         "train_recall": [],
@@ -681,6 +668,8 @@ def _history_from_records(train_jsonl: str, val_jsonl: str) -> History:
             ("f1", "val_f1"),
             ("mAP", "val_map"),
             ("val_kl_st", "val_kl_st"),
+            ("val_align_mmd", "val_align_mmd"),
+            ("val_align_gap", "val_align_gap"),
             ("val_entropy", "val_entropy"),
             ("target_val_loss", "target_val_loss"),
             ("target_precision", "target_precision"),
@@ -863,10 +852,11 @@ class TrainingContext:
         self.teacher: Optional[torch.nn.Module] = None
         self.wandb = WandbLogger(
             enabled=bool(getattr(args_ns, "use_wandb", False)) and local_rank == 0,
-            project=str(getattr(args_ns, "wandb_project", "dainet-railway")),
+            project=str(getattr(args_ns, "wandb_project", "railight-railway")),
             run_name=f"{self.architecture}/{self.backbone}/{args_ns.num_exp}",
             config=vars(args_ns),
             entity=getattr(args_ns, "wandb_entity", None),
+            dir=getattr(args_ns, "wandb_dir", None),
         )
 
     def next_target_batch(
@@ -1130,6 +1120,28 @@ def ema_update(
             t_bufs[name].copy_(b)
 
 
+SourceView = Tuple[str, torch.Tensor, torch.Tensor]
+
+
+def align_source_views(
+    source_view: str,
+    source_images: torch.Tensor,
+    source_illumination: torch.Tensor,
+    source_dark: torch.Tensor,
+    source_dark_illumination: torch.Tensor,
+) -> List[SourceView]:
+    if source_view not in SOURCE_VIEWS:
+        raise ValueError(
+            f"align_source_view must be one of {list(SOURCE_VIEWS)}, "
+            f"got {source_view!r}"
+        )
+
+    light = ("light", source_images, source_illumination)
+    dark = ("dark", source_dark, source_dark_illumination)
+
+    return {"light": [light], "dark": [dark], "both": [dark, light]}[source_view]
+
+
 def strong_photometric_aug(images: torch.Tensor) -> torch.Tensor:
     b, dev = images.size(0), images.device
 
@@ -1238,6 +1250,9 @@ def validate(
     pbar.close()
     kl_sum = torch.tensor(0.0, device="cuda")
     ent_sum = torch.tensor(0.0, device="cuda")
+    mmd_sum = torch.tensor(0.0, device="cuda")
+    gap_sum = torch.tensor(0.0, device="cuda")
+    per_tap_gap: Dict[str, float] = {}
     dom_step = 0
     net_inner = net.module if hasattr(net, "module") else net
     enh_inner = net_enh.module if hasattr(net_enh, "module") else net_enh
@@ -1269,11 +1284,22 @@ def validate(
                 if n == 0:
                     continue
                 s_imgs, t_imgs = (s_imgs[:n], t_imgs[:n])
-                _, I_s = enh_inner(s_imgs)
+                s_view = (
+                    build_dark_batch(s_imgs)
+                    if net_inner.align_spec.source_view != "light"
+                    else s_imgs
+                )
+                _, I_s = enh_inner(s_view)
                 _, I_t = enh_inner(t_imgs)
                 _, _, kl = net_inner.extract_features(
-                    s_imgs, t_imgs, I_s.detach(), I_t.detach()
+                    s_view, t_imgs, I_s.detach(), I_t.detach()
                 )
+                gap_stats = net_inner.domain_gap(s_view, t_imgs)
+                mmd_sum += float(gap_stats["mmd"])
+                gap_sum += float(gap_stats["gap"])
+                for key, value in gap_stats.items():
+                    if key.endswith("_gap"):
+                        per_tap_gap[key] = per_tap_gap.get(key, 0.0) + value
                 out_t, _ = net_inner.test_forward(t_imgs)
                 conf_t = out_t[4]
                 p_t = F.softmax(conf_t, dim=-1)
@@ -1290,7 +1316,9 @@ def validate(
     dist.reduce(conf_sum, 0, op=dist.ReduceOp.SUM)
     dist.reduce(kl_sum, 0, op=dist.ReduceOp.SUM)
     dist.reduce(ent_sum, 0, op=dist.ReduceOp.SUM)
-    
+    dist.reduce(mmd_sum, 0, op=dist.ReduceOp.SUM)
+    dist.reduce(gap_sum, 0, op=dist.ReduceOp.SUM)
+
     if vprof_on:
         _vlap("val_reduce")
     n_gpus = max(torch.cuda.device_count(), 1)
@@ -1301,7 +1329,12 @@ def validate(
     dom_denom = max(dom_step, 1) * n_gpus
     val_kl_st = (kl_sum / dom_denom).item()
     val_entropy = (ent_sum / dom_denom).item()
-    
+    val_align_mmd = (mmd_sum / dom_denom).item()
+    val_align_gap = (gap_sum / dom_denom).item()
+    tap_gap_report = " ".join(
+        f"{k[:-4]}={v / max(dom_step, 1):.3f}" for k, v in sorted(per_tap_gap.items())
+    )
+
     if not is_rank0:
         net.train()
         return None
@@ -1441,7 +1474,10 @@ def validate(
             ),
             ("Target n images", f"{len(target_per_image)}"),
             ("§", "Domain adaptation"),
-            ("KL divergence (source vs target)", f"{val_kl_st:.4f}"),
+            ("Alignment loss (source vs target)", f"{val_kl_st:.4f}"),
+            ("Embedding MMD (0 = overlapping)", f"{val_align_mmd:.4f}"),
+            ("Embedding gap, std units (<0.2 = overlapping)", f"{val_align_gap:.4f}"),
+            ("Per-tap gap", tap_gap_report or "n/a"),
             ("Target detection entropy", f"{val_entropy:.4f}"),
             ("§", "Timing"),
             ("Elapsed (seconds)", f"{elapsed:.2f}"),
@@ -1456,6 +1492,8 @@ def validate(
     ctx.history["val_map"].append((epoch, float(mAP)))
     ctx.history["val_kl_st"].append((epoch, float(val_kl_st)))
     ctx.history["val_entropy"].append((epoch, float(val_entropy)))
+    ctx.history["val_align_mmd"].append((epoch, float(val_align_mmd)))
+    ctx.history["val_align_gap"].append((epoch, float(val_align_gap)))
     
     _append_record_row(
         ctx.val_records_path,
@@ -1473,6 +1511,8 @@ def validate(
             "fp": int(m["fp"]),
             "fn": int(m["fn"]),
             "val_kl_st": round(float(val_kl_st), 6),
+            "val_align_mmd": round(float(val_align_mmd), 6),
+            "val_align_gap": round(float(val_align_gap), 6),
             "val_entropy": round(float(val_entropy), 6),
             "target_val_loss": round(float(tgt_val_loss), 6),
             "target_val_pal2_loc": round(float(tgt_val_loc), 6),
@@ -1614,9 +1654,9 @@ def train_one_epoch(
     )
     
     net_inner = net.module if hasattr(net, "module") else net
-    prof_iters = int(os.environ.get("DAINET_PROFILE_ITERS", "0") or "0")
+    prof_iters = int(os.environ.get("RAILIGHT_PROFILE_ITERS", "0") or "0")
 
-    prof_full = os.environ.get("DAINET_PROFILE", "1").strip().lower() not in (
+    prof_full = os.environ.get("RAILIGHT_PROFILE", "1").strip().lower() not in (
         "0", "false", "no", "off",
     )
     
@@ -1716,17 +1756,29 @@ def train_one_epoch(
             _lap("loss_det_pal2")
         loss_kl_src_tgt = torch.zeros((), device=source_images.device)
         R_target_train = None
-        
-        if has_target:
+        align_parts: Dict[str, torch.Tensor] = {}
 
-            _, _, loss_kl_src_tgt, R_target_train = net_inner.extract_features(
-                source_images, target_images,
-                I_source.detach(), I_target.detach(),
-                return_reflectance=True,
+        if has_target:
+            views = align_source_views(
+                net_inner.align_spec.source_view,
+                source_images, I_source, source_dark, I_source_dark,
             )
-            
+            for view_name, view_images, view_illum in views:
+                _, _, view_loss, R_target_train, view_parts = (
+                    net_inner.extract_features(
+                        view_images, target_images,
+                        view_illum.detach(), I_target.detach(),
+                        return_reflectance=True,
+                        return_parts=True,
+                    )
+                )
+                loss_kl_src_tgt = loss_kl_src_tgt + view_loss / len(views)
+                align_parts.update(
+                    {f"{view_name}/{k}": v for k, v in view_parts.items()}
+                )
+
             loss_kl_src_tgt = loss_kl_src_tgt * kl_loss_weight * prog
-            
+
         if prof_active:
             _lap("loss_kl")
             
@@ -1970,6 +2022,10 @@ def train_one_epoch(
                             f"train_iter/{k}": float(v.detach())
                             for k, v in loss_components.items()
                         },
+                        **{
+                            f"align/{k}": float(v)
+                            for k, v in align_parts.items()
+                        },
                     }
                 )
 
@@ -2041,7 +2097,7 @@ def evaluate_target_test(
     best_path = os.path.join(ctx.save_folder, CHECKPOINT_BEST)
     if os.path.isfile(best_path):
         state = torch.load(best_path, map_location="cuda", weights_only=False)
-        dsfd_net.load_state_dict(state)
+        load_detector_state_dict(dsfd_net, state)
         print(f"[test] loaded {best_path} for target-test eval")
     net.eval()
     
@@ -2117,6 +2173,8 @@ def train(ctx: TrainingContext) -> None:
     if args_ns.lr_steps:
         cfg.LR_STEPS = tuple((int(s) for s in args_ns.lr_steps))
         
+    if hasattr(cfg, "ALIGN"):
+        apply_align_config(cfg.ALIGN, args_ns)
     if hasattr(cfg, "FOCAL"):
         cfg.FOCAL.ENABLED = bool(getattr(args_ns, "focal_enabled", cfg.FOCAL.ENABLED))
         cfg.FOCAL.GAMMA = float(getattr(args_ns, "focal_gamma", cfg.FOCAL.GAMMA))
@@ -2142,6 +2200,12 @@ def train(ctx: TrainingContext) -> None:
             or getattr(args_ns, "backbone_weights", "auto")
         ),
     )
+    if ctx.local_rank == 0 and hasattr(dsfd_net, "align_spec"):
+        print(
+            dsfd_net.align_spec.describe(
+                dsfd_net.align_tap_labels, dsfd_net.align_tap_dims
+            )
+        )
     net = dsfd_net
     net_enh = RetinexNet()
     retinex_path = os.path.join(args_ns.save_folder, RETINEX_WEIGHTS)
@@ -2369,13 +2433,13 @@ def _peek_architecture(config_path: str) -> str:
     return str(arch or "").lower()
 
 def main() -> None:
-    p = argparse.ArgumentParser("Unified DAI-Net / YOLO trainer (YAML-driven)")
+    p = argparse.ArgumentParser("Unified RAILIGHT / YOLO trainer (YAML-driven)")
     p.add_argument("--config", required=True, type=str)
     cli = p.parse_args()
 
     arch = _peek_architecture(cli.config)
     if arch.startswith("yolo"):
-        from dainet.yolo_runner import run_from_config
+        from railight.yolo_runner import run_from_config
 
         run_from_config(cli.config)
         return

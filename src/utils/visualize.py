@@ -132,7 +132,7 @@ def _save(fig: Figure, path: str) -> str:
 def plot_losses(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     x_key: str = "iter",
 ) -> Optional[str]:
@@ -257,7 +257,7 @@ def plot_train_vs_val(
     train_pts: Sequence[Point],
     val_pts: Sequence[Point],
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "train_vs_val.png",
 ) -> Optional[str]:
@@ -302,7 +302,7 @@ def plot_train_vs_val(
 def plot_train_val_metrics(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "train_val_metrics.png",
 ) -> Optional[str]:
@@ -366,7 +366,7 @@ def plot_train_val_metrics(
 def plot_confusion_matrix(
     cm: np.ndarray,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     classes: Sequence[str] = ("object", "background"),
     normalize: bool = True,
@@ -433,7 +433,7 @@ def plot_pr_curve(
     matched: np.ndarray,
     n_gt: int,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "pr_curve.png",
 ) -> Tuple[str, float]:
@@ -458,7 +458,7 @@ def plot_recall_f1_curve(
     matched: np.ndarray,
     n_gt: int,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "recall_f1.png",
 ) -> str:
@@ -502,7 +502,7 @@ def plot_test_distributions(
     kl_vals,
     ce_vals,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "test_distributions.png",
     feat_before_day=None,
@@ -615,7 +615,7 @@ def plot_tsne_features(
     class_names: Sequence[str],
     out_dir: str,
     fname: str = "tsne_source_features.png",
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
 ) -> Optional[str]:
     feats = np.asarray(feats, dtype=np.float32)
@@ -676,7 +676,7 @@ def plot_domain_tsne(
     out_dir: str,
     fname: str,
     subject: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     cap_per_domain: int = 1500,
 ) -> Optional[str]:
@@ -699,10 +699,47 @@ def plot_domain_tsne(
     )
     return _save(fig, os.path.join(out_dir, fname))
 
+def plot_domain_tsne_pair(
+    panels: Sequence[Tuple[str, Optional[np.ndarray], Optional[np.ndarray]]],
+    out_dir: str,
+    fname: str,
+    method: str = "RAILIGHT",
+    config: Config = None,
+    cap_per_domain: int = 1500,
+    suptitle: Optional[str] = None,
+) -> Optional[str]:
+    prepared: List[Tuple[str, np.ndarray, int, Any]] = []
+    for subject, feats_src, feats_tgt in panels:
+        if feats_src is None or feats_tgt is None:
+            continue
+        s = np.asarray(feats_src, dtype=np.float32).reshape(len(feats_src), -1)
+        t = np.asarray(feats_tgt, dtype=np.float32).reshape(len(feats_tgt), -1)
+        if s.shape[0] == 0 or t.shape[0] == 0:
+            continue
+        s = _subsample(s, cap_per_domain, seed=0)
+        t = _subsample(t, cap_per_domain, seed=1)
+        xy, proj = _project_2d(np.concatenate([s, t], axis=0))
+        mn = xy.min(axis=0, keepdims=True)
+        mx = xy.max(axis=0, keepdims=True)
+        prepared.append((subject, (xy - mn) / (mx - mn + 1e-9), len(s), proj))
+    if not prepared:
+        return None
+    fig, axes = plt.subplots(
+        1, len(prepared), figsize=(9.5 * len(prepared), 8), squeeze=False
+    )
+    for ax, (subject, xy, n_src, proj) in zip(axes[0], prepared):
+        _domain_scatter(
+            ax, xy, n_src, proj, _compose_title(method, subject, config)
+        )
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=14, fontweight="bold")
+        fig.subplots_adjust(top=0.88)
+    return _save(fig, os.path.join(out_dir, fname))
+
 def plot_target_metrics(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "target_metrics.png",
 ) -> Optional[str]:
@@ -762,15 +799,17 @@ def plot_target_metrics(
 def plot_domain_metrics(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "domain_metrics.png",
 ) -> Optional[str]:
     kl_pts = history.get("val_kl_st", [])
     ent_pts = history.get("val_entropy", [])
-    if not kl_pts and (not ent_pts):
+    mmd_pts = history.get("val_align_mmd", [])
+    gap_pts = history.get("val_align_gap", [])
+    if not kl_pts and not ent_pts and not mmd_pts and not gap_pts:
         return None
-    fig, ax1 = plt.subplots(figsize=(8, 5))
+    fig, (ax1, ax3) = plt.subplots(1, 2, figsize=(15, 5))
     ax1.set_facecolor("#ECECEC")
     if kl_pts:
         xs, ys = zip(*kl_pts)
@@ -781,10 +820,10 @@ def plot_domain_metrics(
             linewidth=2.0,
             marker="o",
             markersize=5,
-            label="val KL (source↔target)",
+            label="val alignment loss (source↔target)",
         )
     ax1.set_xlabel("Epoch", fontweight="bold")
-    ax1.set_ylabel("KL divergence", color=_BLUE, fontweight="bold")
+    ax1.set_ylabel("Alignment loss", color=_BLUE, fontweight="bold")
     ax1.tick_params(axis="y", labelcolor=_BLUE)
     ax1.grid(True, linestyle="--", alpha=0.5, color="white", linewidth=1.2)
     ax1.set_axisbelow(True)
@@ -802,17 +841,56 @@ def plot_domain_metrics(
         )
         ax2.set_ylabel("Target detection entropy", color=_RED, fontweight="bold")
         ax2.tick_params(axis="y", labelcolor=_RED)
-    run_tag = _run_tag(method, config)
-    title = "Domain adaptation metrics"
-    if run_tag:
-        title = f"{title}\n{run_tag}"
-    ax1.set_title(title, fontweight="bold", fontsize=13, pad=10)
+    ax1.set_title("Optimised objective", fontweight="bold", fontsize=12, pad=10)
     lines, labs = ax1.get_legend_handles_labels()
     if ent_pts:
         l2, lb2 = ax2.get_legend_handles_labels()
         lines += l2
         labs += lb2
     ax1.legend(lines, labs, loc="best", framealpha=0.9)
+
+    ax3.set_facecolor("#ECECEC")
+    ax3.grid(True, linestyle="--", alpha=0.5, color="white", linewidth=1.2)
+    ax3.set_axisbelow(True)
+    ax3.set_xlabel("Epoch", fontweight="bold")
+    ax3.set_ylabel("Embedding gap (std units)", color=_BLUE, fontweight="bold")
+    ax3.tick_params(axis="y", labelcolor=_BLUE)
+    if gap_pts:
+        xs, ys = zip(*gap_pts)
+        ax3.plot(
+            xs, ys, color=_BLUE, linewidth=2.0, marker="o", markersize=5,
+            label="source↔target mean gap",
+        )
+        ax3.axhline(
+            0.2, color="#009E73", linestyle="--", linewidth=1.8,
+            label="overlap threshold (0.2)",
+        )
+    if mmd_pts:
+        ax4 = ax3.twinx()
+        xs, ys = zip(*mmd_pts)
+        ax4.plot(
+            xs, ys, color="#CC79A7", linewidth=2.0, marker="^", markersize=5,
+            label="source↔target MMD",
+        )
+        ax4.set_ylabel("MMD", color="#CC79A7", fontweight="bold")
+        ax4.tick_params(axis="y", labelcolor="#CC79A7")
+    ax3.set_title(
+        "Actual embedding overlap (what t-SNE shows)",
+        fontweight="bold", fontsize=12, pad=10,
+    )
+    lines3, labs3 = ax3.get_legend_handles_labels()
+    if mmd_pts:
+        l4, lb4 = ax4.get_legend_handles_labels()
+        lines3 += l4
+        labs3 += lb4
+    ax3.legend(lines3, labs3, loc="best", framealpha=0.9)
+
+    run_tag = _run_tag(method, config)
+    suptitle = "Domain adaptation metrics"
+    if run_tag:
+        suptitle = f"{suptitle}  ·  {run_tag}"
+    fig.suptitle(suptitle, fontweight="bold", fontsize=13)
+    fig.subplots_adjust(top=0.86)
     return _save(fig, os.path.join(out_dir, fname))
 
 def _draw_boxes(ax: "plt.Axes", sample: Dict[str, Any]) -> None:
@@ -838,7 +916,7 @@ def plot_sample_predictions(
     samples: Sequence[Dict[str, Any]],
     out_dir: str,
     fname: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     title_suffix: str = "",
 ) -> Optional[str]:
@@ -955,7 +1033,7 @@ def plot_samples_grid_3row(
     items: Sequence[Dict[str, Any]],
     out_dir: str,
     fname: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     title_suffix: str = "",
 ) -> Optional[str]:
@@ -1215,7 +1293,7 @@ def plot_gradcam_comparison(
     target_items: Sequence[Dict[str, Any]],
     out_dir: str,
     fname: str = "gradcam_source_vs_target.png",
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     score_fn: Optional[Callable[[Any], Any]] = None,
     forward_fn: Optional[Callable[[Any, Any], Any]] = None,
@@ -1287,13 +1365,13 @@ def _parse_main_args(argv: Optional[Sequence[str]] = None) -> Any:
     import argparse
 
     p = argparse.ArgumentParser(
-        description="Standalone Grad-CAM (source day vs target night) for DAI-Net"
+        description="Standalone Grad-CAM (source day vs target night) for RAILIGHT"
     )
     p.add_argument("cmd", nargs="?", default="gradcam", choices=["gradcam"])
     p.add_argument("--weights", required=True, type=str)
     p.add_argument(
         "--architecture",
-        default="dai_net",
+        default="railight",
         type=str,
         help="Detection architecture name (used in charts path).",
     )
@@ -1396,7 +1474,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         net = net.cuda()
     if not hasattr(net, "vgg"):
         raise RuntimeError(
-            "Backbone has no `.vgg` ModuleList; this Grad-CAM helper is wired for VGG-style DAI-Net only."
+            "Backbone has no `.vgg` ModuleList; this Grad-CAM helper is wired for VGG-style RAILIGHT only."
         )
     target_idx = min(args.target_layer_idx, len(net.vgg) - 1)
     end = min(args.forward_end_idx, len(net.vgg))
@@ -1442,7 +1520,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     out_dir = make_charts_dir(
         args.charts_dir, args.mode_name, args.architecture, args.model, args.num_exp
     )
-    method = f"DAI-Net ({args.model}, {os.path.basename(args.weights)})"
+    method = f"RAILIGHT ({args.model}, {os.path.basename(args.weights)})"
     config = {
         "backbone": args.model,
         "weights": os.path.basename(args.weights),

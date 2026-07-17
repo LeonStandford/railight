@@ -9,16 +9,31 @@ import random
 from utils.augmentations import preprocess
 
 
+def normalize_list_files(list_file):
+    if list_file is None:
+        return []
+    candidates = [list_file] if isinstance(list_file, str) else list(list_file)
+    ordered = []
+    for item in candidates:
+        path = str(item).strip()
+        if path and path not in ordered:
+            ordered.append(path)
+    return ordered
+
+
 class SourceDomainDetection(data.Dataset):
 
     def __init__(self, list_file, mode="train"):
         super(SourceDomainDetection, self).__init__()
         self.mode = mode
+        self.list_files = normalize_list_files(list_file)
         self.fnames = []
         self.boxes = []
         self.labels = []
-        with open(list_file) as f:
-            lines = f.readlines()
+        lines = []
+        for path in self.list_files:
+            with open(path) as f:
+                lines.extend(f.readlines())
         for line in lines:
             line = line.strip().split()
             num_faces = int(line[1])

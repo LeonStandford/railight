@@ -1,0 +1,38 @@
+architecture: railight
+backbone: vgg16
+num_exp: exp3
+
+weights: /mnt/HDD6/longpm/railway/data_exp2/railight/weights/railight/vgg16/exp3/best_model.pth
+
+cuda: true
+gpu_ids: 4
+batch_size: 32
+
+source_test_files: null
+
+target_test_files:
+  - /mnt/HDD6/longpm/railway/data_exp2/railight/dataset/target_train.txt
+  - /mnt/HDD6/longpm/railway/data_exp2/railight/dataset/target_val.txt
+  - /mnt/HDD6/longpm/railway/data_exp2/railight/dataset/target_test.txt
+
+export_predicted_source_path: null
+export_predicted_target_path: null
+export_fp_fn_samples_path: /mnt/HDD6/longpm/railway/data_exp2/railight/records/railight/vgg16/exp3_fp_fn.json
+
+nc: 8
+names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
+
+charts_dir: /mnt/HDD6/longpm/railway/data_exp2/railight/charts
+records_dir: /mnt/HDD6/longpm/railway/data_exp2/railight/records
+log_dir: /mnt/HDD6/longpm/railway/data_exp2/railight/logs
+
+viz_num_samples: 6
+
+is_run_confusion_matrix: false    
+is_run_samples_grid: false        
+is_run_tsne_reflectance: false   
+is_run_domain_gap: false          
+
+iou_thr: 0.5
+score_thr_cm: 0.5
+nms_iou_thr: 0.35

@@ -1,0 +1,39 @@
+architecture: railight
+backbone: vgg16
+num_exp: exp4
+
+weights: weights/railight/vgg16/exp4/best_model.pth
+
+cuda: true
+gpu_ids: 3,5,7
+batch_size: 4
+
+source_test_files:
+  - ./dataset/source_test.txt
+
+target_test_files:
+  - ./dataset/target_test.txt
+
+export_predicted_source_path: null
+export_predicted_target_path: null
+export_fp_fn_samples_path: ./records/railight/vgg16/exp4_fp_fn.json
+
+nc: 8
+names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
+
+
+charts_dir: ./charts
+records_dir: ./records
+log_dir: ./logs
+
+viz_num_samples: 6
+
+# Figures / analysis toggles
+is_run_confusion_matrix: true    # confusion_matrix_source.png, confusion_matrix_target.png
+is_run_samples_grid: true        # samples_day.png, samples_real_night.png (gradcam)
+is_run_tsne_reflectance: true    # tsne_reflectance.png
+is_run_domain_gap: true          # KL / cross-entropy stats in the metrics table
+
+iou_thr: 0.5
+score_thr_cm: 0.5
+nms_iou_thr: 0.35

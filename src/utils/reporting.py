@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from typing import Any, Dict, List, Optional, Tuple
 
-VIZ_METHOD: str = "DAI-Net (railway, real-target dark)"
+VIZ_METHOD: str = "RAILIGHT (railway, real-target dark)"
 SECTION_MARKER: str = "§"
 
 

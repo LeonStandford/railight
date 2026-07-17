@@ -3,7 +3,7 @@ set -e
 
 cd "$(dirname "$0")/../.."
 
-CONFIG=configs/train/dai_net/vgg16/exp3.yaml
+CONFIG=configs/train/railight/vgg16/exp3.yaml
 
 if [ ! -f "$CONFIG" ]; then
     echo "ERROR: CONFIG=$CONFIG does not exist." >&2; exit 1
@@ -20,7 +20,7 @@ export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 NUM_GPUS=$(echo "$GPU_IDS" | awk -F',' '{print NF}')
 
 echo "=========================================="
-echo " DAI-Net training"
+echo " RAILIGHT training"
 echo "   config         : $CONFIG"
 echo "   gpu_ids        : $GPU_IDS        nproc_per_node : $NUM_GPUS"
 echo "=========================================="

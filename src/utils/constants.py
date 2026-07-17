@@ -1,15 +1,108 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 __all__ = [
     "TRAIN_DEFAULTS",
     "TEST_DEFAULTS",
     "WANDB_EPOCH_KEYS",
+    "ALIGN_LOSSES",
+    "ALIGN_DISTRIBUTION_PRESET",
+    "ALIGN_PRESETS",
+    "ALIGN_CONFIG_KEYS",
+    "ALIGN_STATE_PREFIXES",
+    "YOLO_TAP_NAMES",
+    "YOLO_TAP_DIMS",
+    "SOURCE_VIEWS",
     "_TRAIN_DEFAULTS",
     "_TEST_DEFAULTS",
     "_WANDB_EPOCH_KEYS",
 ]
+
+ALIGN_LOSSES: Tuple[str, ...] = ("distill_kl", "moment", "coral", "mmd", "composite")
+
+ALIGN_DISTRIBUTION_PRESET: Dict[str, Any] = {
+    "queue_size": 256,
+    "standardize": True,
+    "taps": (5, 10, 16),
+    "swap_weight": 1.0,
+    "reflectance_weight": 1.0,
+    "source_view": "dark",
+}
+
+ALIGN_PRESETS: Dict[str, Dict[str, Any]] = {
+    "distill_kl": {
+        "kl_weight": 1.0,
+        "mmd_weight": 0.0,
+        "coral_weight": 0.0,
+        "queue_size": 0,
+        "standardize": False,
+        "taps": (5,),
+        "swap_weight": 1.0,
+        "reflectance_weight": 0.0,
+        "source_view": "light",
+    },
+    "mmd": {
+        **ALIGN_DISTRIBUTION_PRESET,
+        "kl_weight": 0.0,
+        "mmd_weight": 1.0,
+        "coral_weight": 0.0,
+    },
+    "coral": {
+        **ALIGN_DISTRIBUTION_PRESET,
+        "kl_weight": 0.0,
+        "mmd_weight": 0.0,
+        "coral_weight": 1.0,
+    },
+    "moment": {
+        **ALIGN_DISTRIBUTION_PRESET,
+        "kl_weight": 0.0,
+        "mmd_weight": 0.0,
+        "coral_weight": 1.0,
+    },
+    "composite": {
+        **ALIGN_DISTRIBUTION_PRESET,
+        "kl_weight": 1.0,
+        "mmd_weight": 1.0,
+        "coral_weight": 1.0,
+    },
+}
+
+ALIGN_CONFIG_KEYS: Dict[str, str] = {
+    "align_loss": "TYPE",
+    "align_temperature": "TEMPERATURE",
+    "align_momentum": "MOMENTUM",
+    "align_covariance_weight": "COVARIANCE_WEIGHT",
+    "align_taps": "TAPS",
+    "align_tap_weights": "TAP_WEIGHTS",
+    "align_kl_weight": "KL_WEIGHT",
+    "align_mmd_weight": "MMD_WEIGHT",
+    "align_coral_weight": "CORAL_WEIGHT",
+    "align_queue_size": "QUEUE_SIZE",
+    "align_standardize": "STANDARDIZE",
+    "align_swap_weight": "SWAP_WEIGHT",
+    "align_reflectance_weight": "REFLECTANCE_WEIGHT",
+    "align_reflectance_pool": "REFLECTANCE_POOL",
+    "align_source_view": "SOURCE_VIEW",
+}
+
+ALIGN_STATE_PREFIXES: Tuple[str, ...] = (
+    "align_heads.",
+    "align_swap.",
+    "align_reflectance.",
+)
+
+YOLO_TAP_NAMES: Tuple[str, ...] = ("shallow", "of1", "of2", "of3", "of4")
+
+YOLO_TAP_DIMS: Dict[str, int] = {
+    "shallow": 64,
+    "of1": 256,
+    "of2": 512,
+    "of3": 512,
+    "of4": 1024,
+}
+
+SOURCE_VIEWS: Tuple[str, ...] = ("dark", "light", "both")
 
 TRAIN_DEFAULTS: Dict[str, Any] = {
     "batch_size": 4,
@@ -28,6 +121,7 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "names": None,
     "charts_dir": "./charts",
     "records_dir": "./records",
+    "log_dir": "./logs",
     "viz_num_samples": 6,
     "viz_every_iters": 500,
     "viz_full_every_epochs": 1,
@@ -58,6 +152,21 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "target_val_file": "./dataset/target_val.txt",
     "target_test_file": "./dataset/target_test.txt",
     "target_folder4unsupervised": None,
+    "align_loss": "composite",
+    "align_temperature": 4.0,
+    "align_momentum": 0.05,
+    "align_covariance_weight": 1.0,
+    "align_taps": None,
+    "align_tap_weights": None,
+    "align_kl_weight": None,
+    "align_mmd_weight": None,
+    "align_coral_weight": None,
+    "align_queue_size": None,
+    "align_standardize": None,
+    "align_swap_weight": None,
+    "align_reflectance_weight": None,
+    "align_reflectance_pool": 4,
+    "align_source_view": None,
     "focal_enabled": True,
     "focal_gamma": 2.0,
     "focal_alpha_bg": 0.25,
@@ -66,8 +175,9 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "backbone_weights": "auto",
     "pretrained_model": None,
     "use_wandb": False,
-    "wandb_project": "dainet-railway",
+    "wandb_project": "railight-railway",
     "wandb_entity": None,
+    "wandb_dir": None,
     "val_every_epochs": 1,
     "viz_max_source_batches": 30,
     "viz_max_target_batches": 30,
@@ -83,16 +193,16 @@ TEST_DEFAULTS: Dict[str, Any] = {
     "cuda": True,
     "source_train_file": "./dataset/source_train.txt",
     "source_val_file": "./dataset/source_val.txt",
-    "source_test_file": "./dataset/source_test.txt",
+    "source_test_files": ["./dataset/source_test.txt"],
     "target_train_file": "./dataset/target_train.txt",
     "target_val_file": "./dataset/target_val.txt",
-    "target_test_file": "./dataset/target_test.txt",
+    "target_test_files": ["./dataset/target_test.txt"],
     "nc": 3,
     "names": None,
     "source_folder": "",
-    "target_folder4unsupervised": "/media/caotulab/303A225B3A221DFA/Nhan/data/images/target",
     "charts_dir": "./charts",
     "records_dir": "./records",
+    "log_dir": "./logs",
     "mode_name": "test",
     "viz_num_samples": 6,
     "weights": None,
@@ -101,6 +211,26 @@ TEST_DEFAULTS: Dict[str, Any] = {
     "nms_iou_thr": 0.35,
     "export_predicted_source_path": None,
     "export_predicted_target_path": None,
+    "export_fp_fn_samples_path": None,
+    "is_run_tsne_reflectance": True,
+    "is_run_domain_gap": True,
+    "is_run_confusion_matrix": True,
+    "is_run_samples_grid": True,
+    "align_loss": "composite",
+    "align_temperature": 4.0,
+    "align_momentum": 0.05,
+    "align_covariance_weight": 1.0,
+    "align_taps": None,
+    "align_tap_weights": None,
+    "align_kl_weight": None,
+    "align_mmd_weight": None,
+    "align_coral_weight": None,
+    "align_queue_size": None,
+    "align_standardize": None,
+    "align_swap_weight": None,
+    "align_reflectance_weight": None,
+    "align_reflectance_pool": 4,
+    "align_source_view": None,
     "focal_enabled": True,
     "focal_gamma": 2.0,
     "focal_alpha_bg": 0.25,
@@ -116,6 +246,8 @@ WANDB_EPOCH_KEYS: Dict[str, str] = {
     "val_f1": "val/f1",
     "val_map": "val/mAP",
     "val_kl_st": "val/kl_st",
+    "val_align_mmd": "val/align_mmd",
+    "val_align_gap": "val/align_gap",
     "val_entropy": "val/entropy",
     "target_precision": "target/precision",
     "target_recall": "target/recall",
