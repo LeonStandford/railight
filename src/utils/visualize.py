@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math
 import os
+import textwrap
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import matplotlib
 
@@ -37,19 +38,39 @@ _BLUE = "tab:blue"
 _RED = "tab:red"
 _TAB_COLORS = list(plt.get_cmap("tab10").colors)
 _PRETTY_LOSS_NAME: Dict[str, str] = {
-    "total": "Loss",
-    "pal1_loc": "Pal1 Loc",
-    "pal1_conf": "Pal1 Conf",
-    "pal2_loc": "Pal2 Loc",
-    "pal2_conf": "Pal2 Conf",
-    "enhance": "Enhance",
-    "enhance_l1ssim": "Enhance L1+SSIM",
-    "mutual": "Mutual",
-    "kl_st": "KL align (source<->target)",
-    "target_unsup": "Target unsup (recon)",
-    "train_loss_epoch": "Train Loss (epoch)",
-    "val_loss": "Val Loss",
-    "target_val_loss": "Target Val Loss",
+    "total": "Total training loss",
+    "pal1_loc": "First shot localisation loss",
+    "pal1_conf": "First shot classification loss",
+    "pal2_loc": "Second shot localisation loss",
+    "pal2_conf": "Second shot classification loss",
+    "enhance": "Retinex decomposition loss",
+    "enhance_l1ssim": "Reflectance reconstruction loss",
+    "mutual": "Mutual learning loss",
+    "kl_st": "Feature alignment loss",
+    "target_unsup": "Target reconstruction loss",
+    "target_sup": "Target supervised detection loss",
+    "pseudo": "Pseudo label loss",
+    "wreg": "Weight regularisation loss",
+    "entropy": "Target prediction entropy loss",
+    "train_loss_epoch": "Training loss",
+    "val_loss": "Validation loss",
+    "target_val_loss": "Target validation loss",
+}
+_LOSS_SUBTITLE: Dict[str, str] = {
+    "total": "Sum of every loss term below, the value actually back-propagated",
+    "pal1_loc": "Box regression on the first detection head, source images only",
+    "pal1_conf": "Class prediction on the first detection head, source images only",
+    "pal2_loc": "Box regression on the second, refined detection head, source images only",
+    "pal2_conf": "Class prediction on the second, refined detection head, source images only",
+    "enhance": "Retinex split of the image into reflectance and illumination",
+    "enhance_l1ssim": "Reflectance predicted inside the network versus the frozen RetinexNet",
+    "mutual": "Agreement between the daylight branch and the synthetic dark branch",
+    "kl_st": "Divergence between source and target features, pulls the two domains together",
+    "target_unsup": "Rebuilds the target image from its reflectance and illumination, needs no labels",
+    "target_sup": "Detection loss on real target labels, both heads, same recipe as the source loss",
+    "pseudo": "Detection loss on boxes invented by the mean teacher for unlabelled target images",
+    "wreg": "Keeps the backbone close to its pretrained weights",
+    "entropy": "Pushes target predictions to be confident rather than undecided",
 }
 _LOSS_ORDER: Tuple[str, ...] = (
     "total",
@@ -62,6 +83,11 @@ _LOSS_ORDER: Tuple[str, ...] = (
     "mutual",
 )
 _EPOCH_KEYS = frozenset({"train_loss_epoch", "val_loss"})
+
+def _wrap_subtitle(text: str, width: int = 58) -> str:
+    """Wrap a one-sentence panel subtitle so it fits above the axes."""
+    return "\n".join(textwrap.wrap(text, width=width))
+
 
 def _run_tag(method: str, config: Config) -> str:
     parts: List[str] = []
@@ -114,19 +140,19 @@ def plot_losses(
         return None
 
     loss_fn_keys = list(_LOSS_ORDER) + [
-        "target_unsup", "kl_st", "wreg", "entropy"
+        "target_unsup", "target_sup", "pseudo", "kl_st", "wreg", "entropy"
     ]
     iter_panels = [k for k in loss_fn_keys if history.get(k)]
 
     combined = [
-        ("Loss (epoch)", "train_det_epoch", "val_loss"),
+        ("Detection loss per epoch", "train_det_epoch", "val_loss"),
         ("Precision", "train_precision", "val_precision"),
         ("Recall", "train_recall", "val_recall"),
         ("F1 score", "train_f1", "val_f1"),
         ("mAP@0.5", "train_map", "val_map"),
-        ("Target Loss (epoch)", None, "target_val_loss"),
-        ("Target Precision", None, "target_precision"),
-        ("Target Recall", None, "target_recall"),
+        ("Target detection loss per epoch", None, "target_val_loss"),
+        ("Target precision", None, "target_precision"),
+        ("Target recall", None, "target_recall"),
         ("Target F1 score", None, "target_f1"),
         ("Target mAP@0.5", None, "target_map"),
     ]
@@ -166,13 +192,23 @@ def plot_losses(
                 ema.append(prev)
             ax.plot(xs, ema, color=color, linewidth=2.2, label="EMA(0.1)")
             ax.legend(loc="best", framealpha=0.85, fontsize=8)
-        short = _PRETTY_LOSS_NAME.get(key, key.replace("_", " ").title())
+        title = _PRETTY_LOSS_NAME.get(key, key.replace("_", " ").capitalize())
+        subtitle = _wrap_subtitle(_LOSS_SUBTITLE.get(key, ""))
+        n_subtitle_lines = len(subtitle.split("\n")) if subtitle else 0
         ax.set_title(
-            "\n".join([short] + run_tag_lines),
-            fontweight="bold", fontsize=11, pad=10,
+            title,
+            fontweight="bold",
+            fontsize=12,
+            pad=10 + 12 * n_subtitle_lines,
         )
+        if subtitle:
+            ax.text(
+                0.5, 1.012, subtitle,
+                transform=ax.transAxes, ha="center", va="bottom",
+                fontsize=8.5, style="italic", color="#444444", linespacing=1.35,
+            )
         ax.set_xlabel("Iteration", fontweight="bold")
-        ax.set_ylabel("Loss", fontweight="bold")
+        ax.set_ylabel("Loss value", fontweight="bold")
         idx += 1
 
     for label, tr_key, va_key in combined:
@@ -191,8 +227,8 @@ def plot_losses(
                 markersize=4, label="val",
             )
         ax.set_title(
-            "\n".join([f"{label}  (train vs val)"] + run_tag_lines),
-            fontweight="bold", fontsize=11, pad=10,
+            f"{label}  (train versus validation)",
+            fontweight="bold", fontsize=12, pad=10,
         )
         ax.set_xlabel("Epoch", fontweight="bold")
         ax.set_ylabel(label, fontweight="bold")
@@ -204,7 +240,8 @@ def plot_losses(
         axes_flat[j].set_visible(False)
     if run_tag:
         fig.suptitle(
-            f"Loss Components — {run_tag}", fontsize=14, fontweight="bold", y=1.005
+            f"Detailed loss components — {run_tag}",
+            fontsize=14, fontweight="bold", y=1.005,
         )
     fig.tight_layout(h_pad=2.5, w_pad=1.5, rect=(0, 0, 1, 0.985))
     fig.savefig(
@@ -1262,9 +1299,13 @@ def _parse_main_args(argv: Optional[Sequence[str]] = None) -> Any:
     )
     p.add_argument(
         "--model",
-        default="dark",
+        default="vgg16",
         type=str,
-        choices=["dark", "vgg", "resnet50", "resnet101", "resnet152"],
+        choices=[
+            "vgg16", "vgg16_sppf", "yolo26n", "yolo26s",
+            "dark", "dark_sppf", "vgg", "resnet50", "resnet101", "resnet152",
+        ],
+        help="Backbone as written in configs/ (legacy model names still accepted).",
     )
     p.add_argument("--num_exp", default="exp1", type=str)
     p.add_argument("--charts_dir", default="./charts", type=str)
@@ -1340,7 +1381,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         torch.set_default_tensor_type("torch.cuda.FloatTensor")
         cudnn.benchmark = True
     print(f"[main] building network ({args.model})")
-    net = build_net("test", num_classes=dcfg.NUM_CLASSES, model=args.model)
+    net = build_net(
+        "test",
+        num_classes=dcfg.NUM_CLASSES,
+        backbone=args.model,
+        architecture=args.architecture,
+    )
     state = torch.load(args.weights, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "weight" in state:
         state = state["weight"]
