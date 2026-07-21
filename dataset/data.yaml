@@ -1,0 +1,15 @@
+path: /mnt/HDD6/longpm/railway/data_exp2/8/target
+train: train/images
+val: val/images
+test: test/images
+
+nc: 8
+names:
+  0: fastener_1
+  1: critical_crack
+  2: fastener_2
+  3: sleeper_l
+  4: sleeper_r
+  5: missing_items
+  6: broken_sleeper
+  7: minor_crack

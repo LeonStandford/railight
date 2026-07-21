@@ -1,0 +1,17 @@
+model: yolo26x.pt            
+
+epochs: 200
+batch: 16                
+imgsz: 640
+device: "7"
+workers: 8
+
+optimizer: auto
+lr0: 0.0001
+patience: 50
+seed: 42
+amp: true
+cache: false
+
+project: /mnt/HDD6/longpm/railway/data_exp2/YOLO/runs/detect
+name: yolo26x_rail8-combined
