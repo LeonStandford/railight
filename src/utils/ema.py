@@ -75,6 +75,10 @@ class ModelEMA:
         if not shadow:
             return
         for key, value in shadow.items():
-            if key in self.shadow:
-                self.shadow[key] = value.detach().clone().float()
+            ref = self.shadow.get(key)
+            if ref is None:
+                continue
+            self.shadow[key] = (
+                value.detach().to(device=ref.device, dtype=torch.float32).clone()
+            )
         self.updates = int(updates)

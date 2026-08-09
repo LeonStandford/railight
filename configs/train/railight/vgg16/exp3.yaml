@@ -1,8 +1,8 @@
 architecture: railight
 backbone: vgg16
-num_exp: exp3
+num_exp: exp3_da_batch8_strong_augmetation
 
-batch_size: 2
+batch_size: 8
 
 lr: 5.0e-4
 momentum: 0.9
@@ -13,34 +13,35 @@ max_steps: 340000
 lr_steps: [98000, 130000, 150000]
 
 cuda: true
-gpu_ids: 5,7
+gpu_ids: 1
 num_workers: 2
 local_rank: 0
 seed: 42
 
-source_train_file: /mnt/HDD6/longpm/railway/data_exp2/8/dataset/source_train.txt
-source_val_file:   /mnt/HDD6/longpm/railway/data_exp2/8/dataset/source_val.txt
-source_test_file:  /mnt/HDD6/longpm/railway/data_exp2/8/dataset/source_test.txt
-target_train_file: /mnt/HDD6/longpm/railway/data_exp2/8/dataset/target_train.txt
-target_val_file:   /mnt/HDD6/longpm/railway/data_exp2/8/dataset/target_val.txt
-target_test_file:  /mnt/HDD6/longpm/railway/data_exp2/8/dataset/target_test.txt
+source_train_file: /mnt/HDD4/longpm/railway/8/dataset/source_train.txt
+source_val_file:   /mnt/HDD4/longpm/railway/8/dataset/source_val.txt
+source_test_file:  /mnt/HDD4/longpm/railway/8/dataset/source_test.txt
+target_train_file: /mnt/HDD4/longpm/railway/8/dataset/target_train.txt
+target_val_file:   /mnt/HDD4/longpm/railway/8/dataset/target_val.txt
+target_test_file:  /mnt/HDD4/longpm/railway/8/dataset/target_test.txt
 
 nc: 8
 names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
 
-save_folder: /mnt/HDD6/longpm/railway/data_exp2/railight/weights/
-charts_dir:  /mnt/HDD6/longpm/railway/data_exp2/railight/charts/
-records_dir: /mnt/HDD6/longpm/railway/data_exp2/railight/records/
-log_dir: /mnt/HDD6/longpm/railway/data_exp2/railight/logs
+save_folder: /mnt/HDD4/longpm/railight/weights/
+charts_dir:  /mnt/HDD4/longpm/railight/charts/
+records_dir: /mnt/HDD4/longpm/railight/records/
+log_dir: /mnt/HDD4/longpm/railight/logs
 resume: true
 
 val_every_epochs: 3
 viz_num_samples: 6
-viz_full_every_epochs: 10
+viz_full_every_epochs: 30
 viz_max_source_batches: 30
 viz_max_target_batches: 30
 
-kl_loss_weight: 1.0
+kl_loss_weight: 0.05
+kl_loss_max: 50.0
 target_loss_weight: 0.1
 is_use_supervised_target_loss: true
 supervised_target_loss_weight: 1.0
@@ -53,7 +54,7 @@ is_use_rc_loss: false
 
 use_wandb: true
 wandb_project: da-rdd-railight
-wandb_dir: /mnt/HDD6/longpm/railway/data_exp2/railight/wandb
+wandb_dir: /mnt/HDD4/longpm/railight/wandb
 
 lr_schedule: cosine
 warmup_epochs: 3.0
@@ -67,12 +68,12 @@ ema_enabled: true
 ema_decay: 0.9999
 ema_warmup_iters: 2000
 
-letterbox: true
-scale_jitter: 0.3
-mosaic_prob: 0.25
+letterbox: false
+scale_jitter: 0
+mosaic_prob: 0
 input_size: 640
 
-offline_aug_dir: /mnt/HDD6/longpm/railway/data_exp2/8/dataset/strong_aug_images
+offline_aug_dir: /mnt/HDD4/longpm/railway/8/dataset/strong_aug_images
 offline_aug_mode: crop
 focal_alpha_include_target: true
 

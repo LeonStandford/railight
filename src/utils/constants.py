@@ -7,6 +7,7 @@ __all__ = [
     "TRAIN_DEFAULTS",
     "TEST_DEFAULTS",
     "WANDB_EPOCH_KEYS",
+    "EVAL_SCORE_THR",
     "ALIGN_LOSSES",
     "ALIGN_DISTRIBUTION_PRESET",
     "ALIGN_PRESETS",
@@ -19,6 +20,8 @@ __all__ = [
     "_TEST_DEFAULTS",
     "_WANDB_EPOCH_KEYS",
 ]
+
+EVAL_SCORE_THR: float = 0.05
 
 ALIGN_LOSSES: Tuple[str, ...] = ("distill_kl", "moment", "coral", "mmd", "composite")
 
@@ -150,6 +153,7 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "viz_full_every_epochs": 1,
     "resume": None,
     "kl_loss_weight": 1.0,
+    "kl_loss_max": 50.0,
     "target_loss_weight": 0.05,
     "is_use_supervised_target_loss": False,
     "supervised_target_loss_weight": 1.0,

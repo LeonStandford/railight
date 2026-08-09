@@ -2,21 +2,21 @@ architecture: railight
 backbone: vgg16
 num_exp: exp3
 
-weights: /mnt/HDD6/longpm/railway/data_exp2/railight/weights/railight/vgg16/exp3/best_model.pth
+weights: /mnt/HDD4/longpm/railight/weights/railight/vgg16/exp3/best_model.pth
 
 cuda: true
 gpu_ids: 4
 batch_size: 32
 
 source_test_files: 
-  # - /mnt/HDD6/longpm/railway/data_exp2/8/dataset/source_train.txt
-  # - /mnt/HDD6/longpm/railway/data_exp2/8/dataset/source_val.txt
-  - /mnt/HDD6/longpm/railway/data_exp2/8/dataset/source_test.txt
+  # - /mnt/HDD4/longpm/railway/8/dataset/source_train.txt
+  # - /mnt/HDD4/longpm/railway/8/dataset/source_val.txt
+  - /mnt/HDD4/longpm/railway/8/dataset/source_test.txt
 
 target_test_files:
-  # - /mnt/HDD6/longpm/railway/data_exp2/8/dataset/target_train.txt
-  # - /mnt/HDD6/longpm/railway/data_exp2/8/dataset/target_val.txt
-  - /mnt/HDD6/longpm/railway/data_exp2/8/dataset/target_test.txt
+  # - /mnt/HDD4/longpm/railway/8/dataset/target_train.txt
+  # - /mnt/HDD4/longpm/railway/8/dataset/target_val.txt
+  - /mnt/HDD4/longpm/railway/8/dataset/target_test.txt
 
 export_predicted_source_path: null
 export_predicted_target_path: null
@@ -25,9 +25,9 @@ export_fp_fn_samples_path: null
 nc: 8
 names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
 
-charts_dir: /mnt/HDD6/longpm/railway/data_exp2/railight/charts
-records_dir: /mnt/HDD6/longpm/railway/data_exp2/railight/records
-log_dir: /mnt/HDD6/longpm/railway/data_exp2/railight/logs
+charts_dir:  /mnt/HDD4/longpm/railight/charts/
+records_dir: /mnt/HDD4/longpm/railight/records/
+log_dir: /mnt/HDD4/longpm/railight/logs
 
 viz_num_samples: 6
 

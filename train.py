@@ -76,7 +76,7 @@ from utils.metrics import (
     macro_summary,
     per_class_detection_metrics,
 )
-from utils.strong_aug import ensure_offline_augmented
+from utils.augmentations import ensure_offline_augmented
 from utils.schedule import LRSchedule
 from utils.reporting import format_val_table, viz_config, viz_method
 from utils.predict import (
@@ -90,6 +90,7 @@ from utils.predict import (
 )
 from utils.checkpoint import load_detector_state_dict
 from utils.constants import (
+    EVAL_SCORE_THR,
     SOURCE_VIEWS,
     _TRAIN_DEFAULTS,
     _WANDB_EPOCH_KEYS,
@@ -155,7 +156,7 @@ def _detection_summary(
     per_image: List[Dict[str, Any]], nc: int, class_aware: bool
 ) -> Tuple[Dict[str, Any], float, np.ndarray]:
     scores, matched, n_gt, cm = viz.evaluate_detections(
-        per_image, iou_thr=0.5, score_thr_cm=0.5, num_classes=nc,
+        per_image, iou_thr=0.5, score_thr_cm=EVAL_SCORE_THR, num_classes=nc,
         class_aware=class_aware,
     )
     met = detect_metrics_from_cm(cm)
@@ -237,7 +238,7 @@ def _eval_labeled_loader(
         conf_sum += float(l_conf.detach().item())
         loss_sum += float((l_loc + l_conf).detach().item())
         steps += 1
-        per_image.extend(_decode_per_image(out, targets, net))
+        per_image.extend(_decode_per_image(out, targets, net, conf_thr=EVAL_SCORE_THR))
     n = max(steps, 1)
     return (per_image, loss_sum / n, loc_sum / n, conf_sum / n)
 
@@ -346,7 +347,7 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
 
     _float_keys = (
         "lr", "momentum", "weight_decay", "gamma",
-        "kl_loss_weight", "target_loss_weight", "wreg_loss_weight",
+        "kl_loss_weight", "kl_loss_max", "target_loss_weight", "wreg_loss_weight",
         "entropy_loss_weight", "muon_ratio",
         "focal_gamma", "focal_alpha_bg",
         "stal_ref_area", "stal_max_w",
@@ -1389,7 +1390,7 @@ def validate(
             step += 1
             
             if is_rank0:
-                per_image.extend(_decode_per_image(out, targets, net))
+                per_image.extend(_decode_per_image(out, targets, net, conf_thr=EVAL_SCORE_THR))
                 
             if vprof_on:
                 _vlap("val_decode")
@@ -1529,7 +1530,7 @@ def validate(
             timg = timg.cuda() / 255.0
             tdark = ctx.synthesize_night(timg)
             tout, _ = test_forward(tdark)
-            tr_per_image.extend(_decode_per_image(tout, ttgt, net))
+            tr_per_image.extend(_decode_per_image(tout, ttgt, net, conf_thr=EVAL_SCORE_THR))
             
     if tr_per_image:
         tmet, tmap, _ = _detection_summary(
@@ -1817,6 +1818,7 @@ def train_one_epoch(
     wreg_loss_weight = float(getattr(ctx.args, "wreg_loss_weight", 0.0))
     entropy_loss_weight = float(getattr(ctx.args, "entropy_loss_weight", 0.0))
     kl_loss_weight = float(getattr(ctx.args, "kl_loss_weight", 1.0))
+    kl_loss_max = float(getattr(ctx.args, "kl_loss_max", 0.0))
     prog_warmup = int(getattr(ctx.args, "prog_warmup_iters", 0))
     lambda_gamma = float(getattr(ctx.args, "align_lambda_gamma", 0.0))
     max_steps = int(getattr(ctx.args, "max_steps", 0) or cfg.MAX_STEPS)
@@ -1995,6 +1997,11 @@ def train_one_epoch(
                     adv_acc_sums[key] = adv_acc_sums.get(key, 0.0) + float(value)
 
             loss_kl_src_tgt = loss_kl_src_tgt * kl_loss_weight
+            if kl_loss_max > 0:
+                kl_value = float(loss_kl_src_tgt.detach())
+                if kl_value > kl_loss_max:
+                    loss_kl_src_tgt = loss_kl_src_tgt * (kl_loss_max / kl_value)
+                    ctx.kl_clips = getattr(ctx, "kl_clips", 0) + 1
 
         if prof_active:
             _lap("loss_kl")
