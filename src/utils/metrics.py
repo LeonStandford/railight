@@ -166,15 +166,32 @@ def per_class_detection_metrics(
 
 
 def macro_summary(per_class: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    """Per-class means of the detection metrics.
+
+    ``macro_f1`` is measured at the fixed ``score_thr`` used by
+    :func:`per_class_detection_metrics`; ``macro_best_f1`` is the mean of each
+    class's best point on its own precision/recall curve. The second number is
+    the one comparable with detectors that report P/R/F1 at their best-F1
+    operating point rather than at a single shared confidence threshold.
+    """
     if not per_class:
-        return {"macro_map50": 0.0, "macro_precision": 0.0, "macro_recall": 0.0, "macro_f1": 0.0}
-    keys = ("ap50", "precision", "recall", "f1")
+        return {
+            "macro_map50": 0.0,
+            "macro_precision": 0.0,
+            "macro_recall": 0.0,
+            "macro_f1": 0.0,
+            "macro_best_f1": 0.0,
+            "macro_best_thr": 0.0,
+        }
+    keys = ("ap50", "precision", "recall", "f1", "best_f1", "best_thr")
     values = {k: float(np.mean([v[k] for v in per_class.values()])) for k in keys}
     return {
         "macro_map50": values["ap50"],
         "macro_precision": values["precision"],
         "macro_recall": values["recall"],
         "macro_f1": values["f1"],
+        "macro_best_f1": values["best_f1"],
+        "macro_best_thr": values["best_thr"],
     }
 
 
@@ -196,7 +213,8 @@ def format_per_class_table(
     lines.append(
         f"{'macro':<18}{'':>7}{macro['macro_map50']:>8.3f}"
         f"{macro['macro_precision']:>8.3f}{macro['macro_recall']:>8.3f}"
-        f"{macro['macro_f1']:>8.3f}"
+        f"{macro['macro_f1']:>8.3f}{macro['macro_best_thr']:>8.3f}"
+        f"{macro['macro_best_f1']:>9.3f}"
     )
     return "\n".join(lines)
 

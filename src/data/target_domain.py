@@ -8,6 +8,7 @@ import torch
 import torch.utils.data as data
 from PIL import Image
 from data.config import cfg
+from data.transforms import build_transforms
 from utils.augmentations import to_chw_bgr
 
 __all__ = [
@@ -36,8 +37,23 @@ class TargetUnlabeledDataset(data.Dataset):
         target_folder: Optional[str] = None,
         size: int = 0,
         paths: Optional[Sequence[str]] = None,
+        transforms=None,
     ) -> None:
         self.size = int(size)
+        # Same pipeline as the source val split. Without it these images were
+        # squashed to a square while the source images were letterboxed, and
+        # they reached the network as BGR while the source images were RGB --
+        # a geometry and a channel-order gap on top of the illumination gap
+        # the alignment loss is supposed to be closing.
+        if transforms is not None:
+            self.transforms = transforms
+        elif (
+            str(getattr(cfg, "DATA_PIPELINE", "transforms")) != "legacy"
+            and bool(getattr(cfg, "TARGET_USE_TRANSFORMS", True))
+        ):
+            self.transforms = build_transforms("val", geometry=True)
+        else:
+            self.transforms = None
         if paths is not None:
             self.paths: List[str] = [p for p in paths if p]
         elif target_folder and os.path.isdir(target_folder):
@@ -59,6 +75,9 @@ class TargetUnlabeledDataset(data.Dataset):
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         img = Image.open(self.paths[idx]).convert("RGB")
+        if self.transforms is not None:
+            arr, _ = self.transforms(img, None)
+            return torch.from_numpy(np.ascontiguousarray(arr))
         img = img.resize((self.size, self.size), Image.BILINEAR)
         arr = to_chw_bgr(np.asarray(img, dtype=np.float32))
         return torch.from_numpy(arr.copy())
@@ -92,12 +111,19 @@ class TargetLabeledDataset(data.Dataset):
         class_map: dict,
         mode: str = "val",
         split: Optional[Tuple[str, float]] = None,
+        transforms=None,
     ) -> None:
         super().__init__()
         from utils.augmentations import preprocess
 
         self._preprocess = preprocess
         self.mode = mode
+        if transforms is not None:
+            self.transforms = transforms
+        elif str(getattr(cfg, "DATA_PIPELINE", "transforms")) != "legacy":
+            self.transforms = build_transforms(mode, geometry=True)
+        else:
+            self.transforms = None
         self.fnames: List[str] = []
         self.boxes: List[List[List[float]]] = []
         self.labels: List[List[int]] = []
@@ -188,9 +214,12 @@ class TargetLabeledDataset(data.Dataset):
             bbox_labels = np.hstack(
                 (label[:, np.newaxis], boxes_n)
             ).tolist()
-            img_arr, sample_labels = self._preprocess(
-                img, bbox_labels, self.mode, image_path
-            )
+            if self.transforms is None:
+                img_arr, sample_labels = self._preprocess(
+                    img, bbox_labels, self.mode, image_path
+                )
+            else:
+                img_arr, sample_labels = self.transforms(img, bbox_labels)
             sample_labels = np.array(sample_labels)
             if len(sample_labels) > 0:
                 target = np.hstack(

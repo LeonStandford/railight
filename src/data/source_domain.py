@@ -7,6 +7,7 @@ import torch.utils.data as data
 import numpy as np
 import random
 from data.config import cfg
+from data.transforms import build_transforms
 from utils.augmentations import mosaic4, preprocess
 
 
@@ -24,9 +25,33 @@ def normalize_list_files(list_file):
 
 class SourceDomainDetection(data.Dataset):
 
-    def __init__(self, list_file, mode="train"):
+    def __init__(self, list_file, mode="train", transforms=None):
         super(SourceDomainDetection, self).__init__()
         self.mode = mode
+        # FCOS-style: the pipeline is assembled once and handed to the dataset
+        # instead of preprocess() re-deciding what to do on every call. The
+        # `nogeom` variant is the mosaic path, whose canvas already sits at the
+        # network resolution, so crop/resize are skipped.
+        self.legacy_pipeline = (
+            str(getattr(cfg, "DATA_PIPELINE", "transforms")) == "legacy"
+        )
+        if transforms is not None:
+            self.transforms = transforms
+            self.transforms_nogeom = transforms
+        elif self.legacy_pipeline:
+            self.transforms = None
+            self.transforms_nogeom = None
+        else:
+            self.transforms = build_transforms(mode, geometry=True)
+            self.transforms_nogeom = build_transforms(mode, geometry=False)
+        self._load_index(list_file)
+
+    def _load_index(self, list_file):
+        """Fill fnames / boxes / labels from the RAILIGHT list format.
+
+        Overridden by :class:`data.voc_dataset.VOCDetection`; everything after
+        this point -- transforms, mosaic, collate -- is shared.
+        """
         self.list_files = normalize_list_files(list_file)
         self.fnames = []
         self.boxes = []
@@ -102,19 +127,27 @@ class SourceDomainDetection(data.Dataset):
             if random.random() < self.mosaic_prob():
                 canvas, bbox_labels = self.pull_mosaic(index)
                 im_width, im_height = (int(cfg.resize_width), int(cfg.resize_height))
-                img, sample_labels = preprocess(
-                    Image.fromarray(canvas),
-                    bbox_labels,
-                    self.mode,
-                    image_path,
-                    geometry=False,
-                )
+                if self.transforms_nogeom is None:
+                    img, sample_labels = preprocess(
+                        Image.fromarray(canvas),
+                        bbox_labels,
+                        self.mode,
+                        image_path,
+                        geometry=False,
+                    )
+                else:
+                    img, sample_labels = self.transforms_nogeom(
+                        Image.fromarray(canvas), bbox_labels
+                    )
             else:
                 img, bbox_labels = self.load_annotated(index)
                 im_width, im_height = img.size
-                img, sample_labels = preprocess(
-                    img, bbox_labels, self.mode, image_path
-                )
+                if self.transforms is None:
+                    img, sample_labels = preprocess(
+                        img, bbox_labels, self.mode, image_path
+                    )
+                else:
+                    img, sample_labels = self.transforms(img, bbox_labels)
             sample_labels = np.array(sample_labels)
             if len(sample_labels) > 0:
                 target = np.hstack(

@@ -42,7 +42,12 @@ from data.target_domain import TargetUnlabeledDataset
 from layers.modules import EnhanceLoss, MultiBoxLoss
 from layers.modules.enhance_loss import smooth as retinex_smooth
 from losses.align import apply_align_config
-from losses.dfl import FocalLoss, compute_focal_alpha, init_focal_bias
+from losses.dfl import (
+    FocalLoss,
+    compute_focal_alpha,
+    compute_focal_alpha_from_labels,
+    init_focal_bias,
+)
 from losses.weight_reg import snapshot_wreg_ref, weight_reg_loss
 from models.enhancer import RetinexNet
 from models.factory import basenet_factory, build_net
@@ -290,6 +295,49 @@ def _resolve_resume(
         return None
     return sval
 
+_DETECTION_ONLY_ZEROS: Dict[str, Any] = {
+    "kl_loss_weight": 0.0,
+    "target_loss_weight": 0.0,
+    "entropy_loss_weight": 0.0,
+    "wreg_loss_weight": 0.0,
+    "supervised_target_loss_weight": 0.0,
+    "align_adv_weight": 0.0,
+    "da_img_adv_weight": 0.0,
+    "da_obj_adv_weight": 0.0,
+}
+
+
+def _apply_loss_preset(merged: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve ``loss_preset`` before anything reads the weights.
+
+    ``detection_only`` keeps the two detection heads and the Retinex
+    reconstruction and zeroes everything domain-adaptive, so you can tell
+    whether the DA terms are helping the detector or drowning it. It has to
+    happen here rather than in train(): the data loaders branch on
+    ``is_use_supervised_target_loss``, and they are built first.
+    """
+    preset = str(merged.get("loss_preset") or "full").lower()
+    if preset not in ("full", "detection_only"):
+        raise ValueError(
+            f"loss_preset must be 'full' or 'detection_only', got {preset!r}"
+        )
+    merged["loss_preset"] = preset
+    if preset != "detection_only":
+        return merged
+    merged.update(_DETECTION_ONLY_ZEROS)
+    merged["is_use_supervised_target_loss"] = False
+    merged["da_align_enabled"] = False
+    merged["da_ia_enabled"] = False
+    merged["da_oa_enabled"] = False
+    if int(merged.get("local_rank", 0) or 0) == 0:
+        print(
+            "🧪 [loss] preset=detection_only -> zeroed "
+            + ", ".join(sorted(_DETECTION_ONLY_ZEROS))
+            + "; target labels and DAMamba heads off"
+        )
+    return merged
+
+
 def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Namespace:
     p = Path(config_path)
     if not p.is_file():
@@ -336,6 +384,7 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
             config=str(p),
         )
     )
+    merged = _apply_loss_preset(merged)
     merged["resume"] = _resolve_resume(
         merged.get("resume"),
         merged["save_folder"],
@@ -472,6 +521,19 @@ def prepare_offline_augmentation(
     out_dir = getattr(args_ns, "offline_aug_dir", None)
     if not out_dir:
         return
+    if str(getattr(args_ns, "dataset_format", "railight")).lower() == "voc":
+        if local_rank == 0:
+            print("[aug] dataset_format=voc -> offline_aug_dir is not used")
+        return
+    if str(getattr(args_ns, "augmentation", "railight")).lower() == "fcos":
+        # The offline bank IS the strong augmentation; fcos-style training uses
+        # the plain source list plus a horizontal flip and nothing else.
+        if local_rank == 0:
+            print(
+                "[aug] augmentation=fcos -> ignoring offline_aug_dir "
+                f"({out_dir}); training on the unaugmented source list"
+            )
+        return
     if local_rank == 0:
         out_txt = ensure_offline_augmented(
             args_ns.source_train_file,
@@ -498,6 +560,140 @@ def build_target_sampler(dataset: data.Dataset) -> data.Sampler:
     )
 
 
+def _loader_workers(
+    args_ns: argparse.Namespace,
+    num_workers: Any,
+    *,
+    persistent: bool = True,
+) -> Dict[str, Any]:
+    """DataLoader worker settings that keep the GPU fed.
+
+    Workers are kept alive across epochs (re-forking them every epoch is pure
+    overhead on a 100-epoch schedule) and allowed to run several batches ahead,
+    so JPEG decode + augmentation happen behind the forward pass instead of in
+    front of it. Both behaviours are config switches -- set
+    ``loader_persistent_workers: false`` / ``loader_prefetch_factor: 2`` to go
+    back to the stock DataLoader.
+    """
+    n = max(int(num_workers or 0), 0)
+    if n == 0:
+        return {"num_workers": 0}
+    kwargs: Dict[str, Any] = {"num_workers": n}
+    prefetch = getattr(args_ns, "loader_prefetch_factor", None)
+    if prefetch:
+        kwargs["prefetch_factor"] = int(prefetch)
+    if persistent and bool(getattr(args_ns, "loader_persistent_workers", True)):
+        kwargs["persistent_workers"] = True
+    return kwargs
+
+
+_AMP_OFF = ("", "0", "no", "false", "off", "none")
+_AMP_ON = ("1", "yes", "true")
+
+
+def _make_grad_scaler(enabled: bool):
+    """GradScaler across torch versions (torch.amp is the 2.4+ home)."""
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def setup_amp(
+    args_ns: argparse.Namespace, local_rank: int
+) -> Tuple[Optional[torch.dtype], Any]:
+    """Resolve the ``amp:`` config key into an autocast dtype and grad scaler.
+
+    Mixed precision is what buys the batch size back: the DSFD activations at
+    640x640 (a stride-4, 160x160 feature map) dominate memory, and holding them
+    in half precision roughly halves the footprint of every forward pass in the
+    step -- and there are several per iteration (source, alignment views,
+    target).  Losses still run in fp32, see ``to_fp32``.
+    """
+    raw = getattr(args_ns, "amp", False)
+    mode = raw.strip().lower() if isinstance(raw, str) else ("fp16" if raw else "off")
+    if mode in _AMP_OFF:
+        mode = "off"
+    elif mode in _AMP_ON:
+        mode = "fp16"
+    if mode not in ("off", "fp16", "bf16"):
+        raise ValueError(
+            f"amp must be one of off/fp16/bf16 (or a bool), got {raw!r}"
+        )
+    if mode != "off" and not torch.cuda.is_available():
+        mode = "off"
+    if mode == "bf16" and not getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+        if local_rank == 0:
+            print("[amp] bf16 not supported on this GPU — falling back to fp16")
+        mode = "fp16"
+    dtype = {"off": None, "fp16": torch.float16, "bf16": torch.bfloat16}[mode]
+    scaler = _make_grad_scaler(mode == "fp16")
+    if local_rank == 0:
+        note = (
+            "disabled (full fp32)"
+            if mode == "off"
+            else f"{mode} activations, fp32 losses"
+        )
+        print(f"⚡ [amp] mixed precision: {note}")
+    return dtype, scaler
+
+
+def to_fp32(obj: Any) -> Any:
+    """Recursively cast floating tensors back to fp32.
+
+    Autocast covers the forward passes; the detection, Retinex and alignment
+    losses (log-sum-exp, SSIM, KL) are run on fp32 copies of the outputs so
+    numerics are unchanged whether or not AMP is on.
+    """
+    if torch.is_tensor(obj):
+        return obj.float() if obj.is_floating_point() else obj
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(to_fp32(o) for o in obj)
+    return obj
+
+
+def dataset_format(args_ns: argparse.Namespace) -> str:
+    fmt = str(getattr(args_ns, "dataset_format", "railight") or "railight").lower()
+    if fmt not in ("railight", "voc"):
+        raise SystemExit(
+            f"dataset_format must be 'railight' or 'voc', got {fmt!r}"
+        )
+    return fmt
+
+
+def _voc_dataset(
+    args_ns: argparse.Namespace,
+    root_key: str,
+    split_key: str,
+    default_split: str,
+    mode: str,
+    required: bool = True,
+):
+    """One VOC split, or None when the config does not name it."""
+    from data.voc_dataset import VOCDetection
+
+    root = getattr(args_ns, root_key, None)
+    if not root:
+        if required:
+            raise SystemExit(
+                f"dataset_format: voc requires `{root_key}` in the config"
+            )
+        return None
+    split = getattr(args_ns, split_key, None) or default_split
+    if not split:
+        return None
+    ds = VOCDetection(
+        root,
+        split=str(split),
+        mode=mode,
+        class_names=tuple(str(n) for n in args_ns.names),
+        keep_difficult=bool(getattr(args_ns, "keep_difficult", False)),
+    )
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        print(f"[data] {ds.describe()}")
+    return ds
+
+
 def build_data_loaders(
     args_ns: argparse.Namespace,
 ) -> Tuple[
@@ -510,32 +706,85 @@ def build_data_loaders(
     Optional[data.DataLoader],
     Optional[data.DataLoader],
 ]:
-    train_ds = SourceDomainDetection(args_ns.source_train_file, mode="train")
+    fmt = dataset_format(args_ns)
+    if fmt == "voc":
+        train_ds = _voc_dataset(
+            args_ns, "source_root", "source_train_split", "train", "train"
+        )
+    else:
+        train_ds = SourceDomainDetection(args_ns.source_train_file, mode="train")
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_ds, shuffle=True
     )
     train_loader = data.DataLoader(
         train_ds,
         args_ns.batch_size,
-        num_workers=args_ns.num_workers,
         collate_fn=detection_collate,
         sampler=train_sampler,
         pin_memory=True,
+        # The target loader already drops its uneven tail. Keeping the source
+        # loader's means the last batch of an epoch is len(dataset) %
+        # batch_size, which no longer lines up with the target batch the
+        # alignment and DAMamba losses pair it against. The dropped images are
+        # reshuffled back in next epoch, so nothing is systematically lost.
+        drop_last=bool(getattr(args_ns, "drop_last_train", True)),
+        **_loader_workers(args_ns, args_ns.num_workers),
     )
-    val_ds = SourceDomainDetection(args_ns.source_val_file, mode="val")
+    if fmt == "voc":
+        val_ds = _voc_dataset(
+            args_ns, "source_root", "source_val_split", "val", "val"
+        )
+    else:
+        val_ds = SourceDomainDetection(args_ns.source_val_file, mode="val")
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds, shuffle=False)
     val_loader = data.DataLoader(
         val_ds,
         args_ns.batch_size,
-        num_workers=0,
         collate_fn=detection_collate,
         sampler=val_sampler,
         pin_memory=True,
+        **_loader_workers(
+            args_ns, min(int(args_ns.num_workers or 0), 4), persistent=False
+        ),
     )
     target_ds: Optional[data.Dataset] = None
     target_loader: Optional[data.DataLoader] = None
     target_labeled = bool(getattr(args_ns, "is_use_supervised_target_loss", False))
-    if target_labeled:
+    if fmt == "voc":
+        from data.voc_dataset import voc_image_paths
+
+        if target_labeled:
+            target_ds = _voc_dataset(
+                args_ns, "target_root", "target_train_split", "train", "train"
+            )
+            if target_ds is None:
+                raise SystemExit(
+                    "is_use_supervised_target_loss: true requires `target_root` "
+                    "and `target_train_split`"
+                )
+        else:
+            tgt_root = getattr(args_ns, "target_root", None)
+            splits = [
+                str(getattr(args_ns, k, None) or d)
+                for k, d in (
+                    ("target_train_split", "train"),
+                    ("target_val_split", "val"),
+                    ("target_test_split", "test"),
+                )
+            ]
+            target_paths = []
+            if tgt_root:
+                for split in splits:
+                    try:
+                        target_paths += voc_image_paths(tgt_root, [split])
+                    except FileNotFoundError:
+                        continue
+                target_paths = list(dict.fromkeys(target_paths))
+            if target_paths:
+                target_ds = TargetUnlabeledDataset(
+                    size=cfg.INPUT_SIZE, paths=target_paths
+                )
+    elif target_labeled:
         target_train_file = getattr(args_ns, "target_train_file", None)
         if not (target_train_file and os.path.isfile(target_train_file)):
             raise SystemExit(
@@ -557,41 +806,68 @@ def build_data_loaders(
             target_loader = data.DataLoader(
                 target_ds,
                 args_ns.batch_size,
-                num_workers=args_ns.num_workers,
                 sampler=tgt_sampler,
                 pin_memory=True,
                 drop_last=True,
                 collate_fn=detection_collate if target_labeled else None,
+                **_loader_workers(args_ns, args_ns.num_workers),
             )
     target_val_loader: Optional[data.DataLoader] = None
     target_test_loader: Optional[data.DataLoader] = None
     target_val_file = getattr(args_ns, "target_val_file", None)
     target_test_file_train = getattr(args_ns, "target_test_file", None)
-    if target_val_file and os.path.isfile(target_val_file):
+    if fmt == "voc":
+        target_val_file = getattr(args_ns, "target_root", None)
+        target_test_file_train = target_val_file
+    if target_val_file and (fmt == "voc" or os.path.isfile(target_val_file)):
         try:
-            tvds = SourceDomainDetection(target_val_file, mode="val")
-            if len(tvds) > 0:
+            tvds = (
+                _voc_dataset(
+                    args_ns, "target_root", "target_val_split", "val", "val",
+                    required=False,
+                )
+                if fmt == "voc"
+                else SourceDomainDetection(target_val_file, mode="val")
+            )
+            if tvds is not None and len(tvds) > 0:
                 target_val_loader = data.DataLoader(
                     tvds,
                     args_ns.batch_size,
-                    num_workers=0,
                     collate_fn=detection_collate,
                     shuffle=False,
                     pin_memory=True,
+                    **_loader_workers(
+                        args_ns,
+                        min(int(args_ns.num_workers or 0), 4),
+                        persistent=False,
+                    ),
                 )
         except Exception as e:
             print(f"[WARN] target-val dataset disabled: {e}")
-    if target_test_file_train and os.path.isfile(target_test_file_train):
+    if target_test_file_train and (
+        fmt == "voc" or os.path.isfile(target_test_file_train)
+    ):
         try:
-            tteds = SourceDomainDetection(target_test_file_train, mode="val")
-            if len(tteds) > 0:
+            tteds = (
+                _voc_dataset(
+                    args_ns, "target_root", "target_test_split", "test", "val",
+                    required=False,
+                )
+                if fmt == "voc"
+                else SourceDomainDetection(target_test_file_train, mode="val")
+            )
+            if tteds is not None and len(tteds) > 0:
                 target_test_loader = data.DataLoader(
                     tteds,
                     args_ns.batch_size,
-                    num_workers=0,
                     collate_fn=detection_collate,
                     shuffle=False,
                     pin_memory=True,
+                    **_loader_workers(
+                        args_ns,
+                        min(int(args_ns.num_workers or 0), 4),
+                        persistent=False,
+                    ),
                 )
         except Exception as e:
             print(f"[WARN] target-test dataset disabled: {e}")
@@ -606,8 +882,23 @@ def adjust_learning_rate(optimizer: optim.Optimizer, gamma: float) -> None:
         g["lr"] = g["lr"] * gamma
 
 
+def require_weights(path: str, what: str) -> None:
+    """Abort training unless the pretrained `what` checkpoint is on disk."""
+    if os.path.isfile(path):
+        return
+    raise FileNotFoundError(
+        f"{what} weights not found: {path}\n"
+        f"Download the checkpoint into `save_folder` before training — "
+        f"without it {what} starts from random init and the run is worthless."
+    )
+
+
 def load_pretrained(
-    net: torch.nn.Module, basenet: str, save_folder: str, model: str, local_rank: int
+    net: torch.nn.Module,
+    basenet: str,
+    save_folder: str,
+    model: str,
+    local_rank: int,
 ) -> None:
     if "yolo" in model:
         if local_rank == 0:
@@ -615,12 +906,7 @@ def load_pretrained(
                   "skipping VGG pretrain.")
         return
     path = os.path.join(save_folder, basenet)
-    if not os.path.isfile(path):
-        if local_rank == 0:
-            print(
-                f"[WARN] base weights not found at {path} — training backbone from scratch"
-            )
-        return
+    require_weights(path, "backbone")
     base_weights = torch.load(path, weights_only=False)
     if local_rank == 0:
         print(f"Load base network {path}")
@@ -628,6 +914,49 @@ def load_pretrained(
         net.vgg.load_state_dict(base_weights)
     else:
         net.resnet.load_state_dict(base_weights)
+
+def freeze_leading_backbone(
+    net: torch.nn.Module, num_layers: int, local_rank: int = 0
+) -> int:
+    """Freeze the first ``num_layers`` entries of the VGG feature list.
+
+    This is fcos.pytorch's ``MODEL.VGG.FIXED_LAYERS`` (default 10 = conv1_1
+    through the second max-pool). The layers are built by the same `vgg()`
+    routine in both repos, so the index means the same thing.
+
+    Two reasons it matters here. Generalisation: a fully trainable 53.8M-param
+    detector on ~6.5k images overfits, and those early filters are generic
+    enough that the ImageNet ones are already right -- which is why FCOS gets
+    away with flip-only augmentation. Memory: with nothing upstream requiring
+    grad, autograd stops retaining the activations of the frozen prefix, and
+    those are the full-resolution ones.
+    """
+    num_layers = int(num_layers or 0)
+    if num_layers <= 0:
+        return 0
+    backbone = getattr(net, "vgg", None)
+    if backbone is None:
+        backbone = getattr(net, "backbone", None)
+    if backbone is None:
+        if local_rank == 0:
+            print("[freeze] no `vgg`/`backbone` module found — nothing frozen")
+        return 0
+    frozen_params, frozen_layers = 0, 0
+    for index in range(min(num_layers, len(backbone))):
+        for param in backbone[index].parameters():
+            param.requires_grad = False
+            frozen_params += param.numel()
+        frozen_layers += 1
+    if local_rank == 0:
+        total = sum(p.numel() for p in net.parameters())
+        trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        print(
+            f"🧊 [freeze] vgg_fixed_layers={num_layers} -> froze {frozen_layers} "
+            f"leading layers ({frozen_params / 1e6:.2f}M params); "
+            f"{trainable / 1e6:.2f}M of {total / 1e6:.2f}M still trainable"
+        )
+    return frozen_params
+
 
 def init_random_layers(net: torch.nn.Module) -> None:
     for layer in (
@@ -699,8 +1028,14 @@ def build_param_groups(
     ]
     if getattr(dsfd_net, "enhance", False):
         main_groups += [dsfd_net.sppf, dsfd_net.psa]
-    groups = [{"params": list(m.parameters()), "lr": lr} for m in main_groups]
-    groups.append({"params": list(dsfd_net.ref.parameters()), "lr": lr / 10.0})
+    groups = [
+        {"params": [p for p in m.parameters() if p.requires_grad], "lr": lr}
+        for m in main_groups
+    ]
+    groups = [g for g in groups if g["params"]]
+    ref_params = [p for p in dsfd_net.ref.parameters() if p.requires_grad]
+    if ref_params:
+        groups.append({"params": ref_params, "lr": lr / 10.0})
     discriminators = [
         p for m in align_modules(dsfd_net) for p in m.parameters() if p.requires_grad
     ]
@@ -949,6 +1284,19 @@ class TrainingContext:
             self.backbone,
             args_ns.num_exp,
         )
+        if local_rank == 0:
+            from data.transforms import build_transforms as _bt
+            print(
+                "[data] pipeline: {} | augmentation: {} | "
+                "target_use_transforms={}".format(
+                    getattr(cfg, "DATA_PIPELINE", "transforms"),
+                    getattr(cfg, "AUGMENTATION", "railight"),
+                    getattr(cfg, "TARGET_USE_TRANSFORMS", True),
+                )
+            )
+            if str(getattr(cfg, "DATA_PIPELINE", "transforms")) != "legacy":
+                print("[data] train transforms: {}".format(_bt("train")))
+                print("[data] val transforms:   {}".format(_bt("val")))
         prepare_offline_augmentation(args_ns, local_rank)
         (
             self.train_dataset,
@@ -965,6 +1313,10 @@ class TrainingContext:
         self.lr_schedule: Optional[LRSchedule] = None
         self.ema: Optional[ModelEMA] = None
         self.accumulate = 1
+        self.amp_dtype: Optional[torch.dtype] = None
+        # Replaced by setup_amp() in train(); a disabled scaler is a passthrough
+        # so the step code has a single path whether or not AMP is on.
+        self.scaler: Any = _make_grad_scaler(False)
         self.target_labeled = bool(
             getattr(args_ns, "is_use_supervised_target_loss", False)
         ) and self.target_dataset is not None
@@ -1055,6 +1407,12 @@ class TrainingContext:
             entity=getattr(args_ns, "wandb_entity", None),
             dir=getattr(args_ns, "wandb_dir", None),
         )
+
+    def autocast(self):
+        """Autocast context for the forward passes (no-op when AMP is off)."""
+        if self.amp_dtype is None:
+            return nullcontext()
+        return torch.autocast("cuda", dtype=self.amp_dtype)
 
     def next_target_batch(
         self,
@@ -1517,9 +1875,10 @@ def validate(
         _vmark[0] = time.perf_counter()
     class_aware = bool(getattr(ctx.args, "eval_class_aware", True))
     m, mAP, _ = _detection_summary(per_image, ctx.args.nc, class_aware)
-    src_macro = macro_summary(
-        per_class_detection_metrics(per_image, ctx.args.nc, ctx.class_names)
+    src_per_class = per_class_detection_metrics(
+        per_image, ctx.args.nc, ctx.class_names
     )
+    src_macro = macro_summary(src_per_class)
 
     tr_per_image: List[Dict[str, np.ndarray]] = []
     max_train_eval = 20
@@ -1598,6 +1957,13 @@ def validate(
             ("Recall", f"{m['recall']:.4f}"),
             ("F1 score", f"{m['f1']:.4f}"),
             ("mAP @ IoU 0.5", f"{mAP:.4f}"),
+            ("Macro mAP@50 (per-class mean)", f"{src_macro['macro_map50']:.4f}"),
+            ("Macro F1 @ score 0.5", f"{src_macro['macro_f1']:.4f}"),
+            (
+                "Macro best-F1 (per-class best threshold)",
+                f"{src_macro['macro_best_f1']:.4f} "
+                f"@ t≈{src_macro['macro_best_thr']:.2f}",
+            ),
             ("§", "Detection metrics (train subset)"),
             ("Train precision", f"{tmet['precision']:.4f}"),
             ("Train recall", f"{tmet['recall']:.4f}"),
@@ -1617,6 +1983,11 @@ def validate(
             ("Target mAP @ IoU 0.5 (micro)", f"{tgt_map:.4f}"),
             ("Target macro mAP@50 (per-class mean)", f"{tgt_macro['macro_map50']:.4f}"),
             ("Target macro F1 (per-class mean)", f"{tgt_macro['macro_f1']:.4f}"),
+            (
+                "Target macro best-F1 (per-class best threshold)",
+                f"{tgt_macro['macro_best_f1']:.4f} "
+                f"@ t≈{tgt_macro['macro_best_thr']:.2f}",
+            ),
             (
                 "Target TP / FP / FN",
                 f"{tgt_met['tp']} / {tgt_met['fp']} / {tgt_met['fn']}",
@@ -1646,6 +2017,12 @@ def validate(
     )
     
     print(table)
+    if src_per_class:
+        print(
+            format_per_class_table(
+                src_per_class, f"☀️  Per-class source-val metrics · epoch {epoch}"
+            )
+        )
     if tgt_per_class:
         print(
             format_per_class_table(
@@ -1655,6 +2032,12 @@ def validate(
     ctx.history["val_macro_map"].append((epoch, float(src_macro["macro_map50"])))
     ctx.history["target_macro_map"].append((epoch, float(tgt_macro["macro_map50"])))
     ctx.history["target_macro_f1"].append((epoch, float(tgt_macro["macro_f1"])))
+    ctx.history.setdefault("val_macro_best_f1", []).append(
+        (epoch, float(src_macro["macro_best_f1"]))
+    )
+    ctx.history.setdefault("target_macro_best_f1", []).append(
+        (epoch, float(tgt_macro["macro_best_f1"]))
+    )
     ctx.history["val_accuracy"].append((epoch, float(m["accuracy"])))
     ctx.history["val_precision"].append((epoch, float(m["precision"])))
     ctx.history["val_recall"].append((epoch, float(m["recall"])))
@@ -1701,8 +2084,13 @@ def validate(
             "target_fn": int(tgt_met["fn"]),
             "target_n": len(target_per_image),
             "val_macro_mAP": round(float(src_macro["macro_map50"]), 6),
+            "val_macro_f1": round(float(src_macro["macro_f1"]), 6),
+            "val_macro_best_f1": round(float(src_macro["macro_best_f1"]), 6),
+            "val_macro_best_thr": round(float(src_macro["macro_best_thr"]), 6),
             "target_macro_mAP": round(float(tgt_macro["macro_map50"]), 6),
             "target_macro_f1": round(float(tgt_macro["macro_f1"]), 6),
+            "target_macro_best_f1": round(float(tgt_macro["macro_best_f1"]), 6),
+            "target_macro_best_thr": round(float(tgt_macro["macro_best_thr"]), 6),
             **{
                 f"target_ap50_{name}": round(float(stats["ap50"]), 6)
                 for name, stats in tgt_per_class.items()
@@ -1722,12 +2110,20 @@ def validate(
         candidates = {
             "micro_f1": (float(tgt_met["f1"]), "target val micro F1"),
             "macro_f1": (float(tgt_macro["macro_f1"]), "target val macro F1"),
+            "macro_best_f1": (
+                float(tgt_macro["macro_best_f1"]),
+                "target val macro best-F1",
+            ),
             "macro_map": (float(tgt_macro["macro_map50"]), "target val macro mAP@50"),
         }
     else:
         candidates = {
             "micro_f1": (float(m["f1"]), "source val micro F1"),
             "macro_f1": (float(src_macro["macro_f1"]), "source val macro F1"),
+            "macro_best_f1": (
+                float(src_macro["macro_best_f1"]),
+                "source val macro best-F1",
+            ),
             "macro_map": (float(src_macro["macro_map50"]), "source val macro mAP@50"),
         }
     sel_f1, sel_name = candidates.get(selection, candidates["micro_f1"])
@@ -1860,9 +2256,15 @@ def train_one_epoch(
     
     prof_iters = int(os.environ.get("RAILIGHT_PROFILE_ITERS", "0") or "0")
 
-    prof_full = os.environ.get("RAILIGHT_PROFILE", "1").strip().lower() not in (
-        "0", "false", "no", "off",
-    )
+    # Every _lap() call issues torch.cuda.synchronize(); with ~15 laps per
+    # iteration that serialises the whole step and hides any overlap between
+    # data loading and compute. Driven by `profile:` in the config; the
+    # RAILIGHT_PROFILE env var overrides it for a one-off measurement.
+    prof_env = os.environ.get("RAILIGHT_PROFILE")
+    if prof_env is None:
+        prof_full = bool(getattr(ctx.args, "profile", False))
+    else:
+        prof_full = prof_env.strip().lower() in ("1", "true", "yes", "on")
     
     if prof_iters > 0 or prof_full:
         ctx._prof = {
@@ -1909,9 +2311,10 @@ def train_one_epoch(
                         class_seen += np.bincount(
                             lbl.numpy(), minlength=num_fg_classes
                         )
-        source_images = Variable(source_images.cuda() / 255.0)
+        source_images = Variable(source_images.cuda(non_blocking=True) / 255.0)
         source_targets_v = [
-            Variable(ann.cuda(), requires_grad=False) for ann in source_targets
+            Variable(ann.cuda(non_blocking=True), requires_grad=False)
+            for ann in source_targets
         ]
         target_batch = ctx.next_target_batch()
         target_images, target_labels = (
@@ -1923,6 +2326,20 @@ def train_one_epoch(
 
         if has_target:
             target_images = target_images.cuda(non_blocking=True) / 255.0
+            # The alignment and DA losses pair source with target row by row, so
+            # they need equal batch sizes. The two loaders disagree whenever one
+            # of them serves a partial batch -- the source loader has no
+            # drop_last, so its last batch of an epoch is len(dataset) %
+            # batch_size. validate() already truncates to the common size; do
+            # the same here. The detection loss still sees the full source
+            # batch, only the cross-domain terms are trimmed.
+            align_n = min(source_images.size(0), target_images.size(0))
+            if target_images.size(0) != align_n:
+                target_images = target_images[:align_n]
+                if target_labels is not None:
+                    target_labels = target_labels[:align_n]
+        else:
+            align_n = source_images.size(0)
             
         if prof_active:
             _lap("data_to_gpu")
@@ -1936,12 +2353,12 @@ def train_one_epoch(
 
         t0 = time.time()
 
-        with torch.no_grad():
-            R_source_gt, I_source = net_enh(source_images)
-            R_source_dark_gt, I_source_dark = net_enh(source_dark)
+        with torch.no_grad(), ctx.autocast():
+            R_source_gt, I_source = to_fp32(net_enh(source_images))
+            R_source_dark_gt, I_source_dark = to_fp32(net_enh(source_dark))
             I_target = None
             if has_target:
-                _, I_target = net_enh(target_images)
+                I_target = to_fp32(net_enh(target_images))[1]
             
         if prof_active:
             _lap("retinex_net_enh")
@@ -1951,10 +2368,11 @@ def train_one_epoch(
             if da_mask_present
             else None
         )
-        with net_inner.da_capture("source", present=present_source):
+        with net_inner.da_capture("source", present=present_source), ctx.autocast():
             out, out2 = net(
                 source_dark, source_images, I_source_dark.detach(), I_source.detach()
             )
+        out, out2 = to_fp32(out), to_fp32(out2)
         R_source_dark_inner, R_source_inner, R_dark_swap, R_light_swap = out2
         if prof_active:
             _lap("net_forward")
@@ -1977,15 +2395,18 @@ def train_one_epoch(
                 source_images, I_source, source_dark, I_source_dark,
             )
             for view_name, view_images, view_illum in views:
-                _, _, view_loss, R_target_train, view_parts = (
-                    net_inner.extract_features(
-                        view_images, target_images,
-                        view_illum.detach(), I_target.detach(),
-                        return_reflectance=True,
-                        return_parts=True,
-                        grl_lambda=grl_lambda,
+                with ctx.autocast():
+                    _, _, view_loss, R_target_train, view_parts = (
+                        net_inner.extract_features(
+                            view_images[:align_n], target_images,
+                            view_illum[:align_n].detach(), I_target.detach(),
+                            return_reflectance=True,
+                            return_parts=True,
+                            grl_lambda=grl_lambda,
+                        )
                     )
-                )
+                view_loss = view_loss.float()
+                R_target_train = to_fp32(R_target_train)
                 loss_kl_src_tgt = loss_kl_src_tgt + view_loss / len(views)
                 align_parts.update(
                     {f"{view_name}/{k}": v for k, v in view_parts.items()}
@@ -2038,6 +2459,7 @@ def train_one_epoch(
         if has_target and target_loss_weight > 0 and R_target_train is not None:
             I_t = I_target.detach()
             recon_target = R_target_train * I_t
+            target_images = target_images[: recon_target.size(0)]
             loss_target_unsup = (
                 F.mse_loss(recon_target, target_images)
                 + (1.0 - ssim(recon_target, target_images))
@@ -2066,11 +2488,13 @@ def train_one_epoch(
                 if (da_mask_present and target_labels is not None)
                 else None
             )
-            with net_inner.da_capture("target", present=present_target):
+            with net_inner.da_capture("target", present=present_target), ctx.autocast():
                 out_t, _ = net_inner.test_forward(target_images)
+            out_t = to_fp32(out_t)
             if sup_on:
                 target_labels_v = [
-                    Variable(ann.cuda(), requires_grad=False) for ann in target_labels
+                    Variable(ann.cuda(non_blocking=True), requires_grad=False)
+                    for ann in target_labels
                 ]
          
                 loss_ts_l1, loss_ts_c1 = criterion(out_t[:3], target_labels_v)
@@ -2087,9 +2511,10 @@ def train_one_epoch(
                 )
             if da_on:
                 da_grl = grl_lambda_at(iteration, max_steps, da_grl_gamma)
-                da_img, da_obj, da_parts = net_inner.damamba_align_loss(da_grl)
-                loss_da_img = da_img * da_img_weight * prog
-                loss_da_obj = da_obj * da_obj_weight * prog
+                with ctx.autocast():
+                    da_img, da_obj, da_parts = net_inner.damamba_align_loss(da_grl)
+                loss_da_img = da_img.float() * da_img_weight * prog
+                loss_da_obj = da_obj.float() * da_obj_weight * prog
                 align_parts.update({f"da_{k}": v for k, v in da_parts.items()})
                 for key, value in da_parts.items():
                     if key.endswith("_acc"):
@@ -2157,15 +2582,20 @@ def train_one_epoch(
             if (not is_step and hasattr(net, "no_sync"))
             else nullcontext()
         )
+        scaler = ctx.scaler
         with sync_ctx:
-            (loss / accumulate).backward()
+            scaler.scale(loss / accumulate).backward()
 
         if prof_active:
             _lap("backward")
 
         if is_step:
+            # Gradients must be unscaled before clipping, otherwise max_norm=35
+            # is applied to loss-scaled gradients and clips nothing.
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=35, norm_type=2)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
             if ctx.ema is not None:
                 ctx.ema.update(net)
@@ -2409,6 +2839,14 @@ def train(ctx: TrainingContext) -> None:
         cfg.FOCAL.ALPHA_BG = float(
             getattr(args_ns, "focal_alpha_bg", cfg.FOCAL.ALPHA_BG)
         )
+    overlap_thresh = getattr(args_ns, "overlap_thresh", None)
+    if overlap_thresh is not None:
+        cfg.FACE.OVERLAP_THRESH = float(overlap_thresh)
+    if ctx.local_rank == 0:
+        print(
+            f"[anchors] positive IoU threshold = {cfg.FACE.OVERLAP_THRESH} "
+            f"(0.35 is the inherited WIDER-FACE default)"
+        )
     if hasattr(cfg, "STAL"):
         cfg.STAL.ENABLED = bool(getattr(args_ns, "stal_enabled", cfg.STAL.ENABLED))
         cfg.STAL.REF_AREA = float(getattr(args_ns, "stal_ref_area", cfg.STAL.REF_AREA))
@@ -2438,15 +2876,10 @@ def train(ctx: TrainingContext) -> None:
     net_enh = RetinexNet()
     retinex_path = os.path.join(args_ns.save_folder, RETINEX_WEIGHTS)
     
-    if os.path.isfile(retinex_path):
-        net_enh.load_state_dict(torch.load(retinex_path, weights_only=False))
-        if ctx.local_rank == 0:
-            print(f"Loaded RetinexNet from {retinex_path}")
-            
-    elif ctx.local_rank == 0:
-        print(
-            f"[WARN] {retinex_path} missing — RetinexNet trained from scratch (pseudo-GT will be noisy)"
-        )
+    require_weights(retinex_path, "RetinexNet")
+    net_enh.load_state_dict(torch.load(retinex_path, weights_only=False))
+    if ctx.local_rank == 0:
+        print(f"Loaded RetinexNet from {retinex_path}")
         
     start_epoch = 0
     iteration = 0
@@ -2458,12 +2891,17 @@ def train(ctx: TrainingContext) -> None:
         iteration = start_epoch * per_epoch_size
         if ctx.local_rank == 0:
             print(
-                f"[resume] continuing from epoch {start_epoch} (iter {iteration})"
+                f"[resume] continuing from epoch {start_epoch} (iter {iteration}) — "
+                f"backbone comes from the checkpoint, {basenet} is not read"
             )
             
     else:
         load_pretrained(
-            net, basenet, args_ns.save_folder, args_ns.model, ctx.local_rank
+            net,
+            basenet,
+            args_ns.save_folder,
+            args_ns.model,
+            ctx.local_rank,
         )
         if ctx.local_rank == 0:
             print("Initializing weights...")
@@ -2472,6 +2910,9 @@ def train(ctx: TrainingContext) -> None:
             init_focal_bias([net.conf_pal1, net.conf_pal2], num_classes)
             if ctx.local_rank == 0:
                 print("[focal] applied RetinaNet classification bias prior")
+    freeze_leading_backbone(
+        net, getattr(args_ns, "vgg_fixed_layers", 0), ctx.local_rank
+    )
     ctx.wreg_ref = snapshot_wreg_ref(net)
     if ctx.local_rank == 0:
         print(
@@ -2503,6 +2944,21 @@ def train(ctx: TrainingContext) -> None:
             )
             net_enh = torch.nn.parallel.DistributedDataParallel(net_enh)
         cudnn.benchmark = True
+    ctx.amp_dtype, ctx.scaler = setup_amp(args_ns, ctx.local_rank)
+    if ctx.local_rank == 0:
+        _amp_label = {None: "off"}.get(
+            ctx.amp_dtype, str(ctx.amp_dtype).replace("torch.", "")
+        )
+        print(
+            "🔧 [speed] amp={} | match_on_device={} | persistent_workers={} | "
+            "prefetch_factor={} | profile={}".format(
+                _amp_label,
+                bool(getattr(args_ns, "match_on_device", True)),
+                bool(getattr(args_ns, "loader_persistent_workers", True)),
+                getattr(args_ns, "loader_prefetch_factor", None),
+                bool(getattr(args_ns, "profile", False)),
+            )
+        )
     focal_loss_fn = None
     
     if getattr(cfg, "FOCAL", None) is not None and cfg.FOCAL.ENABLED:
@@ -2514,11 +2970,28 @@ def train(ctx: TrainingContext) -> None:
             and os.path.isfile(target_train_file)
         ):
             alpha_files.append(target_train_file)
-        alpha = compute_focal_alpha(
-            alpha_files, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
-        )
-        if ctx.local_rank == 0:
-            print(f"[focal] class prior estimated from {alpha_files}")
+        if dataset_format(args_ns) == "voc":
+            label_sources = [ctx.train_dataset.labels]
+            if (
+                bool(getattr(args_ns, "focal_alpha_include_target", False))
+                and ctx.target_dataset is not None
+                and hasattr(ctx.target_dataset, "labels")
+            ):
+                label_sources.append(ctx.target_dataset.labels)
+            alpha = compute_focal_alpha_from_labels(
+                label_sources, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
+            )
+            if ctx.local_rank == 0:
+                print(
+                    "[focal] class prior counted from "
+                    f"{len(label_sources)} VOC dataset(s)"
+                )
+        else:
+            alpha = compute_focal_alpha(
+                alpha_files, num_classes, bg_weight=cfg.FOCAL.ALPHA_BG
+            )
+            if ctx.local_rank == 0:
+                print(f"[focal] class prior estimated from {alpha_files}")
         class_weights = getattr(args_ns, "focal_class_weights", None) or dict(
             getattr(cfg.FOCAL, "CLASS_WEIGHTS", {}) or {}
         )
@@ -2553,6 +3026,7 @@ def train(ctx: TrainingContext) -> None:
         cfg, args_ns.cuda,
         cls_loss_fn=focal_loss_fn,
         box_loss_fn=box_loss_fn,
+        match_on_device=bool(getattr(args_ns, "match_on_device", True)),
     )
     
     use_rc_loss = bool(getattr(args_ns, "is_use_rc_loss", True))

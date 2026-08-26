@@ -207,6 +207,58 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "viz_max_source_batches": 30,
     "viz_max_target_batches": 30,
     "box_loss": "smooth_l1",
+    # --- throughput / memory switches -------------------------------------
+    # Each one falls back to the original behaviour when turned off.
+    # off | fp16 | bf16 (or a bool). Half-precision activations with fp32
+    # losses -- roughly halves the memory of every forward pass in a step.
+    "amp": False,
+    # Build the SSD match targets on the GPU instead of assembling them on the
+    # CPU and copying back once per image. Numerically identical.
+    "match_on_device": True,
+    # Keep DataLoader workers alive across epochs and let them run ahead.
+    "loader_persistent_workers": True,
+    "loader_prefetch_factor": 4,
+    # Per-stage timings. Costs one torch.cuda.synchronize() per stage (~15 per
+    # iteration), so it is off unless you are actually measuring.
+    "profile": False,
+    # Positive-anchor IoU threshold. None keeps cfg.FACE.OVERLAP_THRESH (0.35,
+    # inherited from WIDER-FACE); 0.5 is the usual choice for object detection.
+    "overlap_thresh": None,
+    # "railight" = colour jitter + random crop + mosaic + scale jitter + the
+    # offline strong-augmented bank. "fcos" = horizontal flip only.
+    "augmentation": "railight",
+    # "railight" = the .txt list format; "voc" = a Pascal VOC directory
+    # (Annotations/ + JPEGImages/ + ImageSets/Main/), the layout fcos.pytorch
+    # reads, configured with source_root/target_root + *_split below.
+    "dataset_format": "railight",
+    "source_root": None,
+    "target_root": None,
+    "source_train_split": "train",
+    "source_val_split": "val",
+    "source_test_split": "test",
+    "target_train_split": "train",
+    "target_val_split": "val",
+    "target_test_split": "test",
+    "keep_difficult": False,
+    # Freeze the first N entries of the VGG feature list (fcos.pytorch uses 10 =
+    # conv1_1 through the second max-pool). 0 keeps everything trainable.
+    "vgg_fixed_layers": 0,
+    # "full" | "detection_only". detection_only zeroes every domain-adaptation
+    # term so you can see the detector's own ceiling.
+    "loss_preset": "full",
+    # Drop the uneven tail of each training epoch so source and target batches
+    # always pair up. The target loader already does this.
+    "drop_last_train": True,
+    # Anchor bank. null keeps the WIDER-FACE values inherited from DSFD.
+    "anchor_sizes1": None,
+    "anchor_sizes2": None,
+    "aspect_ratio": None,
+    # "transforms" = composable (image, target) pipeline in data/transforms.py;
+    # "legacy" = the monolithic utils.augmentations.preprocess().
+    "data_pipeline": "transforms",
+    # Send unlabelled target images through the same val pipeline as the source
+    # images (same letterboxing, same RGB channel order).
+    "target_use_transforms": True,
     "use_night_synthesis": "dark_isp",
     "night_synthesis_seed": None,
     "night_profile": None,
@@ -307,6 +359,58 @@ TEST_DEFAULTS: Dict[str, Any] = {
     "focal_gamma": 2.0,
     "focal_alpha_bg": 0.25,
     "box_loss": "smooth_l1",
+    # --- throughput / memory switches -------------------------------------
+    # Each one falls back to the original behaviour when turned off.
+    # off | fp16 | bf16 (or a bool). Half-precision activations with fp32
+    # losses -- roughly halves the memory of every forward pass in a step.
+    "amp": False,
+    # Build the SSD match targets on the GPU instead of assembling them on the
+    # CPU and copying back once per image. Numerically identical.
+    "match_on_device": True,
+    # Keep DataLoader workers alive across epochs and let them run ahead.
+    "loader_persistent_workers": True,
+    "loader_prefetch_factor": 4,
+    # Per-stage timings. Costs one torch.cuda.synchronize() per stage (~15 per
+    # iteration), so it is off unless you are actually measuring.
+    "profile": False,
+    # Positive-anchor IoU threshold. None keeps cfg.FACE.OVERLAP_THRESH (0.35,
+    # inherited from WIDER-FACE); 0.5 is the usual choice for object detection.
+    "overlap_thresh": None,
+    # "railight" = colour jitter + random crop + mosaic + scale jitter + the
+    # offline strong-augmented bank. "fcos" = horizontal flip only.
+    "augmentation": "railight",
+    # "railight" = the .txt list format; "voc" = a Pascal VOC directory
+    # (Annotations/ + JPEGImages/ + ImageSets/Main/), the layout fcos.pytorch
+    # reads, configured with source_root/target_root + *_split below.
+    "dataset_format": "railight",
+    "source_root": None,
+    "target_root": None,
+    "source_train_split": "train",
+    "source_val_split": "val",
+    "source_test_split": "test",
+    "target_train_split": "train",
+    "target_val_split": "val",
+    "target_test_split": "test",
+    "keep_difficult": False,
+    # Freeze the first N entries of the VGG feature list (fcos.pytorch uses 10 =
+    # conv1_1 through the second max-pool). 0 keeps everything trainable.
+    "vgg_fixed_layers": 0,
+    # "full" | "detection_only". detection_only zeroes every domain-adaptation
+    # term so you can see the detector's own ceiling.
+    "loss_preset": "full",
+    # Drop the uneven tail of each training epoch so source and target batches
+    # always pair up. The target loader already does this.
+    "drop_last_train": True,
+    # Anchor bank. null keeps the WIDER-FACE values inherited from DSFD.
+    "anchor_sizes1": None,
+    "anchor_sizes2": None,
+    "aspect_ratio": None,
+    # "transforms" = composable (image, target) pipeline in data/transforms.py;
+    # "legacy" = the monolithic utils.augmentations.preprocess().
+    "data_pipeline": "transforms",
+    # Send unlabelled target images through the same val pipeline as the source
+    # images (same letterboxing, same RGB channel order).
+    "target_use_transforms": True,
     "use_night_synthesis": "dark_isp",
     "night_synthesis_seed": 43,
     "night_profile": None,
@@ -341,8 +445,10 @@ WANDB_EPOCH_KEYS: Dict[str, str] = {
     "val_f1": "val/f1",
     "val_map": "val/mAP",
     "val_macro_map": "val/macro_mAP",
+    "val_macro_best_f1": "val/macro_best_f1",
     "target_macro_map": "target/macro_mAP",
     "target_macro_f1": "target/macro_f1",
+    "target_macro_best_f1": "target/macro_best_f1",
     "val_kl_st": "val/kl_st",
     "val_align_mmd": "val/align_mmd",
     "val_align_gap": "val/align_gap",

@@ -487,6 +487,9 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
         cfg.FOCAL.ALPHA_BG = float(
             getattr(args_ns, "focal_alpha_bg", cfg.FOCAL.ALPHA_BG)
         )
+    overlap_thresh = getattr(args_ns, "overlap_thresh", None)
+    if overlap_thresh is not None:
+        cfg.FACE.OVERLAP_THRESH = float(overlap_thresh)
     print(f"[data] classes ({len(class_names)}): {list(class_names)}")
     night_synthesis, synthesize_night = make_night_synthesizer(args_ns)
     print(f"[data] night synthesis: {night_synthesis}")
@@ -771,7 +774,8 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, float]:
                 getattr(args_ns, "box_loss", "smooth_l1")
             )
             tgt_criterion = MultiBoxLoss(
-                cfg, use_cuda, cls_loss_fn=cls_loss_fn, box_loss_fn=box_loss_fn
+                cfg, use_cuda, cls_loss_fn=cls_loss_fn, box_loss_fn=box_loss_fn,
+                match_on_device=bool(getattr(args_ns, "match_on_device", True)),
             )
 
             tgt_n_imgs = len(tgt_ds)

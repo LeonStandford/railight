@@ -376,6 +376,13 @@ class DSFD(nn.Module):
         if cached is None:
             with torch.no_grad():
                 cached = PriorBox(size, features_maps, cfg, pal=pal).forward()
+                # Keep the prior bank on the model's device: the loss consumes it
+                # every iteration and a CPU-resident copy means a host-to-device
+                # transfer of ~200k boxes per call.
+                try:
+                    cached = cached.to(next(self.parameters()).device)
+                except StopIteration:
+                    pass
             self._prior_cache[key] = cached
         return cached
 

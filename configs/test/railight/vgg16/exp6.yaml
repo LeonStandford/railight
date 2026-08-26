@@ -1,0 +1,74 @@
+architecture: railight
+backbone: vgg16
+num_exp: exp6_uda_dark_isp_fcosaug_freeze10_batch6
+
+weights: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/weights/railight/vgg16/exp6_uda_dark_isp_fcosaug_freeze10_batch6/best_model.pth
+
+cuda: true
+gpu_ids: 0
+batch_size: 4
+
+amp: bf16
+match_on_device: true
+loader_persistent_workers: true
+loader_prefetch_factor: 4
+profile: false
+augmentation: fcos
+data_pipeline: transforms
+target_use_transforms: true
+
+input_size: 640
+letterbox: true
+overlap_thresh: 0.5
+box_loss: ciou
+focal_enabled: true
+focal_gamma: 2.0
+focal_alpha_bg: 0.25
+
+source_test_files:
+  - /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/source_test.txt
+
+target_test_files:
+  - /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/target_test.txt
+
+export_predicted_source_path: null
+export_predicted_target_path: null
+export_fp_fn_samples_path: null
+
+nc: 8
+names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
+
+charts_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/charts
+records_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/records
+log_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/logs
+
+viz_num_samples: 6
+
+is_run_confusion_matrix: true
+is_run_samples_grid: true
+is_run_tsne_reflectance: true
+is_run_domain_gap: true
+
+iou_thr: 0.5
+score_thr_cm: 0.5
+nms_iou_thr: 0.35
+
+use_night_synthesis: dark_isp
+night_synthesis_seed: 43
+
+da:
+  da_align_enabled: false
+  da_ia_enabled: false
+  da_oa_enabled: false
+  da_ia_levels: [0, 1, 2]
+  da_oa_levels: [0, 1, 2]
+  da_reduction: 2.0
+  da_context_impl: pool
+  da_max_tokens: 1024
+  da_disc_hidden: 256
+  da_disc_max_size: 80
+  da_prototype_source: clip
+  da_prototype_dim: 512
+  da_prototype_learnable: false
+  da_prototype_mask_present: false
+  da_clip_model: openai/clip-vit-base-patch32
