@@ -87,8 +87,14 @@ def match_ssd(threshold, truths, priors, variances, labels, loc_t, conf_t, idx):
     best_prior_idx.squeeze_(1)
     best_prior_overlap.squeeze_(1)
     best_truth_overlap.index_fill_(0, best_prior_idx, 2)
-    for j in range(best_prior_idx.size(0)):
-        best_truth_idx[best_prior_idx[j]] = j
+    # Vectorised form of `for j: best_truth_idx[best_prior_idx[j]] = j`.
+    # The Python loop indexed a CUDA tensor once per ground-truth box, which
+    # forced a device synchronisation per box; index_copy_ does it in one kernel.
+    best_truth_idx.index_copy_(
+        0,
+        best_prior_idx,
+        torch.arange(best_prior_idx.size(0), device=best_prior_idx.device),
+    )
     matches = truths[best_truth_idx]
     conf = labels[best_truth_idx]
     conf[best_truth_overlap < threshold] = 0

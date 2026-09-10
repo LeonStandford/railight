@@ -1,0 +1,467 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
+
+__all__ = [
+    "flatten_da_block",
+    "TRAIN_DEFAULTS",
+    "TEST_DEFAULTS",
+    "WANDB_EPOCH_KEYS",
+    "EVAL_SCORE_THR",
+    "ALIGN_LOSSES",
+    "ALIGN_DISTRIBUTION_PRESET",
+    "ALIGN_PRESETS",
+    "ALIGN_CONFIG_KEYS",
+    "ALIGN_STATE_PREFIXES",
+    "YOLO_TAP_NAMES",
+    "YOLO_TAP_DIMS",
+    "SOURCE_VIEWS",
+    "_TRAIN_DEFAULTS",
+    "_TEST_DEFAULTS",
+    "_WANDB_EPOCH_KEYS",
+]
+
+EVAL_SCORE_THR: float = 0.05
+
+ALIGN_LOSSES: Tuple[str, ...] = ("distill_kl", "moment", "coral", "mmd", "composite")
+
+ALIGN_DISTRIBUTION_PRESET: Dict[str, Any] = {
+    "queue_size": 256,
+    "standardize": True,
+    "taps": (5, 10, 16),
+    "swap_weight": 1.0,
+    "reflectance_weight": 1.0,
+    "source_view": "dark",
+}
+
+ALIGN_PRESETS: Dict[str, Dict[str, Any]] = {
+    "distill_kl": {
+        "kl_weight": 1.0,
+        "mmd_weight": 0.0,
+        "coral_weight": 0.0,
+        "queue_size": 0,
+        "standardize": False,
+        "taps": (5,),
+        "swap_weight": 1.0,
+        "reflectance_weight": 0.0,
+        "source_view": "light",
+    },
+    "mmd": {
+        **ALIGN_DISTRIBUTION_PRESET,
+        "kl_weight": 0.0,
+        "mmd_weight": 1.0,
+        "coral_weight": 0.0,
+    },
+    "coral": {
+        **ALIGN_DISTRIBUTION_PRESET,
+        "kl_weight": 0.0,
+        "mmd_weight": 0.0,
+        "coral_weight": 1.0,
+    },
+    "moment": {
+        **ALIGN_DISTRIBUTION_PRESET,
+        "kl_weight": 0.0,
+        "mmd_weight": 0.0,
+        "coral_weight": 1.0,
+    },
+    "composite": {
+        **ALIGN_DISTRIBUTION_PRESET,
+        "kl_weight": 1.0,
+        "mmd_weight": 1.0,
+        "coral_weight": 1.0,
+    },
+}
+
+ALIGN_CONFIG_KEYS: Dict[str, str] = {
+    "align_loss": "TYPE",
+    "align_temperature": "TEMPERATURE",
+    "align_momentum": "MOMENTUM",
+    "align_covariance_weight": "COVARIANCE_WEIGHT",
+    "align_taps": "TAPS",
+    "align_tap_weights": "TAP_WEIGHTS",
+    "align_kl_weight": "KL_WEIGHT",
+    "align_mmd_weight": "MMD_WEIGHT",
+    "align_coral_weight": "CORAL_WEIGHT",
+    "align_queue_size": "QUEUE_SIZE",
+    "align_standardize": "STANDARDIZE",
+    "align_swap_weight": "SWAP_WEIGHT",
+    "align_reflectance_weight": "REFLECTANCE_WEIGHT",
+    "align_reflectance_pool": "REFLECTANCE_POOL",
+    "align_source_view": "SOURCE_VIEW",
+    "align_adv_weight": "ADV_WEIGHT",
+    "align_adv_hidden": "ADV_HIDDEN",
+    "align_local_weight": "LOCAL_WEIGHT",
+    "align_local_pool": "LOCAL_POOL",
+    "align_mean_weight": "MEAN_WEIGHT",
+}
+
+ALIGN_STATE_PREFIXES: Tuple[str, ...] = (
+    "align_heads.",
+    "align_local.",
+    "align_swap.",
+    "align_reflectance.",
+    "ia_align.",
+    "oa_align.",
+    "da_disc_img.",
+    "da_disc_obj.",
+    "da_prototypes.",
+)
+
+YOLO_TAP_NAMES: Tuple[str, ...] = ("shallow", "of1", "of2", "of3", "of4")
+
+YOLO_TAP_DIMS: Dict[str, int] = {
+    "shallow": 64,
+    "of1": 256,
+    "of2": 512,
+    "of3": 512,
+    "of4": 1024,
+}
+
+SOURCE_VIEWS: Tuple[str, ...] = ("dark", "light", "both")
+
+def flatten_da_block(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    nested = cfg.get("da")
+    if not isinstance(nested, dict):
+        return cfg
+    flat = {k: v for k, v in cfg.items() if k != "da"}
+    for key, value in nested.items():
+        name = key if key.startswith("da_") else f"da_{key}"
+        flat.setdefault(name, value)
+    return flat
+
+
+
+TRAIN_DEFAULTS: Dict[str, Any] = {
+    "batch_size": 4,
+    "num_workers": 0,
+    "cuda": True,
+    "lr": 0.0005,
+    "momentum": 0.9,
+    "weight_decay": 0.0005,
+    "gamma": 0.1,
+    "gpu_ids": 0,
+    "save_folder": "weights/",
+    "source_train_file": "./dataset/source_train.txt",
+    "source_val_file": "./dataset/source_val.txt",
+    "source_test_file": "./dataset/source_test.txt",
+    "nc": 3,
+    "names": None,
+    "charts_dir": "./charts",
+    "records_dir": "./records",
+    "log_dir": "./logs",
+    "viz_num_samples": 6,
+    "viz_full_every_epochs": 1,
+    "resume": None,
+    "kl_loss_weight": 1.0,
+    "kl_loss_max": 50.0,
+    "target_loss_weight": 0.05,
+    "is_use_supervised_target_loss": False,
+    "supervised_target_loss_weight": 1.0,
+    "wreg_loss_weight": 0.0001,
+    "entropy_loss_weight": 0.01,
+    "optimizer": "sgd",
+    "muon_ratio": 0.5,
+    "prog_warmup_iters": 0,
+    "stal_enabled": False,
+    "stal_ref_area": 0.02,
+    "stal_max_w": 4.0,
+    "is_use_rc_loss": True,
+    "target_train_file": "./dataset/target_train.txt",
+    "target_val_file": "./dataset/target_val.txt",
+    "target_test_file": "./dataset/target_test.txt",
+    "align_loss": "composite",
+    "align_temperature": 4.0,
+    "align_momentum": 0.05,
+    "align_covariance_weight": 1.0,
+    "align_taps": None,
+    "align_tap_weights": None,
+    "align_kl_weight": None,
+    "align_mmd_weight": None,
+    "align_coral_weight": None,
+    "align_queue_size": None,
+    "align_standardize": None,
+    "align_swap_weight": None,
+    "align_reflectance_weight": None,
+    "align_reflectance_pool": 4,
+    "align_source_view": None,
+    "align_adv_weight": None,
+    "align_adv_hidden": None,
+    "align_local_weight": None,
+    "align_local_pool": None,
+    "align_mean_weight": None,
+    "align_lambda_gamma": 0.0,
+    "align_disc_lr_mult": 1.0,
+    "align_eval_batches": 10,
+    "focal_enabled": True,
+    "focal_gamma": 2.0,
+    "focal_alpha_bg": 0.25,
+    "focal_class_weights": None,
+    "backbone_scale": None,
+    "backbone_weights": "auto",
+    "pretrained_model": None,
+    "use_wandb": False,
+    "wandb_project": "railight-railway",
+    "wandb_entity": None,
+    "wandb_dir": None,
+    "val_every_epochs": 1,
+    "viz_max_source_batches": 30,
+    "viz_max_target_batches": 30,
+    "box_loss": "smooth_l1",
+    # --- throughput / memory switches -------------------------------------
+    # Each one falls back to the original behaviour when turned off.
+    # off | fp16 | bf16 (or a bool). Half-precision activations with fp32
+    # losses -- roughly halves the memory of every forward pass in a step.
+    "amp": False,
+    # Build the SSD match targets on the GPU instead of assembling them on the
+    # CPU and copying back once per image. Numerically identical.
+    "match_on_device": True,
+    # Keep DataLoader workers alive across epochs and let them run ahead.
+    "loader_persistent_workers": True,
+    "loader_prefetch_factor": 4,
+    # Per-stage timings. Costs one torch.cuda.synchronize() per stage (~15 per
+    # iteration), so it is off unless you are actually measuring.
+    "profile": False,
+    # Positive-anchor IoU threshold. None keeps cfg.FACE.OVERLAP_THRESH (0.35,
+    # inherited from WIDER-FACE); 0.5 is the usual choice for object detection.
+    "overlap_thresh": None,
+    # "railight" = colour jitter + random crop + mosaic + scale jitter + the
+    # offline strong-augmented bank. "fcos" = horizontal flip only.
+    "augmentation": "railight",
+    # "railight" = the .txt list format; "voc" = a Pascal VOC directory
+    # (Annotations/ + JPEGImages/ + ImageSets/Main/), the layout fcos.pytorch
+    # reads, configured with source_root/target_root + *_split below.
+    "dataset_format": "railight",
+    "source_root": None,
+    "target_root": None,
+    "source_train_split": "train",
+    "source_val_split": "val",
+    "source_test_split": "test",
+    "target_train_split": "train",
+    "target_val_split": "val",
+    "target_test_split": "test",
+    "keep_difficult": False,
+    # Freeze the first N entries of the VGG feature list (fcos.pytorch uses 10 =
+    # conv1_1 through the second max-pool). 0 keeps everything trainable.
+    "vgg_fixed_layers": 0,
+    # "full" | "detection_only". detection_only zeroes every domain-adaptation
+    # term so you can see the detector's own ceiling.
+    "loss_preset": "full",
+    # Drop the uneven tail of each training epoch so source and target batches
+    # always pair up. The target loader already does this.
+    "drop_last_train": True,
+    # Anchor bank. null keeps the WIDER-FACE values inherited from DSFD.
+    "anchor_sizes1": None,
+    "anchor_sizes2": None,
+    "aspect_ratio": None,
+    # "transforms" = composable (image, target) pipeline in data/transforms.py;
+    # "legacy" = the monolithic utils.augmentations.preprocess().
+    "data_pipeline": "transforms",
+    # Send unlabelled target images through the same val pipeline as the source
+    # images (same letterboxing, same RGB channel order).
+    "target_use_transforms": True,
+    "use_night_synthesis": "dark_isp",
+    "night_synthesis_seed": None,
+    "night_profile": None,
+    "epochs": 100,
+    "max_steps": 150000,
+    "lr_steps": [20000, 25000, 30000],
+    "lr_schedule": "step",
+    "warmup_iters": 0,
+    "warmup_epochs": 0.0,
+    "lr_final_ratio": 0.01,
+    "nominal_batch_size": 0,
+    "lr_scale_by_effective_batch": False,
+    "model_selection": "micro_f1",
+    "ema_enabled": False,
+    "ema_decay": 0.9999,
+    "ema_warmup_iters": 2000,
+    "letterbox": False,
+    "scale_jitter": 0.0,
+    "mosaic_prob": 0.0,
+    "input_size": 640,
+    "offline_aug_dir": None,
+    "offline_aug_mode": "crop",
+    "focal_alpha_include_target": False,
+    "flip_label_swap": [[4, 5], [5, 4]],
+    "eval_class_aware": True,
+    "seed": 42,
+    "da_align_enabled": False,
+    "da_ia_enabled": True,
+    "da_oa_enabled": True,
+    "da_ia_levels": [0, 1, 2],
+    "da_oa_levels": [0, 1, 2],
+    "da_img_adv_weight": 1.0,
+    "da_obj_adv_weight": 0.5,
+    "da_grl_gamma": 10.0,
+    "da_fg_topk_frac": 0.25,
+    "da_reduction": 2.0,
+    "da_context_impl": "pool",
+    "da_max_tokens": 1024,
+    "da_disc_hidden": 256,
+    "da_disc_max_size": 80,
+    "da_prototype_source": "clip",
+    "da_prototype_dim": 512,
+    "da_prototype_learnable": False,
+    "da_prototype_mask_present": False,
+    "da_clip_model": "openai/clip-vit-base-patch32",
+}
+
+TEST_DEFAULTS: Dict[str, Any] = {
+    "batch_size": 1,
+    "num_workers": 0,
+    "cuda": True,
+    "source_train_file": "./dataset/source_train.txt",
+    "source_val_file": "./dataset/source_val.txt",
+    "source_test_files": ["./dataset/source_test.txt"],
+    "target_train_file": "./dataset/target_train.txt",
+    "target_val_file": "./dataset/target_val.txt",
+    "target_test_files": ["./dataset/target_test.txt"],
+    "nc": 3,
+    "names": None,
+    "source_folder": "",
+    "charts_dir": "./charts",
+    "records_dir": "./records",
+    "log_dir": "./logs",
+    "mode_name": "test",
+    "viz_num_samples": 6,
+    "weights": None,
+    "iou_thr": 0.5,
+    "score_thr_cm": 0.5,
+    "nms_iou_thr": 0.35,
+    "export_predicted_source_path": None,
+    "export_predicted_target_path": None,
+    "export_fp_fn_samples_path": None,
+    "is_run_tsne_reflectance": True,
+    "is_run_domain_gap": True,
+    "is_run_confusion_matrix": True,
+    "is_run_samples_grid": True,
+    "align_loss": "composite",
+    "align_temperature": 4.0,
+    "align_momentum": 0.05,
+    "align_covariance_weight": 1.0,
+    "align_taps": None,
+    "align_tap_weights": None,
+    "align_kl_weight": None,
+    "align_mmd_weight": None,
+    "align_coral_weight": None,
+    "align_queue_size": None,
+    "align_standardize": None,
+    "align_swap_weight": None,
+    "align_reflectance_weight": None,
+    "align_reflectance_pool": 4,
+    "align_source_view": None,
+    "align_adv_weight": None,
+    "align_adv_hidden": None,
+    "align_local_weight": None,
+    "align_local_pool": None,
+    "align_mean_weight": None,
+    "focal_enabled": True,
+    "focal_gamma": 2.0,
+    "focal_alpha_bg": 0.25,
+    "box_loss": "smooth_l1",
+    # --- throughput / memory switches -------------------------------------
+    # Each one falls back to the original behaviour when turned off.
+    # off | fp16 | bf16 (or a bool). Half-precision activations with fp32
+    # losses -- roughly halves the memory of every forward pass in a step.
+    "amp": False,
+    # Build the SSD match targets on the GPU instead of assembling them on the
+    # CPU and copying back once per image. Numerically identical.
+    "match_on_device": True,
+    # Keep DataLoader workers alive across epochs and let them run ahead.
+    "loader_persistent_workers": True,
+    "loader_prefetch_factor": 4,
+    # Per-stage timings. Costs one torch.cuda.synchronize() per stage (~15 per
+    # iteration), so it is off unless you are actually measuring.
+    "profile": False,
+    # Positive-anchor IoU threshold. None keeps cfg.FACE.OVERLAP_THRESH (0.35,
+    # inherited from WIDER-FACE); 0.5 is the usual choice for object detection.
+    "overlap_thresh": None,
+    # "railight" = colour jitter + random crop + mosaic + scale jitter + the
+    # offline strong-augmented bank. "fcos" = horizontal flip only.
+    "augmentation": "railight",
+    # "railight" = the .txt list format; "voc" = a Pascal VOC directory
+    # (Annotations/ + JPEGImages/ + ImageSets/Main/), the layout fcos.pytorch
+    # reads, configured with source_root/target_root + *_split below.
+    "dataset_format": "railight",
+    "source_root": None,
+    "target_root": None,
+    "source_train_split": "train",
+    "source_val_split": "val",
+    "source_test_split": "test",
+    "target_train_split": "train",
+    "target_val_split": "val",
+    "target_test_split": "test",
+    "keep_difficult": False,
+    # Freeze the first N entries of the VGG feature list (fcos.pytorch uses 10 =
+    # conv1_1 through the second max-pool). 0 keeps everything trainable.
+    "vgg_fixed_layers": 0,
+    # "full" | "detection_only". detection_only zeroes every domain-adaptation
+    # term so you can see the detector's own ceiling.
+    "loss_preset": "full",
+    # Drop the uneven tail of each training epoch so source and target batches
+    # always pair up. The target loader already does this.
+    "drop_last_train": True,
+    # Anchor bank. null keeps the WIDER-FACE values inherited from DSFD.
+    "anchor_sizes1": None,
+    "anchor_sizes2": None,
+    "aspect_ratio": None,
+    # "transforms" = composable (image, target) pipeline in data/transforms.py;
+    # "legacy" = the monolithic utils.augmentations.preprocess().
+    "data_pipeline": "transforms",
+    # Send unlabelled target images through the same val pipeline as the source
+    # images (same letterboxing, same RGB channel order).
+    "target_use_transforms": True,
+    "use_night_synthesis": "dark_isp",
+    "night_synthesis_seed": 43,
+    "night_profile": None,
+    "letterbox": False,
+    "scale_jitter": 0.0,
+    "input_size": 640,
+    "eval_class_aware": True,
+    "flip_label_swap": [[4, 5], [5, 4]],
+    "da_align_enabled": False,
+    "da_ia_enabled": True,
+    "da_oa_enabled": True,
+    "da_ia_levels": [0, 1, 2],
+    "da_oa_levels": [0, 1, 2],
+    "da_reduction": 2.0,
+    "da_context_impl": "pool",
+    "da_max_tokens": 1024,
+    "da_disc_hidden": 256,
+    "da_disc_max_size": 80,
+    "da_prototype_source": "clip",
+    "da_prototype_dim": 512,
+    "da_prototype_learnable": False,
+    "da_prototype_mask_present": False,
+    "da_clip_model": "openai/clip-vit-base-patch32",
+}
+
+WANDB_EPOCH_KEYS: Dict[str, str] = {
+    "train_loss_epoch": "train/loss",
+    "train_det_epoch": "train/det_loss",
+    "val_loss": "val/loss",
+    "val_precision": "val/precision",
+    "val_recall": "val/recall",
+    "val_f1": "val/f1",
+    "val_map": "val/mAP",
+    "val_macro_map": "val/macro_mAP",
+    "val_macro_best_f1": "val/macro_best_f1",
+    "target_macro_map": "target/macro_mAP",
+    "target_macro_f1": "target/macro_f1",
+    "target_macro_best_f1": "target/macro_best_f1",
+    "val_kl_st": "val/kl_st",
+    "val_align_mmd": "val/align_mmd",
+    "val_align_gap": "val/align_gap",
+    "val_align_auc": "val/align_auc",
+    "val_entropy": "val/entropy",
+    "target_precision": "target/precision",
+    "target_recall": "target/recall",
+    "target_f1": "target/f1",
+    "target_map": "target/mAP",
+    "target_val_loss": "target/loss",
+}
+
+
+_TRAIN_DEFAULTS = TRAIN_DEFAULTS
+_TEST_DEFAULTS = TEST_DEFAULTS
+_WANDB_EPOCH_KEYS = WANDB_EPOCH_KEYS

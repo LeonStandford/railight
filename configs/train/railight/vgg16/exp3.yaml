@@ -1,0 +1,123 @@
+architecture: railight
+backbone: vgg16
+num_exp: exp3_da_batch8_strong_augmetation
+
+batch_size: 8
+
+lr: 5.0e-4
+momentum: 0.9
+weight_decay: 5.0e-4
+gamma: 0.1
+epochs: 100
+max_steps: 340000
+lr_steps: [98000, 130000, 150000]
+
+cuda: true
+gpu_ids: 1
+num_workers: 2
+local_rank: 0
+seed: 42
+
+source_train_file: /mnt/HDD4/longpm/railway/8/dataset/source_train.txt
+source_val_file:   /mnt/HDD4/longpm/railway/8/dataset/source_val.txt
+source_test_file:  /mnt/HDD4/longpm/railway/8/dataset/source_test.txt
+target_train_file: /mnt/HDD4/longpm/railway/8/dataset/target_train.txt
+target_val_file:   /mnt/HDD4/longpm/railway/8/dataset/target_val.txt
+target_test_file:  /mnt/HDD4/longpm/railway/8/dataset/target_test.txt
+
+nc: 8
+names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
+
+save_folder: /mnt/HDD4/longpm/railight/weights/
+charts_dir:  /mnt/HDD4/longpm/railight/charts/
+records_dir: /mnt/HDD4/longpm/railight/records/
+log_dir: /mnt/HDD4/longpm/railight/logs
+resume: true
+
+val_every_epochs: 3
+viz_num_samples: 6
+viz_full_every_epochs: 30
+viz_max_source_batches: 30
+viz_max_target_batches: 30
+
+kl_loss_weight: 0.05
+kl_loss_max: 50.0
+target_loss_weight: 0.1
+is_use_supervised_target_loss: true
+supervised_target_loss_weight: 1.0
+
+focal_enabled: true
+focal_gamma: 2.0
+focal_alpha_bg: 0.25
+
+is_use_rc_loss: false
+
+use_wandb: true
+wandb_project: da-rdd-railight
+wandb_dir: /mnt/HDD4/longpm/railight/wandb
+
+lr_schedule: cosine
+warmup_epochs: 3.0
+warmup_iters: 0
+lr_final_ratio: 0.01
+
+nominal_batch_size: 16
+lr_scale_by_effective_batch: false
+
+ema_enabled: true
+ema_decay: 0.9999
+ema_warmup_iters: 2000
+
+letterbox: false
+scale_jitter: 0
+mosaic_prob: 0
+input_size: 640
+
+offline_aug_dir: /mnt/HDD4/longpm/railway/8/dataset/strong_aug_images
+offline_aug_mode: crop
+focal_alpha_include_target: true
+
+box_loss: ciou
+
+flip_label_swap: [[4, 5], [5, 4]]
+
+eval_class_aware: true
+model_selection: macro_f1
+
+wreg_loss_weight: 0.0001
+entropy_loss_weight: 0.01
+optimizer: sgd
+muon_ratio: 0.5
+prog_warmup_iters: 0
+stal_enabled: false
+stal_ref_area: 0.02
+stal_max_w: 4.0
+focal_class_weights: null
+backbone_scale: null
+backbone_weights: auto
+pretrained_model: null
+wandb_entity: null
+
+use_night_synthesis: dark_isp
+night_synthesis_seed: null
+
+da:
+  da_align_enabled: false
+  da_ia_enabled: false
+  da_oa_enabled: false
+  da_ia_levels: [0, 1, 2]
+  da_oa_levels: [0, 1, 2]
+  da_img_adv_weight: 1.0
+  da_obj_adv_weight: 0.5
+  da_grl_gamma: 10.0
+  da_fg_topk_frac: 0.25
+  da_reduction: 2.0
+  da_context_impl: pool
+  da_max_tokens: 1024
+  da_disc_hidden: 256
+  da_disc_max_size: 80
+  da_prototype_source: clip
+  da_prototype_dim: 512
+  da_prototype_learnable: false
+  da_prototype_mask_present: false
+  da_clip_model: openai/clip-vit-base-patch32

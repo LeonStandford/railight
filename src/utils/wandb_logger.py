@@ -36,6 +36,7 @@ class WandbLogger:
         run_name: str,
         config: Dict[str, Any],
         entity: Optional[str] = None,
+        dir: Optional[str] = None,
     ) -> None:
         self.run = None
         self._wandb = None
@@ -49,6 +50,8 @@ class WandbLogger:
         try:
             import wandb
 
+            if dir:
+                os.makedirs(dir, exist_ok=True)
             self._wandb = wandb
             self.run = wandb.init(
                 project=project,
@@ -56,8 +59,11 @@ class WandbLogger:
                 entity=entity,
                 config=config,
                 resume="allow",
+                dir=dir or None,
             )
             print(f"[wandb] logging to {getattr(self.run, 'url', project)}")
+            if dir:
+                print(f"[wandb] run files under {dir}")
         except Exception as e:
             print(f"[wandb] disabled ({e})")
             self.run = None

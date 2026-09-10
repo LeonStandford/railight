@@ -4,7 +4,7 @@ from __future__ import print_function
 
 import os
 import sys
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -13,14 +13,17 @@ import torch.nn.functional as F
 
 from layers import *
 from data.config import cfg
-from models.dai_net import (
+from models.railight.net import (
     Interpolate,
-    DistillKL,
     fem_module,
     add_extras,
     extras_cfg,
     fem_cfg,
+    spatial_mean,
 )
+from losses.align import align_spec_from_cfg
+from utils.checkpoint import load_detector_state_dict
+from utils.constants import YOLO_TAP_DIMS, YOLO_TAP_NAMES
 
 _YOLO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolo")
 if _YOLO_DIR not in sys.path:
@@ -234,7 +237,25 @@ class IDAYOLO(nn.Module):
             nn.Conv2d(64, 3, kernel_size=3, padding=1),
             nn.Sigmoid(),
         )
-        self.KL = DistillKL(T=4.0)
+        self.align_spec = align_spec_from_cfg(
+            getattr(cfg, "ALIGN", None), scale=cfg.WEIGHT.MC
+        )
+        self.align_tap_names = YOLO_TAP_NAMES[: len(self.align_spec.taps)]
+        self.align_tap_dims = [YOLO_TAP_DIMS[n] for n in self.align_tap_names]
+        self.align_tap_labels = [f"backbone.{n}" for n in self.align_tap_names]
+        self.align_heads = nn.ModuleList(
+            [self.align_spec.build(dim) for dim in self.align_tap_dims]
+        )
+        self.align_swap = (
+            self.align_spec.build(self.align_tap_dims[0])
+            if self.align_spec.swap_weight > 0.0
+            else None
+        )
+        self.align_reflectance = (
+            self.align_spec.build(3 * self.align_spec.reflectance_pool ** 2)
+            if self.align_spec.reflectance_weight > 0.0
+            else None
+        )
         if self.phase == "test":
             self.softmax = nn.Softmax(dim=-1)
             self.detect = Detect(cfg)
@@ -271,8 +292,20 @@ class IDAYOLO(nn.Module):
 
     @torch.no_grad()
     def embed_features(self, x: torch.Tensor) -> torch.Tensor:
-        f = self.backbone.shallow(x)
-        return f.flatten(start_dim=2).mean(dim=-1)
+        return spatial_mean(self.backbone.shallow(x))
+
+    def tap_forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        if self.align_tap_names == ("shallow",):
+            return [self.backbone.shallow(x)]
+
+        stages = dict(zip(YOLO_TAP_NAMES, self.backbone.stages(x)))
+
+        return [stages[name] for name in self.align_tap_names]
+
+    def reflectance_embedding(
+        self, reflectance: torch.Tensor, pool: int
+    ) -> torch.Tensor:
+        return F.adaptive_avg_pool2d(reflectance, pool).flatten(start_dim=1)
 
     def extract_features(
         self,
@@ -281,26 +314,96 @@ class IDAYOLO(nn.Module):
         I_source: torch.Tensor,
         I_target: torch.Tensor,
         return_reflectance: bool = False,
+        return_parts: bool = False,
+        grl_lambda: float = 1.0,
     ) -> Tuple[torch.Tensor, ...]:
-        f_source = self.backbone.shallow(x_source)
-        f_target = self.backbone.shallow(x_target)
-        R_source = self.ref(f_source)
-        R_target = self.ref(f_target)
-        x_source_swap = self.backbone.shallow((I_source * R_target).detach())
-        x_target_swap = self.backbone.shallow((I_target * R_source).detach())
-        f_source_pool = f_source.flatten(start_dim=2).mean(dim=-1)
-        f_target_pool = f_target.flatten(start_dim=2).mean(dim=-1)
-        x_source_swap_pool = x_source_swap.flatten(start_dim=2).mean(dim=-1)
-        x_target_swap_pool = x_target_swap.flatten(start_dim=2).mean(dim=-1)
-        loss_kl_st = cfg.WEIGHT.MC * (
-            self.KL(f_source_pool, f_target_pool)
-            + self.KL(f_target_pool, f_source_pool)
-            + self.KL(x_source_swap_pool, x_target_swap_pool)
-            + self.KL(x_target_swap_pool, x_source_swap_pool)
-        )
+        spec = self.align_spec
+
+        f_source = self.tap_forward(x_source)
+        f_target = self.tap_forward(x_target)
+        R_source = self.ref(f_source[0])
+        R_target = self.ref(f_target[0])
+        f_source_pool = spatial_mean(f_source[0])
+        f_target_pool = spatial_mean(f_target[0])
+
+        parts: Dict[str, torch.Tensor] = {}
+        total = f_source_pool.new_zeros(())
+
+        for name, weight, head, a, b in zip(
+            self.align_tap_names, spec.tap_weights, self.align_heads,
+            f_source, f_target,
+        ):
+            term, tap_parts = head(spatial_mean(a), spatial_mean(b), grl_lambda)
+            total = total + weight * term
+
+            for key, value in tap_parts.items():
+                parts[f"{name}_{key}"] = value
+
+        if self.align_swap is not None:
+            swap_source = self.backbone.shallow((I_source * R_target).detach())
+            swap_target = self.backbone.shallow((I_target * R_source).detach())
+            term, swap_parts = self.align_swap(
+                spatial_mean(swap_source), spatial_mean(swap_target), grl_lambda
+            )
+            total = total + spec.swap_weight * term
+
+            for key, value in swap_parts.items():
+                parts[f"swap_{key}"] = value
+
+        if self.align_reflectance is not None:
+            term, reflectance_parts = self.align_reflectance(
+                self.reflectance_embedding(R_source, spec.reflectance_pool),
+                self.reflectance_embedding(R_target, spec.reflectance_pool),
+                grl_lambda,
+            )
+            total = total + spec.reflectance_weight * term
+
+            for key, value in reflectance_parts.items():
+                parts[f"reflectance_{key}"] = value
+
+        out: List[Any] = [f_source_pool, f_target_pool, spec.scale * total]
+
         if return_reflectance:
-            return (f_source_pool, f_target_pool, loss_kl_st, R_target)
-        return (f_source_pool, f_target_pool, loss_kl_st)
+            out.append(R_target)
+
+        if return_parts:
+            out.append(parts)
+
+        return tuple(out)
+
+    @torch.no_grad()
+    def embed_align_features(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [
+                head.whiten(spatial_mean(f))
+                for head, f in zip(self.align_heads, self.tap_forward(x))
+            ],
+            dim=1,
+        )
+
+    @torch.no_grad()
+    def domain_gap(
+        self, x_source: torch.Tensor, x_target: torch.Tensor
+    ) -> Dict[str, float]:
+        f_source = self.tap_forward(x_source)
+        f_target = self.tap_forward(x_target)
+        stats: Dict[str, float] = {}
+        per_tap = []
+
+        for name, head, a, b in zip(
+            self.align_tap_names, self.align_heads, f_source, f_target
+        ):
+            measured = head.diagnostics(spatial_mean(a), spatial_mean(b))
+            per_tap.append(measured)
+
+            for key, value in measured.items():
+                stats[f"{name}_{key}"] = float(value)
+
+        n_taps = max(len(per_tap), 1)
+        stats["mmd"] = sum(float(m["mmd"]) for m in per_tap) / n_taps
+        stats["gap"] = sum(float(m["gap"]) for m in per_tap) / n_taps
+
+        return stats
 
     def _det_head(
         self, pal1_sources: List[torch.Tensor], size: torch.Size
@@ -402,7 +505,7 @@ class IDAYOLO(nn.Module):
         x_light: torch.Tensor,
         I: torch.Tensor,
         I_light: torch.Tensor,
-    ) -> Tuple[object, List[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[object, List[torch.Tensor]]:
         size = x.size()[2:]
         shallow, pal1_sources = self._sources(x)
         x_dark = shallow
@@ -413,16 +516,6 @@ class IDAYOLO(nn.Module):
         x_light_2 = (I_light * R_dark).detach()
         f_light_2 = self.backbone.shallow(x_light_2)
         f_dark_2 = self.backbone.shallow(x_dark_2)
-        p_light = f_light.flatten(start_dim=2).mean(dim=-1)
-        p_dark = x_dark.flatten(start_dim=2).mean(dim=-1)
-        p_light_2 = f_light_2.flatten(start_dim=2).mean(dim=-1)
-        p_dark_2 = f_dark_2.flatten(start_dim=2).mean(dim=-1)
-        loss_mutual = cfg.WEIGHT.MC * (
-            self.KL(p_light, p_dark)
-            + self.KL(p_dark, p_light)
-            + self.KL(p_light_2, p_dark_2)
-            + self.KL(p_dark_2, p_light_2)
-        )
         tup = self._det_head(pal1_sources, size)
         if self.phase == "test":
             output = self.detect.forward(
@@ -432,7 +525,7 @@ class IDAYOLO(nn.Module):
             output = tup
         R_dark_2 = self.ref(f_light_2)
         R_light_2 = self.ref(f_dark_2)
-        return (output, [R_dark, R_light, R_dark_2, R_light_2], loss_mutual)
+        return (output, [R_dark, R_light, R_dark_2, R_light_2])
 
     def load_weights(self, base_file: str) -> int:
         other, ext = os.path.splitext(base_file)
@@ -450,7 +543,7 @@ class IDAYOLO(nn.Module):
             elif isinstance(mdata, dict) and "state_dict" in mdata:
                 epoch = mdata.get("epoch", epoch)
                 mdata = mdata["state_dict"]
-            self.load_state_dict(mdata)
+            load_detector_state_dict(self, mdata)
             print("Finished!")
         else:
             print("Sorry only .pth and .pkl files supported.")

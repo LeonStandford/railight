@@ -1,10 +1,3 @@
-"""Weight-anchoring regularisation loss.
-
-Keeps the VGG backbone close to its pretrained initialisation (an L2
-anchor) so domain-adaptation fine-tuning does not catastrophically drift
-away from the ImageNet/DSFD features.
-"""
-
 from __future__ import annotations
 
 from typing import Dict
@@ -14,19 +7,20 @@ import torch
 __all__ = ["snapshot_wreg_ref", "weight_reg_loss"]
 
 
+_ANCHOR_PREFIXES = ("vgg.", "backbone.")
+
+
 def snapshot_wreg_ref(net: torch.nn.Module) -> Dict[str, torch.Tensor]:
-    """Snapshot the (detached) VGG backbone weights to anchor against."""
     return {
         name: p.detach().clone()
         for (name, p) in net.named_parameters()
-        if name.startswith("vgg.") and p.requires_grad
+        if name.startswith(_ANCHOR_PREFIXES) and p.requires_grad
     }
 
 
 def weight_reg_loss(
     net_inner: torch.nn.Module, ref: Dict[str, torch.Tensor]
 ) -> torch.Tensor:
-    """Mean squared deviation of current VGG weights from the snapshot."""
     if not ref:
         return torch.zeros((), device=next(net_inner.parameters()).device)
     total = None

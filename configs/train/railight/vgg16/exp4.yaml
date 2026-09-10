@@ -1,0 +1,96 @@
+architecture: railight
+backbone: vgg16
+num_exp: exp4_uda_dark_isp
+
+batch_size: 2
+
+lr: 5.0e-4
+momentum: 0.9
+weight_decay: 5.0e-4
+gamma: 0.1
+epochs: 100
+max_steps: 340000
+lr_steps: [170000, 250000, 310000]
+
+cuda: true
+gpu_ids: 0
+num_workers: 2
+local_rank: 0
+
+source_train_file: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/source_train.txt
+source_val_file:   /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/source_val.txt
+source_test_file:  /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/source_test.txt
+target_train_file: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/target_train.txt
+target_val_file:   /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/target_val.txt
+target_test_file:  /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/target_test.txt
+nc: 8
+names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
+
+save_folder: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/weights/
+charts_dir:  /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/charts/
+records_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/records/
+log_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/logs
+resume: true
+
+viz_num_samples: 6
+viz_full_every_epochs: 20
+
+kl_loss_weight: 1.0
+target_loss_weight: 0.1
+is_use_supervised_target_loss: false
+supervised_target_loss_weight: 1.0
+
+focal_enabled: true
+focal_gamma: 2.0
+focal_alpha_bg: 0.25
+
+box_loss: smooth_l1
+is_use_rc_loss: false
+
+wandb_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/wandb
+
+wreg_loss_weight: 0.0001
+entropy_loss_weight: 0.01
+optimizer: sgd
+muon_ratio: 0.5
+prog_warmup_iters: 0
+stal_enabled: false
+stal_ref_area: 0.02
+stal_max_w: 4.0
+focal_class_weights: null
+backbone_scale: null
+backbone_weights: auto
+pretrained_model: null
+use_wandb: true
+wandb_project: da-rdd-railight
+wandb_entity: null
+val_every_epochs: 3
+viz_max_source_batches: 30
+viz_max_target_batches: 30
+
+use_night_synthesis: dark_isp
+night_synthesis_seed: null
+
+da:
+  da_align_enabled: false
+  da_ia_enabled: false
+  da_oa_enabled: false
+  da_ia_levels: [0, 1, 2]
+  da_oa_levels: [0, 1, 2]
+  da_img_adv_weight: 1.0
+  da_obj_adv_weight: 0.5
+  da_grl_gamma: 10.0
+  da_fg_topk_frac: 0.25
+  da_reduction: 2.0
+  da_context_impl: pool
+  da_max_tokens: 1024
+  da_disc_hidden: 256
+  da_disc_max_size: 80
+  da_prototype_source: clip
+  da_prototype_dim: 512
+  da_prototype_learnable: false
+  da_prototype_mask_present: false
+  da_clip_model: openai/clip-vit-base-patch32
+
+offline_aug_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/strong_aug_images
+offline_aug_mode: crop

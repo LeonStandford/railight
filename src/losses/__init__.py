@@ -1,9 +1,10 @@
-"""Loss functions for DAI-Net training."""
+"""Loss functions for RAILIGHT training."""
 
 from losses.dfl import (
     FocalLoss,
     SigmoidFocalLoss,
     compute_focal_alpha,
+    compute_focal_alpha_from_labels,
     compute_focal_alpha_sigmoid,
     init_focal_bias,
     init_focal_bias_sigmoid,
@@ -15,6 +16,7 @@ __all__ = [
     "FocalLoss",
     "SigmoidFocalLoss",
     "compute_focal_alpha",
+    "compute_focal_alpha_from_labels",
     "compute_focal_alpha_sigmoid",
     "init_focal_bias",
     "init_focal_bias_sigmoid",
