@@ -9,7 +9,7 @@
 **/*charts
 .claude
 runs
-data
+/data/
 **/*assets/*.tex
 **/*assets/*.pdf
 **/*wandb

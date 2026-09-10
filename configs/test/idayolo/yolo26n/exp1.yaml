@@ -1,0 +1,53 @@
+architecture: railight
+backbone: yolo26n
+num_exp: exp1
+
+weights: weights/railight/yolo26n/exp1/best_model.pth
+
+cuda: true
+gpu_ids: 7
+batch_size: 4
+
+source_test_file: ./dataset/source_test.txt
+target_test_file: ./dataset/target_test.txt
+
+export_predicted_source_path: null
+export_predicted_target_path: null
+
+nc: 8
+names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
+
+source_folder: null
+target_folder4unsupervised: null
+
+charts_dir: ./charts
+records_dir: ./records
+log_dir: ./logs
+mode_name: test
+
+viz_num_samples: 6
+
+# Detection thresholds
+iou_thr: 0.5
+score_thr_cm: 0.5
+nms_iou_thr: 0.35
+
+use_night_synthesis: dark_isp
+night_synthesis_seed: 43
+
+da:
+  da_align_enabled: false
+  da_ia_enabled: true
+  da_oa_enabled: true
+  da_ia_levels: [0, 1, 2]
+  da_oa_levels: [0, 1, 2]
+  da_reduction: 2.0
+  da_context_impl: pool
+  da_max_tokens: 1024
+  da_disc_hidden: 256
+  da_disc_max_size: 80
+  da_prototype_source: clip
+  da_prototype_dim: 512
+  da_prototype_learnable: false
+  da_prototype_mask_present: false
+  da_clip_model: openai/clip-vit-base-patch32

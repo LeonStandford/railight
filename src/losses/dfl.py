@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -12,6 +12,7 @@ __all__ = [
     "FocalLoss",
     "SigmoidFocalLoss",
     "compute_focal_alpha",
+    "compute_focal_alpha_from_labels",
     "compute_focal_alpha_sigmoid",
     "init_focal_bias",
     "init_focal_bias_sigmoid",
@@ -64,29 +65,63 @@ class FocalLoss(nn.Module):
         return loss.sum()
 
 
+def _alpha_from_counts(
+    counts: np.ndarray, bg_weight: float = 0.25
+) -> Optional[torch.Tensor]:
+    fg = np.asarray(counts, dtype=np.float64)[1:]
+    if fg.sum() == 0:
+        return None
+    inv = fg.sum() / np.maximum(fg, 1.0)
+    inv = inv / inv.mean() * (1.0 - bg_weight)  # mean(fg alpha) == 1-bg
+    alpha = np.concatenate([[bg_weight], inv]).astype(np.float32)
+    return torch.from_numpy(alpha)
+
+
+def compute_focal_alpha_from_labels(
+    label_sources: Sequence[Sequence[Sequence[int]]],
+    num_classes: int,
+    bg_weight: float = 0.25,
+) -> Optional[torch.Tensor]:
+    """Class prior from in-memory labels, for datasets with no list file.
+
+    Same weighting as :func:`compute_focal_alpha`; that one parses the RAILIGHT
+    list format off disk, this one counts a dataset's ``labels`` directly.
+    """
+    try:
+        counts = np.zeros(num_classes, dtype=np.float64)
+        for per_image in label_sources:
+            for labels in per_image:
+                for c in labels:
+                    c = int(c)
+                    if 0 < c < num_classes:
+                        counts[c] += 1
+        return _alpha_from_counts(counts, bg_weight)
+    except Exception as e:
+        print(f"[focal] could not compute class alpha ({e}); using uniform.")
+        return None
+
+
 def compute_focal_alpha(
-    list_file: str, num_classes: int, bg_weight: float = 0.25
+    list_file: Union[str, Sequence[str]],
+    num_classes: int,
+    bg_weight: float = 0.25,
 ) -> Optional[torch.Tensor]:
 
     try:
         counts = np.zeros(num_classes, dtype=np.float64)
-        with open(list_file) as f:
-            for line in f:
-                p = line.split()
-                if len(p) < 2:
-                    continue
-                n = int(p[1])
-                for i in range(n):
-                    c = int(p[6 + 5 * i])
-                    if 0 < c < num_classes:
-                        counts[c] += 1
-        fg = counts[1:]
-        if fg.sum() == 0:
-            return None
-        inv = fg.sum() / np.maximum(fg, 1.0)
-        inv = inv / inv.mean() * (1.0 - bg_weight)  # mean(fg alpha) == 1-bg
-        alpha = np.concatenate([[bg_weight], inv]).astype(np.float32)
-        return torch.from_numpy(alpha)
+        paths = [list_file] if isinstance(list_file, str) else list(list_file)
+        for path in paths:
+            with open(path) as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) < 2:
+                        continue
+                    n = int(p[1])
+                    for i in range(n):
+                        c = int(p[6 + 5 * i])
+                        if 0 < c < num_classes:
+                            counts[c] += 1
+        return _alpha_from_counts(counts, bg_weight)
     except Exception as e:
         print(f"[focal] could not compute class alpha ({e}); using uniform.")
         return None

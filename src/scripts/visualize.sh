@@ -28,7 +28,7 @@ if [ -n "$DAY_FOLDER" ]; then
 fi
 
 echo "=========================================="
-echo " DAI-Net visualisation (Grad-CAM)"
+echo " RAILIGHT visualisation (Grad-CAM)"
 echo "   backbone        : $BACKBONE"
 echo "   num_exp         : $NUM_EXP"
 echo "   weights         : $WEIGHTS"

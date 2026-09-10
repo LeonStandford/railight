@@ -1,0 +1,96 @@
+meta:
+  input_size: 640
+  num_classes: 8            # foreground; detection head uses 8+1=9 with background
+  names: [
+    fastener_1, 
+    critical_crack, 
+    fastener_2, 
+    sleeper_l, 
+    sleeper_r, 
+    missing_items, 
+    broken_sleeper, 
+    minor_crack
+  ]
+  scale: n                
+
+backbone:
+  # [from, repeats, module, args]                 # idx  out@640   stride  tap
+  - [-1, 1, Conv,  [64, 3, 2]]                     # 0    16x320     /2     -> shallow (Retinex)
+  - [-1, 1, Conv,  [128, 3, 2]]                    # 1    32x160     /4
+  - [-1, 2, C3k2,  [256, False, 0.25]]             # 2    64x160     /4     -> of1
+  - [-1, 1, Conv,  [256, 3, 2]]                    # 3    64x80      /8
+  - [-1, 2, C3k2,  [512, False, 0.25]]             # 4    128x80     /8     -> of2
+  - [-1, 1, Conv,  [512, 3, 2]]                    # 5    128x40     /16
+  - [-1, 2, C3k2,  [512, True]]                    # 6    128x40     /16    -> of3
+  - [-1, 1, Conv,  [1024, 3, 2]]                   # 7    256x20     /32
+  - [-1, 2, C3k2,  [1024, True]]                   # 8    256x20     /32
+  - [-1, 1, SPPF,  [1024, 5, 3, True]]             # 9    256x20     /32
+  - [-1, 2, C2PSA, [1024]]                         # 10   256x20     /32    -> of4
+
+projections:
+  - {tap: L0,  stride: 2,   in: 16,  out: 64,   name: stem64}   # -> Retinex ref
+  - {tap: L2,  stride: 4,   in: 64,  out: 256,  name: of1}
+  - {tap: L4,  stride: 8,   in: 128, out: 512,  name: of2}
+  - {tap: L6,  stride: 16,  in: 128, out: 512,  name: of3}
+  - {tap: L10, stride: 32,  in: 256, out: 1024, name: of4}
+
+extras:
+  - {from: of4,  module: Conv1x1+Conv3x3s2, out: 512, stride: 64,  name: of5}   # 512x10
+  - {from: of5,  module: Conv1x1+Conv3x3s2, out: 256, stride: 128, name: of6}   # 256x5
+
+neck:
+  type: fpn_topdown + fem
+  top_down:
+    - conv7      <- topdown[0](of6)
+    - conv6      <- topdown[1..2] + latlayer[0](of5)
+    - convfc7_2  <- topdown[3]    + latlayer[1](of4)
+    - conv5      <- topdown[4]    + latlayer[2](of3)
+    - conv4      <- topdown[5]    + latlayer[3](of2)
+    - conv3      <-                 latlayer[4](of1)
+  fem_out: [ef1, ef2, ef3, ef4, ef5, ef6]          # L2Norm on ef1/ef2/ef3
+  l2norm_scales: {of1: 10, of2: 8, of3: 5, ef1: 10, ef2: 8, ef3: 5}
+
+head:
+  pal1: {loc: loc_pal1, conf: conf_pal1, sources: [of1, of2, of3, of4, of5, of6]}
+  pal2: {loc: loc_pal2, conf: conf_pal2, sources: [ef1, ef2, ef3, ef4, ef5, ef6]}
+  detect: Detect(cfg)          # test-time: softmax + decode + multiclass NMS on PAL2
+
+anchors:
+  feature_maps: [160, 80, 40, 20, 10, 5]
+  steps:        [4, 8, 16, 32, 64, 128]
+  anchor_sizes_pal1: [8, 16, 32, 64, 128, 256]
+  anchor_sizes_pal2: [16, 32, 64, 128, 256, 512]
+  aspect_ratio: [0.204, 0.317, 0.479, 0.823, 1.424, 2.455]
+  variance: [0.1, 0.2]
+  overlap_thresh: 0.35
+  neg_pos_ratio: 3
+
+retinex:
+  ref: [Conv2d(64,64,3), ReLU, Upsample(x2, nearest), Conv2d(64,3,3), Sigmoid]
+  input: shallow (64ch, /2)   ->   output: R (3ch, /1)
+
+losses:
+  detection: MultiBoxLoss(box=smooth_l1, cls=FocalLoss(gamma=2.0, per_class_alpha))
+  enhance:   EnhanceLoss(retinex reconstruction + smoothness + optional RC loss)
+  target_unsupervised: entropy on unlabeled night target
+  weight_reg: L2 anchor of backbone to init (drift control)
+
+da_align_enabled: false
+da_ia_enabled: true
+da_oa_enabled: true
+da_ia_levels: [0, 1, 2]
+da_oa_levels: [0, 1, 2]
+da_img_adv_weight: 1.0
+da_obj_adv_weight: 0.5
+da_grl_gamma: 10.0
+da_fg_topk_frac: 0.25
+da_reduction: 2.0
+da_context_impl: pool
+da_max_tokens: 1024
+da_disc_hidden: 256
+da_disc_max_size: 80
+da_prototype_source: clip
+da_prototype_dim: 512
+da_prototype_learnable: false
+da_prototype_mask_present: false
+da_clip_model: openai/clip-vit-base-patch32
