@@ -1,6 +1,5 @@
 architecture: railight
-backbone: vgg16
-num_exp: exp3.da.batch16.caotulab_server.h100
+num_exp: exp4.uda.batch16.cat
 
 batch_size: 16
 
@@ -14,7 +13,7 @@ lr_steps: [170000, 250000, 310000]
 
 cuda: true
 gpu_ids: 0,1
-num_workers: 4
+num_workers: 2
 local_rank: 0
 
 source_train_file: /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/source_train.txt
@@ -33,16 +32,13 @@ records_dir: /home/a00161/stacy.en14/data/data_exp2/railight/records
 log_dir:     /home/a00161/stacy.en14/data/data_exp2/railight/logs
 resume: true
 
-val_every_epochs: 3
 viz_num_samples: 6
 viz_every_iters: 500
-viz_full_every_epochs: 10
-viz_max_source_batches: 30
-viz_max_target_batches: 30
+viz_full_every_epochs: 1
 
 kl_loss_weight: 1.0
 target_loss_weight: 0.1
-is_use_supervised_target_loss: true
+is_use_supervised_target_loss: false
 supervised_target_loss_weight: 1.0
 
 focal_enabled: true
@@ -50,9 +46,21 @@ focal_gamma: 2.0
 focal_alpha_bg: 0.25
 
 box_loss: smooth_l1
-is_use_rc_loss: false
+is_use_rc_loss: true
 
 use_wandb: true
 wandb_project: da-rdd-railight
 wandb_entity: null
 wandb_dir: /home/a00161/stacy.en14/data/data_exp2/railight/wandb
+
+cat_enabled: true
+cat_ema_alpha: 0.99
+cat_warmup_iters: 2000
+cat_loss_reg: 1.0
+cat_log_loss: true
+cat_dia_loss: false
+
+pseudo_weight: 1.0
+pseudo_conf: 0.8
+pseudo_start_iters: 20000
+ema_decay: 0.9996

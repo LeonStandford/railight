@@ -42,6 +42,7 @@ from layers.modules import EnhanceLoss, MultiBoxLoss
 from layers.modules.enhance_loss import smooth as retinex_smooth
 from losses.dfl import FocalLoss, compute_focal_alpha, init_focal_bias
 from losses.weight_reg import snapshot_wreg_ref, weight_reg_loss
+from losses.cat_icrm import ClassAwareWeighter, InterClassRelation, KeepRateSchedule
 from models.enhancer import RetinexNet
 from models.factory import basenet_factory, build_net
 from dainet.constants import (
@@ -301,6 +302,7 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
         "stal_ref_area", "stal_max_w",
         "pseudo_weight", "pseudo_conf", "pseudo_nms_iou", "ema_decay",
         "pseudo_cls_weight", "supervised_target_loss_weight",
+        "cat_ema_alpha", "cat_loss_reg",
     )
     for _k in _float_keys:
         if _k in merged and isinstance(merged[_k], str):
@@ -896,6 +898,7 @@ class TrainingContext:
         self.wreg_ref: Dict[str, torch.Tensor] = {}
         # mean-teacher state: created lazily on the first pseudo-label step
         self.teacher: Optional[torch.nn.Module] = None
+        self.icr: Optional[InterClassRelation] = None
         self.nan_skips: int = 0
         self.wandb = WandbLogger(
             enabled=bool(getattr(args_ns, "use_wandb", False)) and local_rank == 0,
@@ -1625,6 +1628,50 @@ def _write_profile_csv(ctx: "TrainingContext", prof: Dict[str, Any], epoch: int)
         f"slowest={slow}), val {val_total:.1f}s ({vn} batches) -> {out_path}"
     )
 
+CAT_STATE_FILE = "cat_icrm.pt"
+
+
+def build_cls_weighter(args_ns: argparse.Namespace) -> Optional[ClassAwareWeighter]:
+    if not bool(getattr(args_ns, "cat_enabled", False)):
+        return None
+    return ClassAwareWeighter(
+        reg=float(getattr(args_ns, "cat_loss_reg", 1.0)),
+        log_loss=bool(getattr(args_ns, "cat_log_loss", True)),
+        dia_loss=bool(getattr(args_ns, "cat_dia_loss", False)),
+    )
+
+
+def build_class_relation(
+    args_ns: argparse.Namespace, save_folder: str
+) -> Optional[InterClassRelation]:
+    if not bool(getattr(args_ns, "cat_enabled", False)):
+        return None
+    icr = InterClassRelation(
+        int(args_ns.nc),
+        KeepRateSchedule(
+            alpha=float(getattr(args_ns, "cat_ema_alpha", 0.99)),
+            warmup_iters=int(getattr(args_ns, "cat_warmup_iters", 2000)),
+        ),
+    )
+    state_path = os.path.join(save_folder, CAT_STATE_FILE)
+    if getattr(args_ns, "resume", None) and os.path.isfile(state_path):
+        icr.load_state_dict(torch.load(state_path, map_location="cpu"))
+    return icr
+
+
+def save_class_relation(icr: Optional[InterClassRelation], save_folder: str) -> None:
+    if icr is not None:
+        torch.save(icr.state_dict(), os.path.join(save_folder, CAT_STATE_FILE))
+
+
+def class_relation_diag(
+    icr: Optional[InterClassRelation], class_names: Sequence[str]
+) -> Dict[str, float]:
+    if icr is None:
+        return {}
+    return {name: float(icr.source[i, i]) for i, name in enumerate(class_names)}
+
+
 def clone_teacher(net_inner: torch.nn.Module) -> torch.nn.Module:
     """Deep-copy the student into a frozen, eval-mode EMA teacher."""
     cached = {}
@@ -1723,6 +1770,7 @@ def train_one_epoch(
     )
     
     net_inner = net.module if hasattr(net, "module") else net
+    icr = ctx.icr
     prof_iters = int(os.environ.get("DAINET_PROFILE_ITERS", "0") or "0")
 
     prof_full = os.environ.get("DAINET_PROFILE", "1").strip().lower() not in (
@@ -1811,11 +1859,16 @@ def train_one_epoch(
         loss_mutual_src_srcdark = torch.zeros((), device=source_images.device)
         optimizer.zero_grad()
         
-        loss_l_pa1l, loss_c_pal1 = criterion(out[:3], source_targets_v)
+        src_ci = icr.for_source() if icr is not None else None
+        tgt_ci = icr.for_target(iteration) if icr is not None else None
+        tgt_pairs = None
+        loss_l_pa1l, loss_c_pal1 = criterion(out[:3], source_targets_v, class_info=src_ci)
         
         if prof_active:
             _lap("loss_det_pal1")
-        loss_l_pa12, loss_c_pal2 = criterion(out[3:], source_targets_v)
+        loss_l_pa12, loss_c_pal2, src_pairs = criterion(
+            out[3:], source_targets_v, class_info=src_ci, return_pairs=True
+        )
         
         if prof_active:
             _lap("loss_det_pal2")
@@ -1899,8 +1952,12 @@ def train_one_epoch(
                 ]
                 # same recipe as the source supervised loss: both PAL heads,
                 # loc + conf, no warm-up ramp
-                loss_ts_l1, loss_ts_c1 = criterion(out_t[:3], target_labels_v)
-                loss_ts_l2, loss_ts_c2 = criterion(out_t[3:], target_labels_v)
+                loss_ts_l1, loss_ts_c1 = criterion(
+                    out_t[:3], target_labels_v, class_info=tgt_ci
+                )
+                loss_ts_l2, loss_ts_c2, tgt_pairs = criterion(
+                    out_t[3:], target_labels_v, class_info=tgt_ci, return_pairs=True
+                )
                 loss_target_sup = (
                     loss_ts_l1 + loss_ts_c1 + loss_ts_l2 + loss_ts_c2
                 ) * sup_target_weight
@@ -1947,7 +2004,11 @@ def train_one_epoch(
                         out_s[4].index_select(0, kt),
                         out_s[5],
                     )
-                    lp_l, lp_c = criterion(pred, [pl_t[i] for i in keep])
+                    lp_l, lp_c, pl_pairs = criterion(
+                        pred, [pl_t[i] for i in keep], class_info=tgt_ci, return_pairs=True
+                    )
+                    if tgt_pairs is None:
+                        tgt_pairs = pl_pairs
                     # ease pseudo loss in over pseudo_ramp_iters after burn-in
                     pseudo_ramp = (
                         1.0 if pseudo_ramp_iters <= 0
@@ -1977,6 +2038,15 @@ def train_one_epoch(
             "entropy": loss_entropy,
         }
         loss = sum(loss_components.values())
+
+        if icr is not None:
+            icr.update(*src_pairs, iteration)
+            if sup_on or pseudo_on:
+                icr.update(
+                    *(tgt_pairs or icr.empty_pairs(source_images.device)),
+                    iteration,
+                    target=True,
+                )
 
         if not torch.isfinite(loss):
             ctx.nan_skips = getattr(ctx, "nan_skips", 0) + 1
@@ -2065,6 +2135,12 @@ def train_one_epoch(
                 f"📈 [train] ep:{epoch} it:{iteration} loss(avg):{tloss:.4f} p1[c:{loss_c_pal1.item():.4f} l:{loss_l_pa1l.item():.4f}] p2[c:{loss_c_pal2.item():.4f} l:{loss_l_pa12.item():.4f}] enh:{loss_enhance.item():.4f} enh2:{loss_enhance2.item():.4f} mut_ssd:{loss_mutual_src_srcdark.item():.4f} kl_st:{loss_kl_src_tgt.item():.4f} tgt:{loss_target_unsup.item():.4f} tsup:{loss_target_sup.item():.4f} wreg:{loss_wreg.item():.4f} ent:{loss_entropy.item():.4f} lr:{cur_lr:.2e} dt:{t1 - t0:.3f}s"
             )
             record_iter_losses(ctx.history, iteration, tloss, loss_components)
+            cat_diag = class_relation_diag(icr, ctx.class_names)
+            if cat_diag:
+                tqdm.write(
+                    "🧮 [CAT] src diag: "
+                    + " ".join(f"{k}:{v:.3f}" for k, v in cat_diag.items())
+                )
 
             if getattr(ctx, "wandb", None) is not None:
                 ctx.wandb.log(
@@ -2080,6 +2156,7 @@ def train_one_epoch(
                             f"train_iter/{k}": float(v.detach())
                             for k, v in loss_components.items()
                         },
+                        **{f"cat/src_diag/{k}": v for k, v in cat_diag.items()},
                     }
                 )
 
@@ -2341,11 +2418,21 @@ def train(ctx: TrainingContext) -> None:
             f"({'IoU-family' if box_loss_fn is not None else 'Smooth-L1'})"
         )
         
+    cls_weighter = build_cls_weighter(args_ns)
     criterion = MultiBoxLoss(
         cfg, args_ns.cuda,
         cls_loss_fn=focal_loss_fn,
         box_loss_fn=box_loss_fn,
+        cls_weighter=cls_weighter,
     )
+    ctx.icr = build_class_relation(args_ns, ctx.save_folder)
+    if ctx.local_rank == 0 and ctx.icr is not None:
+        print(
+            f"🧮 [CAT] ICRm + CALoss enabled "
+            f"(alpha={ctx.icr.schedule.alpha}, warmup={ctx.icr.schedule.warmup_iters}, "
+            f"reg={cls_weighter.reg}, log_loss={cls_weighter.log_loss}, "
+            f"dia_loss={cls_weighter.dia_loss})"
+        )
     
     use_rc_loss = bool(getattr(args_ns, "is_use_rc_loss", True))
     criterion_enh = EnhanceLoss(use_rc_loss=use_rc_loss)
@@ -2400,6 +2487,8 @@ def train(ctx: TrainingContext) -> None:
             iteration,
             step_index,
         )
+        if is_rank0:
+            save_class_relation(ctx.icr, ctx.save_folder)
         val_every = max(1, int(getattr(args_ns, "val_every_epochs", 1)))
         do_val = ((epoch + 1) % val_every == 0) or (epoch + 1 >= cfg.EPOCHES)
         if do_val:
