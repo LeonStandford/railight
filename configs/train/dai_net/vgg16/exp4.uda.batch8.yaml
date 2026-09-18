@@ -13,7 +13,7 @@ lr_steps: [170000, 250000, 310000]
 
 cuda: true
 gpu_ids: 0
-num_workers: 2
+num_workers: 4
 local_rank: 0
 
 source_train_file: /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/source_train.txt
@@ -32,9 +32,10 @@ records_dir: /home/a00161/stacy.en14/data/data_exp2/railight/records
 log_dir:     /home/a00161/stacy.en14/data/data_exp2/railight/logs
 resume: true
 
+val_every_epochs: 3
 viz_num_samples: 6
 viz_every_iters: 500
-viz_full_every_epochs: 1
+viz_full_every_epochs: 10
 
 kl_loss_weight: 1.0
 target_loss_weight: 0.1

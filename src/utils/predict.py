@@ -57,7 +57,7 @@ def collect_target_samples(
             .resize((cfg.INPUT_SIZE, cfg.INPUT_SIZE), Image.BILINEAR)
         )
         rgb = np.asarray(img, dtype=np.float32)
-        tensor = torch.from_numpy((to_chw_bgr(rgb) / 255.0).copy()).float().cuda()
+        tensor = torch.from_numpy((to_chw_bgr(rgb)[[2, 1, 0], :, :] / 255.0).copy()).float().cuda()
 
         boxes, scores, labels = infer_detections(
             net, tensor, conf_thr=conf_thr, nms_iou_thr=nms_iou_thr

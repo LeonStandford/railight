@@ -81,3 +81,4 @@ cat_warmup_iters: 2000
 cat_loss_reg: 1.0
 cat_log_loss: true
 cat_dia_loss: false
+cat_max_weight: 3.0

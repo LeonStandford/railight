@@ -303,7 +303,7 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
         "stal_ref_area", "stal_max_w",
         "pseudo_weight", "pseudo_conf", "pseudo_nms_iou", "ema_decay",
         "pseudo_cls_weight", "supervised_target_loss_weight",
-        "cat_ema_alpha", "cat_loss_reg",
+        "cat_ema_alpha", "cat_loss_reg", "cat_max_weight",
         "source_strong_weight", "strong_aug_jitter_p", "strong_aug_brightness",
         "strong_aug_contrast", "strong_aug_saturation", "strong_aug_hue",
         "strong_aug_gray_p", "strong_aug_blur_p",
@@ -1668,6 +1668,7 @@ def build_cls_weighter(args_ns: argparse.Namespace) -> Optional[ClassAwareWeight
         reg=float(getattr(args_ns, "cat_loss_reg", 1.0)),
         log_loss=bool(getattr(args_ns, "cat_log_loss", True)),
         dia_loss=bool(getattr(args_ns, "cat_dia_loss", False)),
+        max_weight=float(getattr(args_ns, "cat_max_weight", 3.0)),
     )
 
 
@@ -1693,11 +1694,10 @@ def build_strong_aug_config(args_ns: argparse.Namespace, bgr: bool) -> StrongAug
 
 
 def build_strong_augmentations(
-    args_ns: argparse.Namespace, target_labeled: bool
+    args_ns: argparse.Namespace,
 ) -> Tuple[BatchTransform, BatchTransform]:
-    source = build_strong_augmentation(build_strong_aug_config(args_ns, bgr=False))
-    target = build_strong_augmentation(build_strong_aug_config(args_ns, bgr=not target_labeled))
-    return source, target
+    pipeline = build_strong_augmentation(build_strong_aug_config(args_ns, bgr=False))
+    return pipeline, pipeline
 
 
 def uses_strong_augmentation(args_ns: argparse.Namespace) -> bool:
@@ -1714,7 +1714,7 @@ def build_minority_selector(ctx: "TrainingContext") -> viz.MinoritySelector:
     )
     if ctx.icr is None:
         return frequency
-    return viz.FallbackMinority(viz.RelationMinority(ctx.icr.for_source()), frequency)
+    return viz.FallbackMinority(viz.RelationMinority(ctx.icr.source), frequency)
 
 
 def build_class_relation(
@@ -1722,12 +1722,16 @@ def build_class_relation(
 ) -> Optional[InterClassRelation]:
     if not bool(getattr(args_ns, "cat_enabled", False)):
         return None
+    alpha = float(getattr(args_ns, "cat_ema_alpha", 0.99))
+    warmup = int(getattr(args_ns, "cat_warmup_iters", 2000))
+    target_start = (
+        0 if bool(getattr(args_ns, "is_use_supervised_target_loss", False))
+        else int(getattr(args_ns, "pseudo_start_iters", 0))
+    )
     icr = InterClassRelation(
         int(args_ns.nc),
-        KeepRateSchedule(
-            alpha=float(getattr(args_ns, "cat_ema_alpha", 0.99)),
-            warmup_iters=int(getattr(args_ns, "cat_warmup_iters", 2000)),
-        ),
+        KeepRateSchedule(alpha=alpha, warmup_iters=warmup),
+        KeepRateSchedule(alpha=alpha, warmup_iters=warmup, start=target_start),
     )
     state_path = os.path.join(save_folder, CAT_STATE_FILE)
     if getattr(args_ns, "resume", None) and os.path.isfile(state_path):
@@ -1922,7 +1926,7 @@ def train_one_epoch(
         loss_mutual_src_srcdark = torch.zeros((), device=source_images.device)
         optimizer.zero_grad()
         
-        src_ci = icr.for_source() if icr is not None else None
+        src_ci = icr.for_source(iteration) if icr is not None else None
         tgt_ci = icr.for_target(iteration) if icr is not None else None
         tgt_pairs = None
         loss_l_pa1l, loss_c_pal1 = criterion(out[:3], source_targets_v, class_info=src_ci)
@@ -2509,22 +2513,20 @@ def train(ctx: TrainingContext) -> None:
         cls_weighter=cls_weighter,
     )
     ctx.icr = build_class_relation(args_ns, ctx.save_folder)
-    ctx.strong_aug_source, ctx.strong_aug_target = build_strong_augmentations(
-        args_ns, ctx.target_labeled
-    )
+    ctx.strong_aug_source, ctx.strong_aug_target = build_strong_augmentations(args_ns)
     if ctx.local_rank == 0:
         print(
             f"💪 [strong-aug] CAT pipeline "
             f"(source_strong_weight={float(getattr(args_ns, 'source_strong_weight', 0.0))}, "
-            f"target_bgr={not ctx.target_labeled}, "
             f"config={build_strong_aug_config(args_ns, bgr=False)})"
         )
     if ctx.local_rank == 0 and ctx.icr is not None:
         print(
             f"🧮 [CAT] ICRm + CALoss enabled "
             f"(alpha={ctx.icr.schedule.alpha}, warmup={ctx.icr.schedule.warmup_iters}, "
+            f"target_start={ctx.icr.target_schedule.start}, "
             f"reg={cls_weighter.reg}, log_loss={cls_weighter.log_loss}, "
-            f"dia_loss={cls_weighter.dia_loss})"
+            f"dia_loss={cls_weighter.dia_loss}, max_weight={cls_weighter.max_weight})"
         )
     
     use_rc_loss = bool(getattr(args_ns, "is_use_rc_loss", True))
