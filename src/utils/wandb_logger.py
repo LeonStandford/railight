@@ -63,6 +63,22 @@ class WandbLogger:
             self.run = None
             self._wandb = None
 
+    def log_config_file(self, path: str, artifact_name: str) -> None:
+        if self.run is None or not path or not os.path.isfile(path):
+            return
+        try:
+            artifact = self._wandb.Artifact(name=artifact_name, type="config")
+            artifact.add_file(path)
+            self.run.log_artifact(artifact)
+            self.run.save(
+                os.path.abspath(path),
+                base_path=os.path.dirname(os.path.abspath(path)),
+                policy="now",
+            )
+            print(f"[wandb] uploaded config {path} as artifact '{artifact_name}'")
+        except Exception as e:
+            print(f"[wandb] config upload failed: {e}")
+
     def log(self, data: Dict[str, Any]) -> None:
         if self.run is None or not data:
             return

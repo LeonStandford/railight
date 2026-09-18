@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH -J beelab.railight.exp3.da.batch16.h100.train
-#SBATCH -o /home/a00161/stacy.en14/models/railight/logs/beelab.railight.exp3.da.batch16.h100.train.%j.log
-#SBATCH -e /home/a00161/stacy.en14/models/railight/logs/beelab.railight.exp3.da.batch16.h100.train.%j.log
+#SBATCH -J beelab.railight.exp3.da.batch8.weak_strong_augmentation.caotulab_server.h100.train
+#SBATCH -o /home/a00161/stacy.en14/models/railight/logs/beelab.railight.exp3.da.batch8.weak_strong_augmentation.caotulab_server.h100.train.%j.log
+#SBATCH -e /home/a00161/stacy.en14/models/railight/logs/beelab.railight.exp3.da.batch8.weak_strong_augmentation.caotulab_server.h100.train.%j.log
 #SBATCH -p defq
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:gpu:2
+#SBATCH --gres=gpu:gpu:1
 #SBATCH --mem=200G
 #SBATCH --time=5-00:00:00
 
 set -euo pipefail
 
-REPO_ROOT=/home/a00161/stacy.en14/Long/railight
+REPO_ROOT=/home/a00161/stacy.en14/Long/railway.caotulab
 set +u
 source /etc/profile.d/modules.sh
 set -u

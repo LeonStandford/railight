@@ -413,6 +413,7 @@ def build_data_loaders(
         collate_fn=detection_collate,
         sampler=train_sampler,
         pin_memory=True,
+        drop_last=True,
     )
     val_ds = SourceDomainDetection(args_ns.source_val_file, mode="val")
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_ds, shuffle=False)
@@ -915,6 +916,9 @@ class TrainingContext:
             config=vars(args_ns),
             entity=getattr(args_ns, "wandb_entity", None),
         )
+        self.wandb.log_config_file(
+            str(getattr(args_ns, "config", "")), f"config-{args_ns.num_exp}"
+        )
 
     def next_target_batch(
         self,
@@ -1090,11 +1094,7 @@ def run_full_visualisation(
             )
     if gradcam is not None:
         gradcam.remove()
-    if (
-        bool(getattr(ctx.args, "cat_enabled", False))
-        and uses_strong_augmentation(ctx.args)
-        and ctx.strong_aug_source is not None
-    ):
+    if uses_strong_augmentation(ctx.args) and ctx.strong_aug_source is not None:
         try:
             _p("CAT augmentation samples per minority class")
             ctx.cat_aug_images = viz.render_cat_augmentations(

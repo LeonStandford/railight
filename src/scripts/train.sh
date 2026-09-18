@@ -3,7 +3,7 @@ set -e
 
 cd "$(dirname "$0")/../.."
 
-CONFIG=configs/train/dai_net/vgg16/exp3.yaml
+CONFIG="${CONFIG:-configs/train/dai_net/vgg16/exp3.da.batch8.weak_strong_augmentation.yaml}"
 
 if [ ! -f "$CONFIG" ]; then
     echo "ERROR: CONFIG=$CONFIG does not exist." >&2; exit 1
