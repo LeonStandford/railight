@@ -45,7 +45,7 @@ from losses.weight_reg import snapshot_wreg_ref, weight_reg_loss
 from losses.cat_icrm import ClassAwareWeighter, InterClassRelation, KeepRateSchedule
 from models.enhancer import RetinexNet
 from models.factory import basenet_factory, build_net
-from dainet.constants import (
+from railight.constants import (
     CHECKPOINT_LATEST,
     CHECKPOINT_BEST,
     RETINEX_WEIGHTS,
@@ -86,7 +86,7 @@ _MODEL_FROM_ARCH_BACKBONE = MODEL_FROM_ARCH_BACKBONE
 
 def resolve_arch_and_backbone(args_ns: argparse.Namespace) -> Tuple[str, str]:
     arch = args_ns.architecture or _DEFAULT_ARCH_FROM_MODEL.get(
-        args_ns.model, "dai_net"
+        args_ns.model, "railight"
     )
     backbone = _BACKBONE_FROM_MODEL.get(args_ns.model, args_ns.model)
     return (arch, backbone)
@@ -128,7 +128,7 @@ _TRAIN_DEFAULTS: Dict[str, Any] = {
     "backbone_weights": "auto",
     "pretrained_model": None,
     "use_wandb": False,
-    "wandb_project": "dainet-railway",
+    "wandb_project": "railight-railway",
     "wandb_entity": None,
     "val_every_epochs": 1,
     "viz_max_source_batches": 30,
@@ -302,8 +302,8 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
         "focal_gamma", "focal_alpha_bg",
         "stal_ref_area", "stal_max_w",
         "pseudo_weight", "pseudo_conf", "pseudo_nms_iou", "ema_decay",
-        "pseudo_cls_weight", "supervised_target_loss_weight",
-        "cat_ema_alpha", "cat_loss_reg",
+        "pseudo_cls_weight", "supervised_target_loss_weight", "pseudo_neg_thr",
+        "cat_ema_alpha", "cat_loss_reg", "cat_max_weight", "grad_clip_norm",
         "source_strong_weight", "strong_aug_jitter_p", "strong_aug_brightness",
         "strong_aug_contrast", "strong_aug_saturation", "strong_aug_hue",
         "strong_aug_gray_p", "strong_aug_blur_p",
@@ -317,12 +317,12 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
     return argparse.Namespace(**merged)
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser("DAI-Net training driven by a YAML config.")
+    p = argparse.ArgumentParser("RAILIGHT training driven by a YAML config.")
     p.add_argument(
         "--config",
         required=True,
         type=str,
-        help="Path to YAML config, e.g. configs/train/dai_net/vgg16/exp1.yaml",
+        help="Path to YAML config, e.g. configs/train/railight/vgg16/exp1.yaml",
     )
     cli = p.parse_args()
     return load_yaml_config(cli.config, mode="train")
@@ -335,7 +335,7 @@ def setup_logging(
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(log_dir, f"{ts}_{num_exp}.log")
     fh = open(path, "a", buffering=1, encoding="utf-8")
-    fh.write(f"# DAI-Net training log - {_dt.datetime.now().isoformat()}\n")
+    fh.write(f"# RAILIGHT training log - {_dt.datetime.now().isoformat()}\n")
     fh.write(f"# args: {vars(args_ns)}\n")
     sys.stdout = Tee(sys.stdout, fh)
     sys.stderr = Tee(sys.stderr, fh)
@@ -371,7 +371,7 @@ def teardown_distributed() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
-def _paths_from_dainet_txt(*txt_files: Optional[str]) -> List[str]:
+def _paths_from_railight_txt(*txt_files: Optional[str]) -> List[str]:
     seen: set = set()
     out: List[str] = []
     for f in txt_files:
@@ -439,7 +439,7 @@ def build_data_loaders(
         # which would leak the evaluation labels into training here.
         target_ds = SourceDomainDetection(target_train_file, mode="train")
     else:
-        target_paths = _paths_from_dainet_txt(
+        target_paths = _paths_from_railight_txt(
             getattr(args_ns, "target_train_file", None),
             getattr(args_ns, "target_val_file", None),
             getattr(args_ns, "target_test_file", None),
@@ -676,6 +676,7 @@ def history_factory() -> History:
         "target_recall": [],
         "target_f1": [],
         "target_map": [],
+        "teacher_target_map": [],
     }
 
 def _load_history(path: str) -> Optional[History]:
@@ -899,7 +900,7 @@ class TrainingContext:
                 f"{self.total_training_time_s / 3600.0:.3f}h"
             )
         self.min_loss = float("inf")
-        self.best_f1 = -1.0
+        self.best_score = -1.0
         self.best_map = -1.0
         self.wreg_ref: Dict[str, torch.Tensor] = {}
         # mean-teacher state: created lazily on the first pseudo-label step
@@ -911,7 +912,7 @@ class TrainingContext:
         self.nan_skips: int = 0
         self.wandb = WandbLogger(
             enabled=bool(getattr(args_ns, "use_wandb", False)) and local_rank == 0,
-            project=str(getattr(args_ns, "wandb_project", "dainet-railway")),
+            project=str(getattr(args_ns, "wandb_project", "railight-railway")),
             run_name=f"{self.architecture}/{self.backbone}/{args_ns.num_exp}",
             config=vars(args_ns),
             entity=getattr(args_ns, "wandb_entity", None),
@@ -1149,6 +1150,7 @@ _WANDB_EPOCH_KEYS = {
     "target_recall": "target/recall",
     "target_f1": "target/f1",
     "target_map": "target/mAP",
+    "teacher_target_map": "target/teacher_mAP",
     "target_val_loss": "target/loss",
 }
 
@@ -1183,6 +1185,33 @@ def _log_wandb_images(ctx: "TrainingContext") -> None:
         }
     )
 
+
+
+class GradNormTracker:
+
+    def __init__(self) -> None:
+        self.total = 0.0
+        self.clipped = 0
+        self.count = 0
+
+    def add(self, norm: float, limit: float) -> None:
+        self.total += norm
+        self.clipped += int(norm > limit)
+        self.count += 1
+
+    def mean(self) -> float:
+        return self.total / max(self.count, 1)
+
+    def clipped_fraction(self) -> float:
+        return self.clipped / max(self.count, 1)
+
+
+def checkpoint_score(
+    metric: str, has_target: bool, target_map: float, target_f1: float, source_f1: float
+) -> float:
+    if not has_target:
+        return source_f1
+    return target_map if metric == "target_map" else target_f1
 
 
 def _decode_per_image(
@@ -1236,6 +1265,22 @@ def _decode_per_image(
             }
         )
     return out
+
+def evaluate_target_map(
+    ctx: TrainingContext, model: torch.nn.Module
+) -> Tuple[float, Dict[str, Any]]:
+    per_image: List[Dict[str, np.ndarray]] = []
+    model.eval()
+    with torch.no_grad():
+        for images, targets, _ in ctx.target_val_loader:
+            out, _ = model.test_forward(images.cuda() / 255.0)
+            per_image.extend(_decode_per_image(out, targets, model))
+    scores, matched, n_gt, cm = viz.evaluate_detections(
+        per_image, iou_thr=0.5, score_thr_cm=0.5, num_classes=ctx.args.nc
+    )
+    _, _, _, target_map = viz._pr_from_scores(np.asarray(scores), np.asarray(matched), n_gt)
+    return float(target_map), detect_metrics_from_cm(cm)
+
 
 def validate(
     ctx: TrainingContext,
@@ -1496,6 +1541,13 @@ def validate(
     ctx.history.setdefault("target_val_loss", []).append(
         (epoch, float(tgt_val_loss))
     )
+    teacher_map, teacher_met = (
+        evaluate_target_map(ctx, ctx.teacher)
+        if ctx.teacher is not None and ctx.target_val_loader is not None
+        else (None, None)
+    )
+    if teacher_map is not None:
+        ctx.history.setdefault("teacher_target_map", []).append((epoch, float(teacher_map)))
 
     elapsed = time.time() - t0
     table = format_val_table(
@@ -1533,6 +1585,11 @@ def validate(
                 f"{tgt_met['tp']} / {tgt_met['fp']} / {tgt_met['fn']}",
             ),
             ("Target n images", f"{len(target_per_image)}"),
+            (
+                "Teacher target F1 / mAP @ IoU 0.5",
+                "n/a" if teacher_map is None
+                else f"{teacher_met['f1']:.4f} / {teacher_map:.4f}",
+            ),
             ("§", "Domain adaptation"),
             ("KL divergence (source vs target)", f"{val_kl_st:.4f}"),
             ("Target detection entropy", f"{val_entropy:.4f}"),
@@ -1574,6 +1631,8 @@ def validate(
             "target_recall": round(float(tgt_met["recall"]), 6),
             "target_f1": round(float(tgt_met["f1"]), 6),
             "target_mAP": round(float(tgt_map), 6),
+            "teacher_target_mAP": None if teacher_map is None else round(float(teacher_map), 6),
+            "teacher_target_f1": None if teacher_met is None else round(float(teacher_met["f1"]), 6),
             "target_tp": int(tgt_met["tp"]),
             "target_fp": int(tgt_met["fp"]),
             "target_fn": int(tgt_met["fn"]),
@@ -1584,17 +1643,33 @@ def validate(
     )
 
     has_target = bool(target_per_image)
-    sel_f1 = float(tgt_met["f1"] if has_target else m["f1"])
-    sel_name = "target val F1" if has_target else "source val F1"
-    if sel_f1 > ctx.best_f1:
+    metric = str(getattr(ctx.args, "best_metric", "target_f1"))
+    candidates = [
+        (
+            "student",
+            dsfd_net,
+            checkpoint_score(metric, has_target, tgt_map, tgt_met["f1"], m["f1"]),
+        ),
+    ]
+    if teacher_map is not None:
+        candidates.append(
+            (
+                "teacher",
+                ctx.teacher,
+                checkpoint_score(metric, True, teacher_map, teacher_met["f1"], m["f1"]),
+            )
+        )
+    best_name, best_model, best_score = max(candidates, key=lambda c: c[2])
+    if best_score > ctx.best_score:
         print(
-            f"🏆 [ckpt] saving best_model.pth, epoch {epoch} "
-            f"({sel_name} {sel_f1:.4f} > {max(ctx.best_f1, 0.0):.4f})"
+            f"🏆 [ckpt] saving best_model.pth from {best_name}, epoch {epoch} "
+            f"({metric if has_target else 'source_f1'} {best_score:.4f} > "
+            f"{max(ctx.best_score, 0.0):.4f})"
         )
         torch.save(
-            dsfd_net.state_dict(), os.path.join(ctx.save_folder, CHECKPOINT_BEST)
+            best_model.state_dict(), os.path.join(ctx.save_folder, CHECKPOINT_BEST)
         )
-        ctx.best_f1 = sel_f1
+        ctx.best_score = best_score
 
     sel_map = float(tgt_map if has_target else mAP)
     if sel_map > ctx.best_map:
@@ -1668,6 +1743,7 @@ def build_cls_weighter(args_ns: argparse.Namespace) -> Optional[ClassAwareWeight
         reg=float(getattr(args_ns, "cat_loss_reg", 1.0)),
         log_loss=bool(getattr(args_ns, "cat_log_loss", True)),
         dia_loss=bool(getattr(args_ns, "cat_dia_loss", False)),
+        max_weight=float(getattr(args_ns, "cat_max_weight", 3.0)),
     )
 
 
@@ -1693,11 +1769,10 @@ def build_strong_aug_config(args_ns: argparse.Namespace, bgr: bool) -> StrongAug
 
 
 def build_strong_augmentations(
-    args_ns: argparse.Namespace, target_labeled: bool
+    args_ns: argparse.Namespace,
 ) -> Tuple[BatchTransform, BatchTransform]:
-    source = build_strong_augmentation(build_strong_aug_config(args_ns, bgr=False))
-    target = build_strong_augmentation(build_strong_aug_config(args_ns, bgr=not target_labeled))
-    return source, target
+    pipeline = build_strong_augmentation(build_strong_aug_config(args_ns, bgr=False))
+    return pipeline, pipeline
 
 
 def uses_strong_augmentation(args_ns: argparse.Namespace) -> bool:
@@ -1714,7 +1789,7 @@ def build_minority_selector(ctx: "TrainingContext") -> viz.MinoritySelector:
     )
     if ctx.icr is None:
         return frequency
-    return viz.FallbackMinority(viz.RelationMinority(ctx.icr.for_source()), frequency)
+    return viz.FallbackMinority(viz.RelationMinority(ctx.icr.source), frequency)
 
 
 def build_class_relation(
@@ -1722,12 +1797,16 @@ def build_class_relation(
 ) -> Optional[InterClassRelation]:
     if not bool(getattr(args_ns, "cat_enabled", False)):
         return None
+    alpha = float(getattr(args_ns, "cat_ema_alpha", 0.99))
+    warmup = int(getattr(args_ns, "cat_warmup_iters", 2000))
+    target_start = (
+        0 if bool(getattr(args_ns, "is_use_supervised_target_loss", False))
+        else int(getattr(args_ns, "pseudo_start_iters", 0))
+    )
     icr = InterClassRelation(
         int(args_ns.nc),
-        KeepRateSchedule(
-            alpha=float(getattr(args_ns, "cat_ema_alpha", 0.99)),
-            warmup_iters=int(getattr(args_ns, "cat_warmup_iters", 2000)),
-        ),
+        KeepRateSchedule(alpha=alpha, warmup_iters=warmup),
+        KeepRateSchedule(alpha=alpha, warmup_iters=warmup, start=target_start),
     )
     state_path = os.path.join(save_folder, CAT_STATE_FILE)
     if getattr(args_ns, "resume", None) and os.path.isfile(state_path):
@@ -1746,6 +1825,11 @@ def class_relation_diag(
     if icr is None:
         return {}
     return {name: float(icr.source[i, i]) for i, name in enumerate(class_names)}
+
+
+@torch.no_grad()
+def pseudo_ignore_mask(teacher_conf: torch.Tensor, neg_thr: float) -> torch.Tensor:
+    return F.softmax(teacher_conf, dim=-1)[..., 1:].amax(-1) >= neg_thr
 
 
 def clone_teacher(net_inner: torch.nn.Module) -> torch.nn.Module:
@@ -1796,6 +1880,9 @@ def train_one_epoch(
 ) -> Tuple[int, int]:
     losses_sum = 0.0
     comp_sums: Dict[str, Any] = {k: 0.0 for k in LOSS_COMPONENT_KEYS}
+    grad_clip = float(getattr(ctx.args, "grad_clip_norm", 35.0))
+    grad_stats = GradNormTracker()
+    grad_norm = 0.0
 
     target_loss_weight = float(getattr(ctx.args, "target_loss_weight", 0.0))
     wreg_loss_weight = float(getattr(ctx.args, "wreg_loss_weight", 0.0))
@@ -1807,6 +1894,7 @@ def train_one_epoch(
     pseudo_conf = float(getattr(ctx.args, "pseudo_conf", 0.7))
     pseudo_start = int(getattr(ctx.args, "pseudo_start_iters", 0))
     pseudo_nms = float(getattr(ctx.args, "pseudo_nms_iou", 0.35))
+    pseudo_neg_thr = float(getattr(ctx.args, "pseudo_neg_thr", 0.0))
     ema_decay = float(getattr(ctx.args, "ema_decay", 0.9996))
     strong_aug = bool(getattr(ctx.args, "pseudo_strong_aug", False))
     pseudo_ramp_iters = int(getattr(ctx.args, "pseudo_ramp_iters", 1000))
@@ -1834,9 +1922,9 @@ def train_one_epoch(
     
     net_inner = net.module if hasattr(net, "module") else net
     icr = ctx.icr
-    prof_iters = int(os.environ.get("DAINET_PROFILE_ITERS", "0") or "0")
+    prof_iters = int(os.environ.get("RAILIGHT_PROFILE_ITERS", "0") or "0")
 
-    prof_full = os.environ.get("DAINET_PROFILE", "1").strip().lower() not in (
+    prof_full = os.environ.get("RAILIGHT_PROFILE", "1").strip().lower() not in (
         "0", "false", "no", "off",
     )
     
@@ -1922,7 +2010,7 @@ def train_one_epoch(
         loss_mutual_src_srcdark = torch.zeros((), device=source_images.device)
         optimizer.zero_grad()
         
-        src_ci = icr.for_source() if icr is not None else None
+        src_ci = icr.for_source(iteration) if icr is not None else None
         tgt_ci = icr.for_target(iteration) if icr is not None else None
         tgt_pairs = None
         loss_l_pa1l, loss_c_pal1 = criterion(out[:3], source_targets_v, class_info=src_ci)
@@ -2085,8 +2173,17 @@ def train_one_epoch(
                         out_s[4].index_select(0, kt),
                         out_s[5],
                     )
+                    pl_ignore = (
+                        pseudo_ignore_mask(out_teacher[4], pseudo_neg_thr).index_select(0, kt)
+                        if pseudo_neg_thr > 0
+                        else None
+                    )
                     lp_l, lp_c, pl_pairs = criterion(
-                        pred, [pl_t[i] for i in keep], class_info=tgt_ci, return_pairs=True
+                        pred,
+                        [pl_t[i] for i in keep],
+                        class_info=tgt_ci,
+                        return_pairs=True,
+                        ignore=pl_ignore,
                     )
                     if tgt_pairs is None:
                         tgt_pairs = pl_pairs
@@ -2168,7 +2265,10 @@ def train_one_epoch(
         if prof_active:
             _lap("backward")
             
-        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=35, norm_type=2)
+        grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip, norm_type=2)
+        )
+        grad_stats.add(grad_norm, grad_clip)
         optimizer.step()
 
         # Mean-teacher: slide the EMA teacher toward the updated student.
@@ -2215,7 +2315,7 @@ def train_one_epoch(
             tloss = float(losses_sum) / (batch_idx + 1)
             cur_lr = optimizer.param_groups[0]["lr"]
             tqdm.write(
-                f"📈 [train] ep:{epoch} it:{iteration} loss(avg):{tloss:.4f} p1[c:{loss_c_pal1.item():.4f} l:{loss_l_pa1l.item():.4f}] p2[c:{loss_c_pal2.item():.4f} l:{loss_l_pa12.item():.4f}] ss:{loss_source_strong.item():.4f} enh:{loss_enhance.item():.4f} enh2:{loss_enhance2.item():.4f} mut_ssd:{loss_mutual_src_srcdark.item():.4f} kl_st:{loss_kl_src_tgt.item():.4f} tgt:{loss_target_unsup.item():.4f} tsup:{loss_target_sup.item():.4f} wreg:{loss_wreg.item():.4f} ent:{loss_entropy.item():.4f} lr:{cur_lr:.2e} dt:{t1 - t0:.3f}s"
+                f"📈 [train] ep:{epoch} it:{iteration} loss(avg):{tloss:.4f} p1[c:{loss_c_pal1.item():.4f} l:{loss_l_pa1l.item():.4f}] p2[c:{loss_c_pal2.item():.4f} l:{loss_l_pa12.item():.4f}] ss:{loss_source_strong.item():.4f} enh:{loss_enhance.item():.4f} enh2:{loss_enhance2.item():.4f} mut_ssd:{loss_mutual_src_srcdark.item():.4f} kl_st:{loss_kl_src_tgt.item():.4f} tgt:{loss_target_unsup.item():.4f} tsup:{loss_target_sup.item():.4f} wreg:{loss_wreg.item():.4f} ent:{loss_entropy.item():.4f} gn:{grad_norm:.2f} clip:{grad_stats.clipped_fraction():.2f} lr:{cur_lr:.2e} dt:{t1 - t0:.3f}s"
             )
             record_iter_losses(ctx.history, iteration, tloss, loss_components)
             cat_diag = class_relation_diag(icr, ctx.class_names)
@@ -2231,6 +2331,9 @@ def train_one_epoch(
                         "iter": iteration,
                         "train/total": tloss,
                         "train/lr": float(cur_lr),
+                        "train_iter/grad_norm": grad_norm,
+                        "train/grad_norm_mean": grad_stats.mean(),
+                        "train/clip_frac": grad_stats.clipped_fraction(),
                         **{
                             f"train/{k}": float(v) / (batch_idx + 1)
                             for k, v in comp_sums.items()
@@ -2280,6 +2383,8 @@ def train_one_epoch(
             if epoch_elapsed > 0 else 0.0,
             "latency_ms_per_iter": round(epoch_elapsed / n_batches * 1000.0, 4),
             "n_batches": n_batches,
+            "grad_norm_mean": round(grad_stats.mean(), 4),
+            "clip_frac": round(grad_stats.clipped_fraction(), 4),
             "imgs_seen": imgs_seen,
             "world_size": ctx.world_size,
             "batch_size": int(ctx.args.batch_size),
@@ -2509,22 +2614,20 @@ def train(ctx: TrainingContext) -> None:
         cls_weighter=cls_weighter,
     )
     ctx.icr = build_class_relation(args_ns, ctx.save_folder)
-    ctx.strong_aug_source, ctx.strong_aug_target = build_strong_augmentations(
-        args_ns, ctx.target_labeled
-    )
+    ctx.strong_aug_source, ctx.strong_aug_target = build_strong_augmentations(args_ns)
     if ctx.local_rank == 0:
         print(
             f"💪 [strong-aug] CAT pipeline "
             f"(source_strong_weight={float(getattr(args_ns, 'source_strong_weight', 0.0))}, "
-            f"target_bgr={not ctx.target_labeled}, "
             f"config={build_strong_aug_config(args_ns, bgr=False)})"
         )
     if ctx.local_rank == 0 and ctx.icr is not None:
         print(
             f"🧮 [CAT] ICRm + CALoss enabled "
             f"(alpha={ctx.icr.schedule.alpha}, warmup={ctx.icr.schedule.warmup_iters}, "
+            f"target_start={ctx.icr.target_schedule.start}, "
             f"reg={cls_weighter.reg}, log_loss={cls_weighter.log_loss}, "
-            f"dia_loss={cls_weighter.dia_loss})"
+            f"dia_loss={cls_weighter.dia_loss}, max_weight={cls_weighter.max_weight})"
         )
     
     use_rc_loss = bool(getattr(args_ns, "is_use_rc_loss", True))
@@ -2657,13 +2760,13 @@ def _peek_architecture(config_path: str) -> str:
     return str(arch or "").lower()
 
 def main() -> None:
-    p = argparse.ArgumentParser("Unified DAI-Net / YOLO trainer (YAML-driven)")
+    p = argparse.ArgumentParser("Unified RAILIGHT / YOLO trainer (YAML-driven)")
     p.add_argument("--config", required=True, type=str)
     cli = p.parse_args()
 
     arch = _peek_architecture(cli.config)
     if arch.startswith("yolo"):
-        from dainet.yolo_runner import run_from_config
+        from railight.yolo_runner import run_from_config
 
         run_from_config(cli.config)
         return

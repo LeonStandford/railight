@@ -1,4 +1,4 @@
-"""Loss functions for DAI-Net training."""
+"""Loss functions for RAILIGHT training."""
 
 from losses.dfl import (
     FocalLoss,

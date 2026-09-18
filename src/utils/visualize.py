@@ -138,7 +138,7 @@ def _save(fig: Figure, path: str) -> str:
 def plot_losses(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     x_key: str = "iter",
 ) -> Optional[str]:
@@ -263,7 +263,7 @@ def plot_train_vs_val(
     train_pts: Sequence[Point],
     val_pts: Sequence[Point],
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "train_vs_val.png",
 ) -> Optional[str]:
@@ -308,7 +308,7 @@ def plot_train_vs_val(
 def plot_train_val_metrics(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "train_val_metrics.png",
 ) -> Optional[str]:
@@ -372,7 +372,7 @@ def plot_train_val_metrics(
 def plot_confusion_matrix(
     cm: np.ndarray,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     classes: Sequence[str] = ("object", "background"),
     normalize: bool = True,
@@ -439,7 +439,7 @@ def plot_pr_curve(
     matched: np.ndarray,
     n_gt: int,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "pr_curve.png",
 ) -> Tuple[str, float]:
@@ -464,7 +464,7 @@ def plot_recall_f1_curve(
     matched: np.ndarray,
     n_gt: int,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "recall_f1.png",
 ) -> str:
@@ -508,7 +508,7 @@ def plot_test_distributions(
     kl_vals,
     ce_vals,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "test_distributions.png",
     feat_before_day=None,
@@ -621,7 +621,7 @@ def plot_tsne_features(
     class_names: Sequence[str],
     out_dir: str,
     fname: str = "tsne_source_features.png",
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
 ) -> Optional[str]:
     feats = np.asarray(feats, dtype=np.float32)
@@ -682,7 +682,7 @@ def plot_domain_tsne(
     out_dir: str,
     fname: str,
     subject: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     cap_per_domain: int = 1500,
 ) -> Optional[str]:
@@ -708,7 +708,7 @@ def plot_domain_tsne(
 def plot_target_metrics(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "target_metrics.png",
 ) -> Optional[str]:
@@ -768,7 +768,7 @@ def plot_target_metrics(
 def plot_domain_metrics(
     history: History,
     out_dir: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     fname: str = "domain_metrics.png",
 ) -> Optional[str]:
@@ -844,7 +844,7 @@ def plot_sample_predictions(
     samples: Sequence[Dict[str, Any]],
     out_dir: str,
     fname: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     title_suffix: str = "",
 ) -> Optional[str]:
@@ -961,7 +961,7 @@ def plot_samples_grid_3row(
     items: Sequence[Dict[str, Any]],
     out_dir: str,
     fname: str,
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     title_suffix: str = "",
 ) -> Optional[str]:
@@ -1455,7 +1455,7 @@ def plot_gradcam_comparison(
     target_items: Sequence[Dict[str, Any]],
     out_dir: str,
     fname: str = "gradcam_source_vs_target.png",
-    method: str = "DAI-Net",
+    method: str = "RAILIGHT",
     config: Config = None,
     score_fn: Optional[Callable[[Any], Any]] = None,
     forward_fn: Optional[Callable[[Any, Any], Any]] = None,
@@ -1527,13 +1527,13 @@ def _parse_main_args(argv: Optional[Sequence[str]] = None) -> Any:
     import argparse
 
     p = argparse.ArgumentParser(
-        description="Standalone Grad-CAM (source day vs target night) for DAI-Net"
+        description="Standalone Grad-CAM (source day vs target night) for RAILIGHT"
     )
     p.add_argument("cmd", nargs="?", default="gradcam", choices=["gradcam"])
     p.add_argument("--weights", required=True, type=str)
     p.add_argument(
         "--architecture",
-        default="dai_net",
+        default="railight",
         type=str,
         help="Detection architecture name (used in charts path).",
     )
@@ -1636,7 +1636,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         net = net.cuda()
     if not hasattr(net, "vgg"):
         raise RuntimeError(
-            "Backbone has no `.vgg` ModuleList; this Grad-CAM helper is wired for VGG-style DAI-Net only."
+            "Backbone has no `.vgg` ModuleList; this Grad-CAM helper is wired for VGG-style RAILIGHT only."
         )
     target_idx = min(args.target_layer_idx, len(net.vgg) - 1)
     end = min(args.forward_end_idx, len(net.vgg))
@@ -1682,7 +1682,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     out_dir = make_charts_dir(
         args.charts_dir, args.mode_name, args.architecture, args.model, args.num_exp
     )
-    method = f"DAI-Net ({args.model}, {os.path.basename(args.weights)})"
+    method = f"RAILIGHT ({args.model}, {os.path.basename(args.weights)})"
     config = {
         "backbone": args.model,
         "weights": os.path.basename(args.weights),

@@ -60,7 +60,7 @@ class TargetUnlabeledDataset(data.Dataset):
     def __getitem__(self, idx: int) -> torch.Tensor:
         img = Image.open(self.paths[idx]).convert("RGB")
         img = img.resize((self.size, self.size), Image.BILINEAR)
-        arr = to_chw_bgr(np.asarray(img, dtype=np.float32))
+        arr = to_chw_bgr(np.asarray(img, dtype=np.float32))[[2, 1, 0], :, :]
         return torch.from_numpy(arr.copy())
 
 def resolve_target_label_paths(

@@ -1,8 +1,8 @@
-architecture: dai_net
+architecture: railight
 backbone: yolo26n
 num_exp: exp2
 
-weights: weights/dai_net/yolo26n/exp2/best_model.pth
+weights: weights/railight/yolo26n/exp2/best_model.pth
 
 cuda: true
 gpu_ids: 7

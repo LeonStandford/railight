@@ -22,7 +22,7 @@ TARGET_DEFAULT_CLASS_MAP: Dict[int, int] = {1: 1, 7: 1, 5: 2, 6: 3}
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Convert YOLO-format dataset to DAI-Net txt files"
+        description="Convert YOLO-format dataset to RAILIGHT txt files"
     )
     p.add_argument("--source-root", default=None, type=str)
     p.add_argument("--train-split", default="Train", type=str)
@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         "--class-map",
         default=None,
         type=str,
-        help='JSON string mapping yolo cls -> dainet cls, e.g. \'{"1":1,"7":1,"5":2,"6":3}\'',
+        help='JSON string mapping yolo cls -> railight cls, e.g. \'{"1":1,"7":1,"5":2,"6":3}\'',
     )
     p.add_argument("--out-dir", default="dataset", type=str)
     p.add_argument("--max-class", default=3, type=int)
@@ -109,7 +109,7 @@ def _yolo_line_to_pixel(
         return None
     return (x1, y1, box_w, box_h, out_cls)
 
-def _write_dainet_lines(
+def _write_railight_lines(
     images_dir: str,
     labels_dir: str,
     fnames: List[str],
@@ -173,7 +173,7 @@ def convert_split(
     files = sorted((f for f in os.listdir(images_dir) if f.endswith(IMG_EXTS)))
     if not files:
         raise RuntimeError(f"No images in {images_dir}")
-    return _write_dainet_lines(
+    return _write_railight_lines(
         images_dir, labels_dir, files, out_path, max_class, cls_offset, class_map
     )
 
@@ -256,15 +256,15 @@ def convert_flat(
         f"[flat] {flat_root} -> {prefix}_{{train,val,test}}.txt "
         f"({n} usable; split {len(train_files)}/{len(val_files)}/{len(test_files)})"
     )
-    _write_dainet_lines(
+    _write_railight_lines(
         images_dir, labels_dir, train_files, train_out, max_class, cls_offset, class_map
     )
     if val_files:
-        _write_dainet_lines(
+        _write_railight_lines(
             images_dir, labels_dir, val_files, val_out, max_class, cls_offset, class_map
         )
     if test_files:
-        _write_dainet_lines(
+        _write_railight_lines(
             images_dir, labels_dir, test_files, test_out, max_class, cls_offset, class_map
         )
 

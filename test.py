@@ -1120,12 +1120,12 @@ def _collect_paired_samples(
     return (day, synth)
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser("DAI-Net evaluation driven by a YAML config.")
+    p = argparse.ArgumentParser("RAILIGHT evaluation driven by a YAML config.")
     p.add_argument(
         "--config",
         required=True,
         type=str,
-        help="Path to YAML config, e.g. configs/test/dai_net/vgg16/exp1.yaml",
+        help="Path to YAML config, e.g. configs/test/railight/vgg16/exp1.yaml",
     )
     cli = p.parse_args()
     return load_test_config(cli.config)

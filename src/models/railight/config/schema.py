@@ -36,7 +36,7 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
 
 @dataclass
 class Config:
-    architecture: str = "dai_net"
+    architecture: str = "railight"
     backbone: str = "vgg16"
     model: str = "dark"
     num_exp: str = "exp1"

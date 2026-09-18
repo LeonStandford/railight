@@ -1,7 +1,7 @@
-architecture: dai_net
+architecture: railight
 num_exp: exp3
 
-weights: weights/dai_net/vgg16/exp3/best_model.pth
+weights: weights/railight/vgg16/exp3/best_model.pth
 
 cuda: true
 gpu_ids: 7

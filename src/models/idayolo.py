@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from layers import *
 from data.config import cfg
-from models.dai_net import (
+from models.railight_net import (
     Interpolate,
     DistillKL,
     fem_module,

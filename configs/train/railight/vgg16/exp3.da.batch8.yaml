@@ -34,6 +34,8 @@ log_dir:     /home/a00161/stacy.en14/data/data_exp2/railight/logs
 resume: true
 
 val_every_epochs: 3
+best_metric: target_map
+grad_clip_norm: 35
 viz_num_samples: 6
 viz_every_iters: 500
 viz_full_every_epochs: 10

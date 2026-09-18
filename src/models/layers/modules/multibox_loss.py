@@ -57,12 +57,20 @@ class MultiBoxLoss(nn.Module):
         conf_t: torch.Tensor,
         pred_cls: Optional[torch.Tensor],
         class_info: Optional[torch.Tensor],
+        ignore: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         logits = conf_data.view(-1, self.num_classes)
         flat_t = conf_t.view(-1)
-        if class_info is None or self.cls_weighter is None:
+        weighted = class_info is not None and self.cls_weighter is not None
+        if not weighted and ignore is None:
             return self.cls_loss_fn(logits, flat_t)
-        w = self.cls_weighter(class_info, flat_t, pred_cls.view(-1))
+        w = (
+            self.cls_weighter(class_info, flat_t, pred_cls.view(-1))
+            if weighted
+            else torch.ones(flat_t.shape, dtype=torch.float32, device=flat_t.device)
+        )
+        if ignore is not None:
+            w = w * (~(ignore.view(-1) & (flat_t == 0))).float()
         return (self._cls_per_prior(logits, flat_t) * w).sum()
 
     def _ohem_cls(
@@ -96,6 +104,7 @@ class MultiBoxLoss(nn.Module):
         targets: Sequence[torch.Tensor],
         class_info: Optional[torch.Tensor] = None,
         return_pairs: bool = False,
+        ignore: Optional[torch.Tensor] = None,
     ) -> LossOutput:
         loc_data, conf_data, priors = predictions
         num = loc_data.size(0)
@@ -143,7 +152,7 @@ class MultiBoxLoss(nn.Module):
         pred_cls = conf_data.detach().argmax(-1) if need_pred else None
         if self.cls_loss_fn is not None:
             # Focal path: classify over every prior, no hard-neg mining.
-            loss_c = self._focal_cls(conf_data, conf_t, pred_cls, class_info)
+            loss_c = self._focal_cls(conf_data, conf_t, pred_cls, class_info, ignore)
             N = num_pos.data.sum() if num_pos.data.sum() > 0 else num
             loss_l /= N
             loss_c /= N
@@ -152,11 +161,15 @@ class MultiBoxLoss(nn.Module):
         loss_c = log_sum_exp(batch_conf) - batch_conf.gather(1, conf_t.view(-1, 1))
         loss_c[pos.view(-1, 1)] = 0
         loss_c = loss_c.view(num, -1)
+        if ignore is not None:
+            loss_c[ignore & ~pos] = 0
         _, loss_idx = loss_c.sort(1, descending=True)
         _, idx_rank = loss_idx.sort(1)
         num_pos = pos.long().sum(1, keepdim=True)
         num_neg = torch.clamp(self.negpos_ratio * num_pos, max=pos.size(1) - 1)
         neg = idx_rank < num_neg.expand_as(idx_rank)
+        if ignore is not None:
+            neg = neg & ~ignore
         pos_idx = pos.unsqueeze(2).expand_as(conf_data)
         neg_idx = neg.unsqueeze(2).expand_as(conf_data)
         conf_p = conf_data[(pos_idx + neg_idx).gt(0)].view(-1, self.num_classes)

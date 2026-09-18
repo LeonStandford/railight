@@ -16,19 +16,15 @@ BACKBONE_FROM_MODEL: Dict[str, str] = {
     "resnet152": "resnet152",
 }
 DEFAULT_ARCH_FROM_MODEL: Dict[str, str] = {
-    "dark": "dai_net",
-    "dark_sppf": "dai_net",
-    "yolo26n": "dai_net",
+    "dark": "railight",
+    "dark_sppf": "railight",
+    "yolo26n": "railight",
     "vgg": "dsfd",
     "resnet50": "dsfd",
     "resnet101": "dsfd",
     "resnet152": "dsfd",
 }
 MODEL_FROM_ARCH_BACKBONE: Dict[Tuple[str, str], str] = {
-    ("dai_net", "vgg16"): "dark",
-    ("dai_net", "vgg16_sppf"): "dark_sppf",
-    ("dai_net", "yolo26n"): "yolo26n",
-    # "railight" is the new name of the DAI-Net architecture; same models.
     ("railight", "vgg16"): "dark",
     ("railight", "vgg16_sppf"): "dark_sppf",
     ("railight", "yolo26n"): "yolo26n",

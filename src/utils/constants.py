@@ -65,7 +65,7 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "backbone_weights": "auto",
     "pretrained_model": None,
     "use_wandb": False,
-    "wandb_project": "dainet-railway",
+    "wandb_project": "railight-railway",
     "wandb_entity": None,
     "val_every_epochs": 1,
     "viz_max_source_batches": 30,

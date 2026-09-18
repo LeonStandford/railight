@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -28,11 +28,16 @@ class PriorWeighter(ABC):
 class ClassAwareWeighter(PriorWeighter):
 
     def __init__(
-        self, reg: float = 1.0, log_loss: bool = True, dia_loss: bool = False
+        self,
+        reg: float = 1.0,
+        log_loss: bool = True,
+        dia_loss: bool = False,
+        max_weight: float = 3.0,
     ) -> None:
         self.reg = float(reg)
         self.log_loss = bool(log_loss)
         self.dia_loss = bool(dia_loss)
+        self.max_weight = float(max_weight)
 
     def _prepare(self, relation: torch.Tensor, device: torch.device) -> torch.Tensor:
         k = relation.size(0)
@@ -66,37 +71,49 @@ class ClassAwareWeighter(PriorWeighter):
             w = w.clamp_min(1e-5)
             w[sel] = w[sel] / mean_w
         w = (w + self.reg) / (1.0 + self.reg)
-        return torch.nan_to_num(w, nan=0.0)
+        return torch.nan_to_num(w, nan=0.0).clamp(max=self.max_weight)
 
 
 class KeepRateSchedule:
 
-    def __init__(self, alpha: float = 0.99, warmup_iters: int = 2000) -> None:
+    def __init__(self, alpha: float = 0.99, warmup_iters: int = 2000, start: int = 0) -> None:
         self.alpha = float(alpha)
         self.warmup_iters = int(warmup_iters)
+        self.start = int(start)
+
+    def _progress(self, iteration: int) -> int:
+        return max(0, iteration - self.start)
 
     def is_warm(self, iteration: int) -> bool:
-        return self.warmup_iters <= 0 or iteration >= self.warmup_iters
+        return self.warmup_iters <= 0 or self._progress(iteration) >= self.warmup_iters
 
     def __call__(self, iteration: int) -> float:
         if self.is_warm(iteration):
             return self.alpha
-        return 0.5 + (self.alpha - 0.5) * (iteration / self.warmup_iters) ** 3
+        return 0.5 + (self.alpha - 0.5) * (self._progress(iteration) / self.warmup_iters) ** 3
 
 
 class InterClassRelation:
 
-    def __init__(self, num_fg: int, schedule: KeepRateSchedule) -> None:
+    def __init__(
+        self,
+        num_fg: int,
+        schedule: KeepRateSchedule,
+        target_schedule: Optional[KeepRateSchedule] = None,
+    ) -> None:
         self.num_fg = int(num_fg)
         self.schedule = schedule
+        self.target_schedule = target_schedule if target_schedule is not None else schedule
         self.source = torch.zeros(self.num_fg, self.num_fg)
         self.target = torch.zeros(self.num_fg, self.num_fg)
 
-    def for_source(self) -> torch.Tensor:
-        return self.source
+    def for_source(self, iteration: int) -> Optional[torch.Tensor]:
+        return self.source if self.schedule.is_warm(iteration) else None
 
-    def for_target(self, iteration: int) -> torch.Tensor:
-        return self.target if self.schedule.is_warm(iteration) else self.source
+    def for_target(self, iteration: int) -> Optional[torch.Tensor]:
+        if self.target_schedule.is_warm(iteration):
+            return self.target
+        return self.for_source(iteration)
 
     @staticmethod
     def empty_pairs(device: torch.device) -> LabelPairs:
@@ -129,7 +146,7 @@ class InterClassRelation:
         seen = rows > 0
         if not seen.any():
             return
-        a = self.schedule(iteration)
+        a = (self.target_schedule if target else self.schedule)(iteration)
         m = self.target if target else self.source
         m[seen] = m[seen] * a + counts[seen] / rows[seen, None] * (1.0 - a)
 
