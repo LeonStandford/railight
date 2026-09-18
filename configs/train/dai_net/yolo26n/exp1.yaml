@@ -1,4 +1,4 @@
-architecture: dai_net
+architecture: railight
 backbone: yolo26n
 num_exp: exp1
 
@@ -25,7 +25,6 @@ source_test_file:  ./dataset/source_test.txt
 target_train_file: ./dataset/target_train.txt
 target_val_file:   ./dataset/target_val.txt
 target_test_file:  ./dataset/target_test.txt
-target_folder4unsupervised: null
 
 nc: 8
 names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
@@ -46,12 +45,15 @@ focal_class_weights:
 box_loss: smooth_l1
 is_use_rc_loss: false
 
-use_wandb: true
-wandb_project: uda-rdd-idayolo
+use_wandb:                     true
+wandb_project:                 da-rdd-railight
+wandb_entity:                  null
+wandb_dir:                     ./wandb
 
 save_folder: weights/
 charts_dir:  ./charts
 records_dir: ./records
+log_dir:     ./logs
 resume: true
 
 val_every_epochs: 3

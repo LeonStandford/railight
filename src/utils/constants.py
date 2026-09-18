@@ -57,7 +57,6 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "target_train_file": "./dataset/target_train.txt",
     "target_val_file": "./dataset/target_val.txt",
     "target_test_file": "./dataset/target_test.txt",
-    "target_folder4unsupervised": None,
     "focal_enabled": True,
     "focal_gamma": 2.0,
     "focal_alpha_bg": 0.25,

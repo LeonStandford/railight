@@ -1,4 +1,4 @@
-architecture: dai_net
+architecture: railight
 num_exp: exp1
 
 batch_size: 2
@@ -24,13 +24,13 @@ source_test_file:  ./dataset/source_test.txt
 target_train_file: ./dataset/target_train.txt
 target_val_file:   ./dataset/target_val.txt
 target_test_file:  ./dataset/target_test.txt
-target_folder4unsupervised: null
 nc: 3
 names: ['crack', 'missing_items', 'broken_sleeper']
 
 save_folder: weights/
 charts_dir:  ./charts
 records_dir: ./records
+log_dir:     ./logs
 resume: false
 
 viz_num_samples: 6
@@ -46,3 +46,8 @@ box_loss: smooth_l1
 
 # Redecomposition cohering loss (L_rc, Eq.2 DAI-Net); set false to disable
 is_use_rc_loss: true
+
+use_wandb:                     true
+wandb_project:                 da-rdd-railight
+wandb_entity:                  null
+wandb_dir:                     ./wandb

@@ -28,6 +28,10 @@ MODEL_FROM_ARCH_BACKBONE: Dict[Tuple[str, str], str] = {
     ("dai_net", "vgg16"): "dark",
     ("dai_net", "vgg16_sppf"): "dark_sppf",
     ("dai_net", "yolo26n"): "yolo26n",
+    # "railight" is the new name of the DAI-Net architecture; same models.
+    ("railight", "vgg16"): "dark",
+    ("railight", "vgg16_sppf"): "dark_sppf",
+    ("railight", "yolo26n"): "yolo26n",
     ("dsfd", "vgg16"): "vgg",
     ("dsfd", "resnet50"): "resnet50",
     ("dsfd", "resnet101"): "resnet101",
