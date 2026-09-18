@@ -1,7 +1,10 @@
 from __future__ import annotations
+import glob
 import math
 import os
 import textwrap
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import matplotlib
 
@@ -10,6 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 import numpy as np
+import torch
 
 matplotlib.rcParams.update(
     {
@@ -43,6 +47,7 @@ _PRETTY_LOSS_NAME: Dict[str, str] = {
     "pal1_conf": "First shot classification loss",
     "pal2_loc": "Second shot localisation loss",
     "pal2_conf": "Second shot classification loss",
+    "source_strong": "Source strong-view detection loss",
     "enhance": "Retinex decomposition loss",
     "enhance_l1ssim": "Reflectance reconstruction loss",
     "mutual": "Mutual learning loss",
@@ -62,6 +67,7 @@ _LOSS_SUBTITLE: Dict[str, str] = {
     "pal1_conf": "Class prediction on the first detection head, source images only",
     "pal2_loc": "Box regression on the second, refined detection head, source images only",
     "pal2_conf": "Class prediction on the second, refined detection head, source images only",
+    "source_strong": "Detection loss on a CAT-style strongly augmented copy of the source image, both heads",
     "enhance": "Retinex split of the image into reflectance and illumination",
     "enhance_l1ssim": "Reflectance predicted inside the network versus the frozen RetinexNet",
     "mutual": "Agreement between the daylight branch and the synthetic dark branch",
@@ -140,7 +146,7 @@ def plot_losses(
         return None
 
     loss_fn_keys = list(_LOSS_ORDER) + [
-        "target_unsup", "target_sup", "pseudo", "kl_st", "wreg", "entropy"
+        "source_strong", "target_unsup", "target_sup", "pseudo", "kl_st", "wreg", "entropy"
     ]
     iter_panels = [k for k in loss_fn_keys if history.get(k)]
 
@@ -1003,6 +1009,240 @@ def plot_samples_grid_3row(
         axes[r][0].set_ylabel(row_titles[r], fontsize=11, fontweight="bold")
     fig.subplots_adjust(top=0.92, hspace=0.06, wspace=0.04)
     return _save(fig, os.path.join(out_dir, fname))
+
+
+DetectionBatch = Tuple[torch.Tensor, Sequence[torch.Tensor], Sequence[str]]
+
+
+class MinoritySelector(ABC):
+
+    @abstractmethod
+    def select(self) -> List[int]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def describe(self, label: int) -> str:
+        raise NotImplementedError
+
+
+class RelationMinority(MinoritySelector):
+
+    def __init__(self, relation: torch.Tensor) -> None:
+        self.diag = relation.diagonal().detach().float().cpu().clone()
+
+    def _mean(self) -> float:
+        return float(self.diag.mean())
+
+    def select(self) -> List[int]:
+        if not bool((self.diag > 0).any()):
+            return []
+        mean = self._mean()
+        return [i + 1 for i, v in enumerate(self.diag.tolist()) if v <= mean]
+
+    def describe(self, label: int) -> str:
+        return f"ICRm diag {float(self.diag[label - 1]):.2f} <= mean {self._mean():.2f}"
+
+
+class FrequencyMinority(MinoritySelector):
+
+    def __init__(self, counts: Sequence[int]) -> None:
+        self.counts = np.asarray(counts, dtype=np.float64)
+
+    @classmethod
+    def from_list_file(cls, list_file: str, num_fg: int) -> "FrequencyMinority":
+        counts = np.zeros(num_fg, dtype=np.int64)
+        if list_file and os.path.isfile(list_file):
+            with open(list_file) as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    for i in range(int(parts[1])):
+                        c = int(parts[6 + 5 * i])
+                        if 0 < c <= num_fg:
+                            counts[c - 1] += 1
+        return cls(counts.tolist())
+
+    def _mean(self) -> float:
+        return float(self.counts.mean()) if self.counts.size else 0.0
+
+    def select(self) -> List[int]:
+        if not self.counts.size or self.counts.sum() == 0:
+            return []
+        mean = self._mean()
+        return [i + 1 for i, v in enumerate(self.counts.tolist()) if v < mean]
+
+    def describe(self, label: int) -> str:
+        return f"{int(self.counts[label - 1])} train instances < mean {self._mean():.0f}"
+
+
+class FallbackMinority(MinoritySelector):
+
+    def __init__(self, primary: MinoritySelector, fallback: MinoritySelector) -> None:
+        self.primary = primary
+        self.fallback = fallback
+
+    def _active(self) -> MinoritySelector:
+        return self.primary if self.primary.select() else self.fallback
+
+    def select(self) -> List[int]:
+        return self._active().select()
+
+    def describe(self, label: int) -> str:
+        return self._active().describe(label)
+
+
+@dataclass(frozen=True)
+class AugSample:
+    day: np.ndarray
+    weak: np.ndarray
+    strong: np.ndarray
+    boxes: np.ndarray
+    labels: np.ndarray
+    path: str
+
+
+class AugSampleCollector:
+
+    def __init__(
+        self,
+        darken: Callable[[torch.Tensor], torch.Tensor],
+        strong: Callable[[torch.Tensor], torch.Tensor],
+        device: torch.device,
+        per_class: int = 6,
+        max_batches: int = 30,
+    ) -> None:
+        self.darken = darken
+        self.strong = strong
+        self.device = device
+        self.per_class = int(per_class)
+        self.max_batches = int(max_batches)
+
+    @staticmethod
+    def _to_hwc(image: torch.Tensor) -> np.ndarray:
+        return image.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
+
+    def _full(self, wanted: Dict[int, List[AugSample]]) -> bool:
+        return all(len(v) >= self.per_class for v in wanted.values())
+
+    @torch.no_grad()
+    def collect(
+        self, loader: Iterable[DetectionBatch], classes: Sequence[int]
+    ) -> Dict[int, List[AugSample]]:
+        wanted: Dict[int, List[AugSample]] = {int(c): [] for c in classes}
+        if not wanted:
+            return wanted
+        for b_idx, (images, targets, paths) in enumerate(loader):
+            if b_idx >= self.max_batches or self._full(wanted):
+                break
+            day = images.to(self.device) / 255.0
+            weak = self.darken(day)
+            strong = self.strong(weak)
+            h, w = day.shape[2], day.shape[3]
+            scale = np.array([w, h, w, h], dtype=np.float32)
+            for i, target in enumerate(targets):
+                gt = np.asarray(target.cpu() if hasattr(target, "cpu") else target, dtype=np.float32)
+                if gt.size == 0:
+                    continue
+                labels = gt[:, 4].astype(np.int64)
+                hits = [c for c, v in wanted.items() if len(v) < self.per_class and c in labels]
+                if not hits:
+                    continue
+                sample = AugSample(
+                    day=self._to_hwc(day[i]),
+                    weak=self._to_hwc(weak[i]),
+                    strong=self._to_hwc(strong[i]),
+                    boxes=gt[:, :4] * scale,
+                    labels=labels,
+                    path=str(paths[i]),
+                )
+                for c in hits:
+                    wanted[c].append(sample)
+        return wanted
+
+
+class AugmentationGridPlotter:
+
+    ROWS: Tuple[Tuple[str, str], ...] = (
+        ("day", "Source image (day)"),
+        ("weak", "Weak view: dark ISP"),
+        ("strong", "Strong view: CAT aug"),
+    )
+    PREFIX: str = "cat_aug_"
+
+    def __init__(
+        self,
+        class_names: Sequence[str],
+        out_dir: str,
+        method: str,
+        config: Config,
+    ) -> None:
+        self.class_names = list(class_names)
+        self.out_dir = out_dir
+        self.method = method
+        self.config = config
+
+    def name(self, label: int) -> str:
+        return self.class_names[label - 1]
+
+    def clear(self) -> None:
+        for path in glob.glob(os.path.join(self.out_dir, f"{self.PREFIX}*.png")):
+            os.remove(path)
+
+    @staticmethod
+    def _draw_gt(ax: Any, sample: AugSample, focus: int) -> None:
+        for (x1, y1, x2, y2), label in zip(sample.boxes, sample.labels):
+            hit = int(label) == focus
+            ax.add_patch(
+                Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1,
+                    fill=False,
+                    edgecolor="red" if hit else "yellow",
+                    linewidth=2.0 if hit else 0.8,
+                )
+            )
+
+    def plot(self, label: int, samples: Sequence[AugSample], reason: str) -> Optional[str]:
+        if not samples:
+            return None
+        n = len(samples)
+        fig, axes = plt.subplots(
+            len(self.ROWS), n, figsize=(3.4 * n, 3.4 * len(self.ROWS)), squeeze=False
+        )
+        subject = (
+            f"CAT augmentation, minority class '{self.name(label)}' ({reason}); "
+            f"red = {self.name(label)}, yellow = other GT"
+        )
+        fig.suptitle(_compose_title(self.method, subject, self.config), fontsize=12)
+        for c, sample in enumerate(samples):
+            for r, (attr, _) in enumerate(self.ROWS):
+                ax = axes[r][c]
+                ax.imshow(getattr(sample, attr))
+                self._draw_gt(ax, sample, label)
+                ax.set_xticks([])
+                ax.set_yticks([])
+            axes[0][c].set_title(os.path.basename(sample.path), fontsize=8)
+        for r, (_, title) in enumerate(self.ROWS):
+            axes[r][0].set_ylabel(title, fontsize=10, fontweight="bold")
+        fig.subplots_adjust(top=0.88, hspace=0.06, wspace=0.04)
+        return _save(fig, os.path.join(self.out_dir, f"{self.PREFIX}{self.name(label)}.png"))
+
+
+def render_cat_augmentations(
+    loader: Iterable[DetectionBatch],
+    selector: MinoritySelector,
+    collector: AugSampleCollector,
+    plotter: AugmentationGridPlotter,
+) -> Dict[str, str]:
+    plotter.clear()
+    samples = collector.collect(loader, selector.select())
+    out: Dict[str, str] = {}
+    for label, items in samples.items():
+        path = plotter.plot(label, items, selector.describe(label))
+        if path:
+            out[plotter.name(label)] = path
+    return out
+
 
 def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     if len(a) == 0 or len(b) == 0:

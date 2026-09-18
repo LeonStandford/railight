@@ -1,6 +1,6 @@
 architecture: railight
 backbone: vgg16
-num_exp: exp3.da.batch16.cat
+num_exp: exp3.da.batch16.cat.caotulab_server.h100
 
 batch_size: 16
 

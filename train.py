@@ -57,6 +57,7 @@ from dainet.constants import (
 )
 from utils import visualize as viz
 from utils.dark_isp import build_dark_batch
+from utils.strong_aug import BatchTransform, ErasingSpec, StrongAugConfig, build_strong_augmentation
 from utils.metrics import detect_metrics_from_cm
 from utils.reporting import format_val_table, viz_config, viz_method
 from utils.predict import (
@@ -303,6 +304,9 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
         "pseudo_weight", "pseudo_conf", "pseudo_nms_iou", "ema_decay",
         "pseudo_cls_weight", "supervised_target_loss_weight",
         "cat_ema_alpha", "cat_loss_reg",
+        "source_strong_weight", "strong_aug_jitter_p", "strong_aug_brightness",
+        "strong_aug_contrast", "strong_aug_saturation", "strong_aug_hue",
+        "strong_aug_gray_p", "strong_aug_blur_p",
     )
     for _k in _float_keys:
         if _k in merged and isinstance(merged[_k], str):
@@ -635,6 +639,7 @@ LOSS_COMPONENT_KEYS: Tuple[str, ...] = (
     "pal1_conf",
     "pal2_loc",
     "pal2_conf",
+    "source_strong",
     "enhance",
     "enhance_l1ssim",
     "mutual",
@@ -899,6 +904,9 @@ class TrainingContext:
         # mean-teacher state: created lazily on the first pseudo-label step
         self.teacher: Optional[torch.nn.Module] = None
         self.icr: Optional[InterClassRelation] = None
+        self.strong_aug_source: Optional[BatchTransform] = None
+        self.strong_aug_target: Optional[BatchTransform] = None
+        self.cat_aug_images: Dict[str, str] = {}
         self.nan_skips: int = 0
         self.wandb = WandbLogger(
             enabled=bool(getattr(args_ns, "use_wandb", False)) and local_rank == 0,
@@ -1082,6 +1090,27 @@ def run_full_visualisation(
             )
     if gradcam is not None:
         gradcam.remove()
+    if (
+        bool(getattr(ctx.args, "cat_enabled", False))
+        and uses_strong_augmentation(ctx.args)
+        and ctx.strong_aug_source is not None
+    ):
+        try:
+            _p("CAT augmentation samples per minority class")
+            ctx.cat_aug_images = viz.render_cat_augmentations(
+                ctx.val_loader,
+                build_minority_selector(ctx),
+                viz.AugSampleCollector(
+                    build_dark_batch,
+                    ctx.strong_aug_source,
+                    next(net_inner.parameters()).device,
+                    per_class=int(getattr(ctx.args, "cat_viz_per_class", 6)),
+                    max_batches=max_eval_batches,
+                ),
+                viz.AugmentationGridPlotter(ctx.class_names, ctx.charts_dir, method, config),
+            )
+        except Exception as e:
+            print(f"⚠️ [WARN] CAT augmentation plot failed: {e}")
     try:
         _p("domain-adaptation metric curves")
         viz.plot_domain_metrics(
@@ -1150,6 +1179,7 @@ def _log_wandb_images(ctx: "TrainingContext") -> None:
             "charts/losses": os.path.join(d, "losses.png"),
             "charts/confusion_source": os.path.join(d, "confusion_matrix_source.png"),
             "charts/confusion_target": os.path.join(d, "confusion_matrix_target.png"),
+            **{f"cat_aug/{k}": v for k, v in ctx.cat_aug_images.items()},
         }
     )
 
@@ -1641,6 +1671,52 @@ def build_cls_weighter(args_ns: argparse.Namespace) -> Optional[ClassAwareWeight
     )
 
 
+def build_strong_aug_config(args_ns: argparse.Namespace, bgr: bool) -> StrongAugConfig:
+    base = StrongAugConfig()
+    erase_p = getattr(args_ns, "strong_aug_erase_p", None)
+    erasing = base.erasing if erase_p is None else tuple(
+        ErasingSpec(float(p), spec.scale, spec.ratio) for p, spec in zip(erase_p, base.erasing)
+    )
+    sigma = getattr(args_ns, "strong_aug_blur_sigma", None) or base.blur_sigma
+    return StrongAugConfig(
+        jitter_p=float(getattr(args_ns, "strong_aug_jitter_p", base.jitter_p)),
+        brightness=float(getattr(args_ns, "strong_aug_brightness", base.brightness)),
+        contrast=float(getattr(args_ns, "strong_aug_contrast", base.contrast)),
+        saturation=float(getattr(args_ns, "strong_aug_saturation", base.saturation)),
+        hue=float(getattr(args_ns, "strong_aug_hue", base.hue)),
+        gray_p=float(getattr(args_ns, "strong_aug_gray_p", base.gray_p)),
+        blur_p=float(getattr(args_ns, "strong_aug_blur_p", base.blur_p)),
+        blur_sigma=(float(sigma[0]), float(sigma[1])),
+        erasing=erasing,
+        bgr=bgr,
+    )
+
+
+def build_strong_augmentations(
+    args_ns: argparse.Namespace, target_labeled: bool
+) -> Tuple[BatchTransform, BatchTransform]:
+    source = build_strong_augmentation(build_strong_aug_config(args_ns, bgr=False))
+    target = build_strong_augmentation(build_strong_aug_config(args_ns, bgr=not target_labeled))
+    return source, target
+
+
+def uses_strong_augmentation(args_ns: argparse.Namespace) -> bool:
+    source = float(getattr(args_ns, "source_strong_weight", 0.0)) > 0
+    target = float(getattr(args_ns, "pseudo_weight", 0.0)) > 0 and bool(
+        getattr(args_ns, "pseudo_strong_aug", False)
+    )
+    return source or target
+
+
+def build_minority_selector(ctx: "TrainingContext") -> viz.MinoritySelector:
+    frequency = viz.FrequencyMinority.from_list_file(
+        ctx.args.source_train_file, int(ctx.args.nc)
+    )
+    if ctx.icr is None:
+        return frequency
+    return viz.FallbackMinority(viz.RelationMinority(ctx.icr.for_source()), frequency)
+
+
 def build_class_relation(
     args_ns: argparse.Namespace, save_folder: str
 ) -> Optional[InterClassRelation]:
@@ -1707,20 +1783,6 @@ def ema_update(
             t_bufs[name].copy_(b)
 
 
-def strong_photometric_aug(images: torch.Tensor) -> torch.Tensor:
-    b, dev = images.size(0), images.device
-
-    def _rf(lo: float, hi: float) -> torch.Tensor:
-        return torch.rand(b, 1, 1, 1, device=dev) * (hi - lo) + lo
-
-    x = images * _rf(0.6, 1.4)                         # brightness
-    mean = x.mean(dim=(1, 2, 3), keepdim=True)
-    x = (x - mean) * _rf(0.6, 1.4) + mean              # contrast
-    gray = x.mean(dim=1, keepdim=True)
-    x = (x - gray) * _rf(0.5, 1.5) + gray              # saturation
-    return x.clamp_(0.0, 1.0)
-
-
 def train_one_epoch(
     ctx: TrainingContext,
     net: torch.nn.Module,
@@ -1746,13 +1808,14 @@ def train_one_epoch(
     pseudo_start = int(getattr(ctx.args, "pseudo_start_iters", 0))
     pseudo_nms = float(getattr(ctx.args, "pseudo_nms_iou", 0.35))
     ema_decay = float(getattr(ctx.args, "ema_decay", 0.9996))
-    strong_aug = bool(getattr(ctx.args, "pseudo_strong_aug", True))
+    strong_aug = bool(getattr(ctx.args, "pseudo_strong_aug", False))
     pseudo_ramp_iters = int(getattr(ctx.args, "pseudo_ramp_iters", 1000))
     pseudo_cls_weight = float(getattr(ctx.args, "pseudo_cls_weight", 0.25))
     sup_target_on = bool(getattr(ctx.args, "is_use_supervised_target_loss", False))
     sup_target_weight = float(
         getattr(ctx.args, "supervised_target_loss_weight", 1.0)
     )
+    source_strong_weight = float(getattr(ctx.args, "source_strong_weight", 0.0))
     epoch_start = time.time()
     batch_idx = 0
     is_rank0 = ctx.local_rank == 0
@@ -1872,6 +1935,24 @@ def train_one_epoch(
         
         if prof_active:
             _lap("loss_det_pal2")
+        loss_source_strong = torch.zeros((), device=source_images.device)
+        if source_strong_weight > 0:
+            out_ss, _ = net_inner.test_forward(ctx.strong_aug_source(source_dark))
+            loss_ss_l1, loss_ss_c1 = criterion(
+                out_ss[:3], source_targets_v, class_info=src_ci
+            )
+            loss_ss_l2, loss_ss_c2, ss_pairs = criterion(
+                out_ss[3:], source_targets_v, class_info=src_ci, return_pairs=True
+            )
+            loss_source_strong = (
+                loss_ss_l1 + loss_ss_c1 + loss_ss_l2 + loss_ss_c2
+            ) * source_strong_weight
+            src_pairs = (
+                torch.cat((src_pairs[0], ss_pairs[0])),
+                torch.cat((src_pairs[1], ss_pairs[1])),
+            )
+        if prof_active:
+            _lap("loss_source_strong")
         loss_kl_src_tgt = torch.zeros((), device=source_images.device)
         R_target_train = None
         
@@ -1994,7 +2075,7 @@ def train_one_epoch(
                 if keep:
                     if strong_aug:
                         out_s, _ = net_inner.test_forward(
-                            strong_photometric_aug(target_images)
+                            ctx.strong_aug_target(target_images)
                         )
                     else:
                         out_s = out_t
@@ -2027,6 +2108,7 @@ def train_one_epoch(
             "pal1_conf": loss_c_pal1,
             "pal2_loc": loss_l_pa12,
             "pal2_conf": loss_c_pal2,
+            "source_strong": loss_source_strong,
             "enhance": loss_enhance,
             "enhance_l1ssim": loss_enhance2,
             "mutual": loss_mutual_src_srcdark,
@@ -2115,6 +2197,7 @@ def train_one_epoch(
                     "p1_l": f"{loss_l_pa1l.item():.3f}",
                     "p2_c": f"{loss_c_pal2.item():.3f}",
                     "p2_l": f"{loss_l_pa12.item():.3f}",
+                    "ss": f"{loss_source_strong.item():.3f}",
                     "enh": f"{loss_enhance.item():.3f}",
                     "enh2": f"{loss_enhance2.item():.3f}",
                     "kl_st": f"{loss_kl_src_tgt.item():.3f}",
@@ -2132,7 +2215,7 @@ def train_one_epoch(
             tloss = float(losses_sum) / (batch_idx + 1)
             cur_lr = optimizer.param_groups[0]["lr"]
             tqdm.write(
-                f"📈 [train] ep:{epoch} it:{iteration} loss(avg):{tloss:.4f} p1[c:{loss_c_pal1.item():.4f} l:{loss_l_pa1l.item():.4f}] p2[c:{loss_c_pal2.item():.4f} l:{loss_l_pa12.item():.4f}] enh:{loss_enhance.item():.4f} enh2:{loss_enhance2.item():.4f} mut_ssd:{loss_mutual_src_srcdark.item():.4f} kl_st:{loss_kl_src_tgt.item():.4f} tgt:{loss_target_unsup.item():.4f} tsup:{loss_target_sup.item():.4f} wreg:{loss_wreg.item():.4f} ent:{loss_entropy.item():.4f} lr:{cur_lr:.2e} dt:{t1 - t0:.3f}s"
+                f"📈 [train] ep:{epoch} it:{iteration} loss(avg):{tloss:.4f} p1[c:{loss_c_pal1.item():.4f} l:{loss_l_pa1l.item():.4f}] p2[c:{loss_c_pal2.item():.4f} l:{loss_l_pa12.item():.4f}] ss:{loss_source_strong.item():.4f} enh:{loss_enhance.item():.4f} enh2:{loss_enhance2.item():.4f} mut_ssd:{loss_mutual_src_srcdark.item():.4f} kl_st:{loss_kl_src_tgt.item():.4f} tgt:{loss_target_unsup.item():.4f} tsup:{loss_target_sup.item():.4f} wreg:{loss_wreg.item():.4f} ent:{loss_entropy.item():.4f} lr:{cur_lr:.2e} dt:{t1 - t0:.3f}s"
             )
             record_iter_losses(ctx.history, iteration, tloss, loss_components)
             cat_diag = class_relation_diag(icr, ctx.class_names)
@@ -2426,6 +2509,16 @@ def train(ctx: TrainingContext) -> None:
         cls_weighter=cls_weighter,
     )
     ctx.icr = build_class_relation(args_ns, ctx.save_folder)
+    ctx.strong_aug_source, ctx.strong_aug_target = build_strong_augmentations(
+        args_ns, ctx.target_labeled
+    )
+    if ctx.local_rank == 0:
+        print(
+            f"💪 [strong-aug] CAT pipeline "
+            f"(source_strong_weight={float(getattr(args_ns, 'source_strong_weight', 0.0))}, "
+            f"target_bgr={not ctx.target_labeled}, "
+            f"config={build_strong_aug_config(args_ns, bgr=False)})"
+        )
     if ctx.local_rank == 0 and ctx.icr is not None:
         print(
             f"🧮 [CAT] ICRm + CALoss enabled "

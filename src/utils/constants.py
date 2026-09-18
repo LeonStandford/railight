@@ -50,7 +50,7 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "pseudo_start_iters": 0,
     "pseudo_nms_iou": 0.35,
     "ema_decay": 0.9996,
-    "pseudo_strong_aug": True,
+    "pseudo_strong_aug": False,
     "pseudo_ramp_iters": 1000,
     "pseudo_cls_weight": 0.25,
     "is_use_rc_loss": True,

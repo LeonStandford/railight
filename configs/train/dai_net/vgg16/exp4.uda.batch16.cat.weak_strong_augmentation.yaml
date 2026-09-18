@@ -1,5 +1,5 @@
 architecture: railight
-num_exp: exp4.uda.batch16.cat.caotulab_server.h100
+num_exp: exp4.uda.batch16.cat.weak_strong_augmentation.caotulab_server.h100
 
 batch_size: 16
 
@@ -64,3 +64,16 @@ pseudo_weight: 1.0
 pseudo_conf: 0.8
 pseudo_start_iters: 20000
 ema_decay: 0.9996
+
+source_strong_weight: 1.0
+pseudo_strong_aug: true
+strong_aug_jitter_p: 0.8
+strong_aug_brightness: 0.4
+strong_aug_contrast: 0.4
+strong_aug_saturation: 0.4
+strong_aug_hue: 0.1
+strong_aug_gray_p: 0.2
+strong_aug_blur_p: 0.5
+strong_aug_blur_sigma: [0.1, 2.0]
+strong_aug_erase_p: [0.7, 0.5, 0.3]
+cat_viz_per_class: 6
