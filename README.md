@@ -6,7 +6,7 @@
   </p>
 </p>
 
-![overview](./assets/railight.jpg)
+![overview](./assets/railight_cat.png)
 
 ## 🚂 Introduction
 
@@ -75,14 +75,21 @@ Shell wrappers read `gpu_ids` from the config and set `CUDA_VISIBLE_DEVICES`; `t
 
 ```bash
 CONFIG=configs/train/railight/vgg16/exp3.da.batch8.yaml bash src/scripts/train.sh
-bash src/scripts/test.sh
+CONFIG=configs/test/railight/vgg16/exp3.da.batch8.yaml bash src/scripts/test.sh
 ```
 
 Evaluate a checkpoint:
 
 ```bash
-python test.py --config configs/test/railight/vgg16/exp3.yaml
+python test.py --config configs/test/railight/vgg16/exp3.da.batch8.yaml
 ```
+
+Test configs mirror the train config they evaluate: `source_test_files` / `target_test_files`
+take a list of RAILIGHT `.txt` lists (source is scored through the `night_synthesis` ISP when
+`align_source_view: dark`, target is scored as-is), and `is_run_confusion_matrix`,
+`is_run_samples_grid`, `is_run_tsne_reflectance`, `is_run_domain_gap` switch the chart groups on
+and off. `export_fp_fn_samples_path` writes every image holding a false positive (red) or a false
+negative (blue).
 
 🔑 Config keys worth knowing:
 
@@ -105,8 +112,10 @@ python test.py --config configs/test/railight/vgg16/exp3.yaml
 📦 Outputs:
 - `<save_folder>/<arch>/<backbone>/<num_exp>/best_model.pth`, `last_model.pth`
 - `<charts_dir>/<mode>/<arch>/<backbone>/<num_exp>/` — `losses.png`, `confusion_matrix_*.png`, `samples_day.png`, `samples_real_night.png`, `cat_aug_*.png`
-- `<records_dir>/` — per-epoch train / val JSONL
-- `metrics.json` (test) — P/R/F1/mAP for source and target
+- `<records_dir>/` — per-epoch train / val JSONL, `<num_exp>_test.csv` per evaluation
+- `metrics.json` (test) — `combined` / `source` / `target` sections (accuracy, P/R/F1, mAP,
+  mAP@50:95 with the per-IoU sweep, TP/FP/FN, per-class AP + best-F1 threshold, macro averages)
+  plus `setup`, `model` (parameter breakdown), `speed` and `domain_gap` (KL / CE / MMD / AUC)
 
 ## 🧮 New: CAT + weak/strong augmentation
 

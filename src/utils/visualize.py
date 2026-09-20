@@ -705,6 +705,64 @@ def plot_domain_tsne(
     )
     return _save(fig, os.path.join(out_dir, fname))
 
+def plot_tsne_reflectance(
+    feats_before_src: Optional[np.ndarray],
+    feats_before_tgt: Optional[np.ndarray],
+    feats_after_src: Optional[np.ndarray],
+    feats_after_tgt: Optional[np.ndarray],
+    reflectance_pairs: Sequence[Tuple[np.ndarray, np.ndarray, str]],
+    out_dir: str,
+    fname: str = "tsne_reflectance.png",
+    method: str = "RAILIGHT",
+    config: Config = None,
+    cap_per_domain: int = 1500,
+) -> Optional[str]:
+    panels = [
+        ("CNN representations before DSFD.extract_features",
+         feats_before_src, feats_before_tgt),
+        ("CNN representations after DSFD.extract_features",
+         feats_after_src, feats_after_tgt),
+    ]
+    panels = [p for p in panels if p[1] is not None and p[2] is not None
+              and len(p[1]) and len(p[2])]
+    pairs = list(reflectance_pairs)[:3]
+    if not panels and not pairs:
+        return None
+    ncols = max(len(panels), 2 * len(pairs), 1)
+    nrows = 1 + int(bool(pairs))
+    fig = plt.figure(figsize=(5.2 * ncols, 5.0 * nrows))
+    gs = fig.add_gridspec(nrows, ncols)
+    span = max(1, ncols // max(len(panels), 1))
+    for idx, (subject, src, tgt) in enumerate(panels):
+        ax = fig.add_subplot(gs[0, idx * span : (idx + 1) * span])
+        s = _subsample(
+            np.asarray(src, dtype=np.float32).reshape(len(src), -1),
+            cap_per_domain, seed=0,
+        )
+        t = _subsample(
+            np.asarray(tgt, dtype=np.float32).reshape(len(tgt), -1),
+            cap_per_domain, seed=1,
+        )
+        xy, proj = _project_2d(np.concatenate([s, t], axis=0))
+        mn = xy.min(axis=0, keepdims=True)
+        mx = xy.max(axis=0, keepdims=True)
+        xy = (xy - mn) / (mx - mn + 1e-9)
+        _domain_scatter(ax, xy, len(s), proj, subject)
+    for idx, (image, reflectance, title) in enumerate(pairs):
+        for offset, (panel, tag) in enumerate(
+            ((image, "input"), (reflectance, "reflectance"))
+        ):
+            ax = fig.add_subplot(gs[1, 2 * idx + offset])
+            ax.imshow(panel)
+            ax.set_title(f"{tag} · {title}", fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+    fig.suptitle(
+        _compose_title(method, "domain t-SNE and retinex reflectance", config),
+        fontsize=12,
+    )
+    return _save(fig, os.path.join(out_dir, fname))
+
 def plot_target_metrics(
     history: History,
     out_dir: str,

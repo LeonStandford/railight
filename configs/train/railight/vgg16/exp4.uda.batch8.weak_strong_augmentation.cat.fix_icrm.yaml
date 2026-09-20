@@ -1,5 +1,5 @@
 architecture: railight
-num_exp: exp4.uda.batch8.weak_strong_augmentation.cat.caotulab_server.h100
+num_exp: exp4.uda.batch8.weak_strong_augmentation.cat.caotulab_server.h100_fix_icrm
 
 batch_size: 8
 
@@ -82,4 +82,4 @@ cat_loss_reg: 1.0
 cat_log_loss: true
 cat_dia_loss: false
 cat_max_weight: 3.0
-cat_target_from_teacher: false
+cat_target_from_teacher: true

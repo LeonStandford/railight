@@ -26,4 +26,4 @@ conda activate railight
 set -u
 
 cd "$REPO_ROOT/src/scripts"
-bash train.sh
+bash "${SCRIPT:-train.sh}"

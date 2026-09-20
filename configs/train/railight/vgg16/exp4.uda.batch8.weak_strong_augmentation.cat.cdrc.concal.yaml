@@ -1,5 +1,5 @@
 architecture: railight
-num_exp: exp4.uda.batch8.weak_strong_augmentation.cat.caotulab_server.h100
+num_exp: exp4.uda.batch8.weak_strong_augmentation.cat.cdrc.concal.caotulab_server.h100
 
 batch_size: 8
 
@@ -82,4 +82,18 @@ cat_loss_reg: 1.0
 cat_log_loss: true
 cat_dia_loss: false
 cat_max_weight: 3.0
-cat_target_from_teacher: false
+cat_target_from_teacher: true
+
+concal_enabled: true
+concal_base: 0.5
+concal_beta: 0.8
+concal_lower: 0.3
+concal_upper: 0.9
+concal_tau: 0.6
+concal_delta_min: 0.3
+concal_update_every: 50
+
+cdrc_enabled: true
+cdrc_alpha: 4.0
+cdrc_max_objects: 4
+cdrc_max_iou: 0.9

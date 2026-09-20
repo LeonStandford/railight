@@ -60,9 +60,18 @@ from utils.dark_isp import build_dark_batch
 from utils.strong_aug import BatchTransform, ErasingSpec, StrongAugConfig, build_strong_augmentation
 from utils.metrics import detect_metrics_from_cm
 from utils.reporting import format_val_table, viz_config, viz_method
+from models.concal import (
+    ClassThresholds,
+    ConCalConfig,
+    Detections,
+    PseudoLabelCalibrator,
+    box_iou_matrix,
+)
+from models.cdrc import CrossDomainMixer, InverseFrequencySampler
 from utils.predict import (
     _decode_per_image,
     _decode_predictions,
+    decode_image_instances,
     _ensure_detect,
     _inner_net,
     build_pseudo_targets,
@@ -304,6 +313,8 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
         "pseudo_weight", "pseudo_conf", "pseudo_nms_iou", "ema_decay",
         "pseudo_cls_weight", "supervised_target_loss_weight", "pseudo_neg_thr",
         "cat_ema_alpha", "cat_loss_reg", "cat_max_weight", "grad_clip_norm",
+        "concal_base", "concal_beta", "concal_lower", "concal_upper",
+        "concal_tau", "concal_delta_min", "concal_momentum", "cdrc_alpha", "cdrc_max_iou",
         "source_strong_weight", "strong_aug_jitter_p", "strong_aug_brightness",
         "strong_aug_contrast", "strong_aug_saturation", "strong_aug_hue",
         "strong_aug_gray_p", "strong_aug_blur_p",
@@ -909,6 +920,9 @@ class TrainingContext:
         self.strong_aug_source: Optional[BatchTransform] = None
         self.strong_aug_target: Optional[BatchTransform] = None
         self.cat_aug_images: Dict[str, str] = {}
+        self.class_thresholds: Optional[ClassThresholds] = None
+        self.calibrator: Optional[PseudoLabelCalibrator] = None
+        self.mixer: Optional[CrossDomainMixer] = None
         self.nan_skips: int = 0
         self.wandb = WandbLogger(
             enabled=bool(getattr(args_ns, "use_wandb", False)) and local_rank == 0,
@@ -1747,6 +1761,78 @@ def build_cls_weighter(args_ns: argparse.Namespace) -> Optional[ClassAwareWeight
     )
 
 
+def build_class_thresholds(args_ns: argparse.Namespace) -> Optional[ClassThresholds]:
+    if not bool(getattr(args_ns, "concal_enabled", False)):
+        return None
+    return ClassThresholds(
+        int(args_ns.nc),
+        base=float(getattr(args_ns, "concal_base", 0.5)),
+        beta=float(getattr(args_ns, "concal_beta", 0.8)),
+        lower=float(getattr(args_ns, "concal_lower", 0.3)),
+        upper=float(getattr(args_ns, "concal_upper", 0.9)),
+        momentum=float(getattr(args_ns, "concal_momentum", 0.9)),
+    )
+
+
+def build_calibrator(
+    args_ns: argparse.Namespace, thresholds: Optional[ClassThresholds]
+) -> Optional[PseudoLabelCalibrator]:
+    if thresholds is None:
+        return None
+    return PseudoLabelCalibrator(
+        thresholds,
+        ConCalConfig(
+            tau=float(getattr(args_ns, "concal_tau", 0.6)),
+            delta_min=float(getattr(args_ns, "concal_delta_min", 0.3)),
+        ),
+    )
+
+
+def build_cross_domain_mixer(args_ns: argparse.Namespace) -> Optional[CrossDomainMixer]:
+    if not bool(getattr(args_ns, "cdrc_enabled", False)):
+        return None
+    return CrossDomainMixer(
+        InverseFrequencySampler(
+            int(args_ns.nc), alpha=float(getattr(args_ns, "cdrc_alpha", 4.0))
+        ),
+        max_objects=int(getattr(args_ns, "cdrc_max_objects", 4)),
+        max_iou=float(getattr(args_ns, "cdrc_max_iou", 0.9)),
+    )
+
+
+def decode_batch_instances(
+    model: torch.nn.Module,
+    out_tuple: Tuple[torch.Tensor, ...],
+    conf_thr: float,
+    nms_iou_thr: float,
+) -> List[Detections]:
+    det = _decode_predictions(model, out_tuple).detach().cpu().numpy()
+    return [decode_image_instances(det[b], conf_thr, nms_iou_thr) for b in range(det.shape[0])]
+
+
+@torch.no_grad()
+def update_class_thresholds(
+    thresholds: ClassThresholds,
+    detections: Sequence[Detections],
+    targets: Sequence[torch.Tensor],
+    iou_thr: float = 0.5,
+) -> None:
+    scores: List[float] = []
+    labels: List[int] = []
+    for (boxes, score, label), target in zip(detections, targets):
+        gt = target.detach().cpu().numpy()
+        if len(label) == 0 or gt.size == 0:
+            continue
+        ious = box_iou_matrix(boxes.astype(np.float32), gt[:, :4].astype(np.float32))
+        best = ious.argmax(axis=1)
+        ok = (ious.max(axis=1) >= iou_thr) & (gt[best, 4].astype(np.int64) == label)
+        if ok.any():
+            scores.extend(score[ok].tolist())
+            labels.extend(label[ok].tolist())
+    if labels:
+        thresholds.update(torch.tensor(scores), torch.tensor(labels))
+
+
 def build_strong_aug_config(args_ns: argparse.Namespace, bgr: bool) -> StrongAugConfig:
     base = StrongAugConfig()
     erase_p = getattr(args_ns, "strong_aug_erase_p", None)
@@ -1807,6 +1893,7 @@ def build_class_relation(
         int(args_ns.nc),
         KeepRateSchedule(alpha=alpha, warmup_iters=warmup),
         KeepRateSchedule(alpha=alpha, warmup_iters=warmup, start=target_start),
+        source_fallback=bool(getattr(args_ns, "cat_target_from_teacher", True)),
     )
     state_path = os.path.join(save_folder, CAT_STATE_FILE)
     if getattr(args_ns, "resume", None) and os.path.isfile(state_path):
@@ -1830,6 +1917,15 @@ def class_relation_diag(
 @torch.no_grad()
 def pseudo_ignore_mask(teacher_conf: torch.Tensor, neg_thr: float) -> torch.Tensor:
     return F.softmax(teacher_conf, dim=-1)[..., 1:].amax(-1) >= neg_thr
+
+
+@torch.no_grad()
+def teacher_student_pairs(
+    teacher_conf: torch.Tensor, student_conf: torch.Tensor, conf_thr: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    fg_score, fg_cls = F.softmax(teacher_conf, dim=-1)[..., 1:].max(-1)
+    sel = fg_score >= conf_thr
+    return ((fg_cls + 1)[sel], student_conf.detach().argmax(-1)[sel])
 
 
 def clone_teacher(net_inner: torch.nn.Module) -> torch.nn.Module:
@@ -1895,6 +1991,8 @@ def train_one_epoch(
     pseudo_start = int(getattr(ctx.args, "pseudo_start_iters", 0))
     pseudo_nms = float(getattr(ctx.args, "pseudo_nms_iou", 0.35))
     pseudo_neg_thr = float(getattr(ctx.args, "pseudo_neg_thr", 0.0))
+    cat_teacher_pairs = bool(getattr(ctx.args, "cat_target_from_teacher", True))
+    concal_update_every = max(1, int(getattr(ctx.args, "concal_update_every", 50)))
     ema_decay = float(getattr(ctx.args, "ema_decay", 0.9996))
     strong_aug = bool(getattr(ctx.args, "pseudo_strong_aug", False))
     pseudo_ramp_iters = int(getattr(ctx.args, "pseudo_ramp_iters", 1000))
@@ -2024,23 +2122,7 @@ def train_one_epoch(
         if prof_active:
             _lap("loss_det_pal2")
         loss_source_strong = torch.zeros((), device=source_images.device)
-        if source_strong_weight > 0:
-            out_ss, _ = net_inner.test_forward(ctx.strong_aug_source(source_dark))
-            loss_ss_l1, loss_ss_c1 = criterion(
-                out_ss[:3], source_targets_v, class_info=src_ci
-            )
-            loss_ss_l2, loss_ss_c2, ss_pairs = criterion(
-                out_ss[3:], source_targets_v, class_info=src_ci, return_pairs=True
-            )
-            loss_source_strong = (
-                loss_ss_l1 + loss_ss_c1 + loss_ss_l2 + loss_ss_c2
-            ) * source_strong_weight
-            src_pairs = (
-                torch.cat((src_pairs[0], ss_pairs[0])),
-                torch.cat((src_pairs[1], ss_pairs[1])),
-            )
-        if prof_active:
-            _lap("loss_source_strong")
+        pseudo_targets: Optional[List[torch.Tensor]] = None
         loss_kl_src_tgt = torch.zeros((), device=source_images.device)
         R_target_train = None
         
@@ -2155,15 +2237,37 @@ def train_one_epoch(
                 ctx.teacher.eval()
                 with torch.no_grad():
                     out_teacher, _ = ctx.teacher.test_forward(target_images)
-                    pl_t = build_pseudo_targets(
-                        ctx.teacher, out_teacher, pseudo_conf, pseudo_nms,
-                        source_images.device,
+                    if ctx.calibrator is not None:
+                        floor = ctx.calibrator.config.delta_min
+                        if ctx.class_thresholds is not None and not iteration % concal_update_every:
+                            out_src, _ = ctx.teacher.test_forward(source_dark)
+                            update_class_thresholds(
+                                ctx.class_thresholds,
+                                decode_batch_instances(ctx.teacher, out_src, floor, pseudo_nms),
+                                source_targets_v,
+                            )
+                        pl_t = ctx.calibrator.as_targets(
+                            decode_batch_instances(ctx.teacher, out_teacher, floor, pseudo_nms),
+                            decode_batch_instances(net_inner, out_t, floor, pseudo_nms),
+                            source_images.device,
+                        )
+                    else:
+                        pl_t = build_pseudo_targets(
+                            ctx.teacher, out_teacher, pseudo_conf, pseudo_nms,
+                            source_images.device,
+                        )
+                pseudo_targets = pl_t
+                student_images = target_images
+                if ctx.mixer is not None:
+                    ctx.mixer.sampler.observe(list(source_targets_v) + list(pl_t))
+                    student_images, pl_t = ctx.mixer.mix(
+                        target_images, pl_t, source_dark, source_targets_v
                     )
                 keep = [i for i, t in enumerate(pl_t) if t.shape[0] > 0]
                 if keep:
                     if strong_aug:
                         out_s, _ = net_inner.test_forward(
-                            ctx.strong_aug_target(target_images)
+                            ctx.strong_aug_target(student_images)
                         )
                     else:
                         out_s = out_t
@@ -2186,7 +2290,15 @@ def train_one_epoch(
                         ignore=pl_ignore,
                     )
                     if tgt_pairs is None:
-                        tgt_pairs = pl_pairs
+                        tgt_pairs = (
+                            teacher_student_pairs(
+                                out_teacher[4].index_select(0, kt),
+                                out_s[4].index_select(0, kt),
+                                pseudo_neg_thr,
+                            )
+                            if cat_teacher_pairs
+                            else pl_pairs
+                        )
                     # ease pseudo loss in over pseudo_ramp_iters after burn-in
                     pseudo_ramp = (
                         1.0 if pseudo_ramp_iters <= 0
@@ -2199,7 +2311,30 @@ def train_one_epoch(
 
         if prof_active:
             _lap("loss_entropy")
-            
+
+        if source_strong_weight > 0:
+            strong_source, strong_targets = source_dark, source_targets_v
+            if ctx.mixer is not None and pseudo_targets is not None:
+                strong_source, strong_targets = ctx.mixer.mix(
+                    source_dark, source_targets_v, target_images, pseudo_targets
+                )
+            out_ss, _ = net_inner.test_forward(ctx.strong_aug_source(strong_source))
+            loss_ss_l1, loss_ss_c1 = criterion(
+                out_ss[:3], strong_targets, class_info=src_ci
+            )
+            loss_ss_l2, loss_ss_c2, ss_pairs = criterion(
+                out_ss[3:], strong_targets, class_info=src_ci, return_pairs=True
+            )
+            loss_source_strong = (
+                loss_ss_l1 + loss_ss_c1 + loss_ss_l2 + loss_ss_c2
+            ) * source_strong_weight
+            src_pairs = (
+                torch.cat((src_pairs[0], ss_pairs[0])),
+                torch.cat((src_pairs[1], ss_pairs[1])),
+            )
+        if prof_active:
+            _lap("loss_source_strong")
+
         loss_components: Dict[str, torch.Tensor] = {
             "pal1_loc": loss_l_pa1l,
             "pal1_conf": loss_c_pal1,
@@ -2615,6 +2750,14 @@ def train(ctx: TrainingContext) -> None:
     )
     ctx.icr = build_class_relation(args_ns, ctx.save_folder)
     ctx.strong_aug_source, ctx.strong_aug_target = build_strong_augmentations(args_ns)
+    ctx.class_thresholds = build_class_thresholds(args_ns)
+    ctx.calibrator = build_calibrator(args_ns, ctx.class_thresholds)
+    ctx.mixer = build_cross_domain_mixer(args_ns)
+    if ctx.local_rank == 0 and (ctx.calibrator is not None or ctx.mixer is not None):
+        print(
+            f"🧪 [DeT] ConCal={'on' if ctx.calibrator is not None else 'off'} "
+            f"CDRC={'on' if ctx.mixer is not None else 'off'}"
+        )
     if ctx.local_rank == 0:
         print(
             f"💪 [strong-aug] CAT pipeline "
@@ -2626,6 +2769,7 @@ def train(ctx: TrainingContext) -> None:
             f"🧮 [CAT] ICRm + CALoss enabled "
             f"(alpha={ctx.icr.schedule.alpha}, warmup={ctx.icr.schedule.warmup_iters}, "
             f"target_start={ctx.icr.target_schedule.start}, "
+            f"target_from_teacher={ctx.icr.source_fallback}, "
             f"reg={cls_weighter.reg}, log_loss={cls_weighter.log_loss}, "
             f"dia_loss={cls_weighter.dia_loss}, max_weight={cls_weighter.max_weight})"
         )

@@ -100,10 +100,12 @@ class InterClassRelation:
         num_fg: int,
         schedule: KeepRateSchedule,
         target_schedule: Optional[KeepRateSchedule] = None,
+        source_fallback: bool = True,
     ) -> None:
         self.num_fg = int(num_fg)
         self.schedule = schedule
         self.target_schedule = target_schedule if target_schedule is not None else schedule
+        self.source_fallback = bool(source_fallback)
         self.source = torch.zeros(self.num_fg, self.num_fg)
         self.target = torch.zeros(self.num_fg, self.num_fg)
 
@@ -111,9 +113,16 @@ class InterClassRelation:
         return self.source if self.schedule.is_warm(iteration) else None
 
     def for_target(self, iteration: int) -> Optional[torch.Tensor]:
-        if self.target_schedule.is_warm(iteration):
+        if not self.target_schedule.is_warm(iteration):
+            return self.for_source(iteration)
+        if not self.source_fallback:
             return self.target
-        return self.for_source(iteration)
+        empty = self.target.sum(1) == 0
+        if not bool(empty.any()):
+            return self.target
+        merged = self.target.clone()
+        merged[empty] = self.source[empty]
+        return merged
 
     @staticmethod
     def empty_pairs(device: torch.device) -> LabelPairs:

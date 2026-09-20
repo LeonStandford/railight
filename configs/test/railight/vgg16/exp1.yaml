@@ -1,4 +1,5 @@
 architecture: railight
+backbone: vgg16
 num_exp: exp1
 
 weights: weights/railight/vgg16/exp1/best_model.pth
@@ -7,25 +8,34 @@ cuda: true
 gpu_ids: 0
 batch_size: 4
 
-source_test_file: ./dataset/source_test.txt
-target_test_file: ./dataset/target_test.txt
+source_test_files:
+  # - ./dataset/source_train.txt
+  # - ./dataset/source_val.txt
+  - ./dataset/source_test.txt
+
+target_test_files:
+  # - ./dataset/target_train.txt
+  # - ./dataset/target_val.txt
+  - ./dataset/target_test.txt
 
 export_predicted_source_path: null
-export_predicted_target_path: /home/caotulab/wd_nhan/data/images/3/predicted
+export_predicted_target_path: null
+export_fp_fn_samples_path: null
 
 nc: 3
 names: ['crack', 'missing_items', 'broken_sleeper']
 
-source_folder: /home/longpm/works/projects/railway-domain-adaption/data/8/source/Test
-target_folder4unsupervised: /home/longpm/works/projects/railway-domain-adaption/data/8/target/test
-
-charts_dir: ./charts_v2
-records_dir: ./records_v2
-mode_name: test
+charts_dir:  ./charts
+records_dir: ./records
+log_dir:     ./logs
 
 viz_num_samples: 6
 
-# Detection thresholds
-iou_thr: 0.5          
-score_thr_cm: 0.5     
-nms_iou_thr: 0.35     
+is_run_confusion_matrix: true
+is_run_samples_grid: true
+is_run_tsne_reflectance: true
+is_run_domain_gap: true
+
+iou_thr: 0.5
+score_thr_cm: 0.5
+nms_iou_thr: 0.35

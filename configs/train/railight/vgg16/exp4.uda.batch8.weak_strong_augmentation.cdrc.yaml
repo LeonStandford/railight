@@ -1,5 +1,5 @@
 architecture: railight
-num_exp: exp4.uda.batch8.weak_strong_augmentation.cat.caotulab_server.h100
+num_exp: exp4.uda.batch8.weak_strong_augmentation.cdrc.caotulab_server.h100
 
 batch_size: 8
 
@@ -75,11 +75,7 @@ strong_aug_blur_sigma: [0.1, 2.0]
 strong_aug_erase_p: [0.7, 0.5, 0.3]
 cat_viz_per_class: 6
 
-cat_enabled: true
-cat_ema_alpha: 0.99
-cat_warmup_iters: 2000
-cat_loss_reg: 1.0
-cat_log_loss: true
-cat_dia_loss: false
-cat_max_weight: 3.0
-cat_target_from_teacher: false
+cdrc_enabled: true
+cdrc_alpha: 4.0
+cdrc_max_objects: 4
+cdrc_max_iou: 0.9

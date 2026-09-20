@@ -3,7 +3,7 @@ set -e
 
 cd "$(dirname "$0")/../.."
 
-CONFIG=configs/test/railight/yolo26n/exp2.yaml
+CONFIG="${CONFIG:-configs/test/railight/vgg16/exp3.da.batch8.weak_strong_augmentation.cat.yaml}"
 
 if [ ! -f "$CONFIG" ]; then
     echo "ERROR: CONFIG=$CONFIG does not exist." >&2; exit 1
