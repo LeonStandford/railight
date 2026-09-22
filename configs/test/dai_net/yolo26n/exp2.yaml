@@ -17,11 +17,9 @@ export_predicted_target_path: null
 nc: 8
 names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
 
-source_folder: null
-target_folder4unsupervised: null
-
 charts_dir: ./charts
 records_dir: ./records
+log_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/logs
 mode_name: test
 
 viz_num_samples: 6

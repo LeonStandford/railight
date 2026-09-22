@@ -3,7 +3,7 @@ set -e
 
 cd "$(dirname "$0")/../.."
 
-CONFIG=configs/test/dai_net/yolo26n/exp2.yaml
+CONFIG=configs/test/dai_net/vgg16/exp4.yaml
 
 if [ ! -f "$CONFIG" ]; then
     echo "ERROR: CONFIG=$CONFIG does not exist." >&2; exit 1

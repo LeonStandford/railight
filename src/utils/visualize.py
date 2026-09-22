@@ -864,6 +864,65 @@ def plot_sample_predictions(
     fig.subplots_adjust(top=0.9)
     return _save(fig, os.path.join(out_dir, fname))
 
+def plot_tsne_reflectance(
+    pixels_src: Optional[np.ndarray],
+    pixels_tgt: Optional[np.ndarray],
+    embeds_src: Optional[np.ndarray],
+    embeds_tgt: Optional[np.ndarray],
+    pairs: Sequence[Tuple[np.ndarray, np.ndarray, str]],
+    out_dir: str,
+    method: str = "DAI-Net",
+    config: Config = None,
+    fname: str = "tsne_reflectance.png",
+    cap_per_domain: int = 1500,
+) -> Optional[str]:
+    """Domain t-SNE before / after the backbone (top row, needs both domains)
+    and input / reflectance pairs (one row per pair)."""
+    panels: List[Tuple[np.ndarray, int, str, str]] = []
+    for src, tgt, title in (
+        (pixels_src, pixels_tgt, "Before backbone (pooled pixels)"),
+        (embeds_src, embeds_tgt, "After backbone (embeddings)"),
+    ):
+        if src is None or tgt is None or len(src) == 0 or len(tgt) == 0:
+            continue
+        s = np.asarray(src, dtype=np.float32).reshape(len(src), -1)
+        t = np.asarray(tgt, dtype=np.float32).reshape(len(tgt), -1)
+        s = _subsample(s, cap_per_domain, seed=0)
+        t = _subsample(t, cap_per_domain, seed=1)
+        xy, proj = _project_2d(np.concatenate([s, t], axis=0))
+        mn = xy.min(axis=0, keepdims=True)
+        mx = xy.max(axis=0, keepdims=True)
+        panels.append(((xy - mn) / (mx - mn + 1e-9), len(s), proj, title))
+    n_rows = (1 if panels else 0) + len(pairs)
+    if n_rows == 0:
+        return None
+    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 5.2 * n_rows), squeeze=False)
+    fig.suptitle(
+        _compose_title(method, "domain t-SNE / reflectance", config), fontsize=12
+    )
+    row = 0
+    if panels:
+        for col in range(2):
+            if col < len(panels):
+                xy, n_src, proj, title = panels[col]
+                _domain_scatter(axes[0][col], xy, n_src, proj, title)
+            else:
+                axes[0][col].axis("off")
+        row = 1
+    for image, reflectance, title in pairs:
+        for col, (img, label) in enumerate(
+            ((image, f"input | {title}"), (reflectance, f"reflectance | {title}"))
+        ):
+            ax = axes[row][col]
+            ax.imshow(img)
+            ax.set_title(label, fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.grid(False)
+        row += 1
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return _save(fig, os.path.join(out_dir, fname))
+
 def make_gradcam(net_inner: Any, target_layer: Any = None) -> Optional["GradCAM"]:
     import torch.nn as nn
 

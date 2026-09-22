@@ -88,8 +88,6 @@ TEST_DEFAULTS: Dict[str, Any] = {
     "target_test_file": "./dataset/target_test.txt",
     "nc": 3,
     "names": None,
-    "source_folder": "",
-    "target_folder4unsupervised": "/media/caotulab/303A225B3A221DFA/Nhan/data/images/target",
     "charts_dir": "./charts",
     "records_dir": "./records",
     "mode_name": "test",

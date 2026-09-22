@@ -16,11 +16,9 @@ export_predicted_target_path: null
 nc: 3
 names: ['crack', 'missing_items', 'broken_sleeper']
 
-source_folder: /home/longpm/works/projects/railway-domain-adaption/data/8/source/Test
-target_folder4unsupervised: /home/longpm/works/projects/railway-domain-adaption/data/8/target/test
-
 charts_dir: ./charts
 records_dir: ./records
+log_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/logs
 mode_name: test
 
 viz_num_samples: 6

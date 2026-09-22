@@ -194,11 +194,12 @@ def _decode_per_image(
     targets: Sequence[torch.Tensor],
     net: torch.nn.Module,
     conf_thr: float = 0.05,
+    nms_iou_thr: float = 0.35,
 ) -> List[Dict[str, np.ndarray]]:
     det = _decode_predictions(net, out_tuple).cpu().numpy()
     out: List[Dict[str, np.ndarray]] = []
     for b in range(det.shape[0]):
-        pb, ps, pl = decode_image_instances(det[b], conf_thr, 0.35)
+        pb, ps, pl = decode_image_instances(det[b], conf_thr, nms_iou_thr)
         gt = (
             targets[b].cpu().numpy()
             if hasattr(targets[b], "cpu")

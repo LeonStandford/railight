@@ -1,14 +1,14 @@
 architecture: dai_net
 num_exp: exp4
 
-weights: weights/dai_net/vgg16/exp4/best_model.pth
+weights: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/weights/railight/vgg16/exp4.uda.batch2.caotulab_server/best_model.pth
 
 cuda: true
-gpu_ids: 3,5,7
-batch_size: 4
+gpu_ids: 0
+batch_size: 16
 
-source_test_file: ./dataset/source_test.txt
-target_test_file: ./dataset/target_test.txt
+source_test_file:  /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/source_test.txt
+target_test_file: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/8/dataset/target_test.txt
 
 export_predicted_source_path: null
 export_predicted_target_path: null
@@ -16,11 +16,9 @@ export_predicted_target_path: null
 nc: 8
 names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
 
-source_folder: /home/longpm/works/projects/railway-domain-adaption/data/8/source/Test
-target_folder4unsupervised: /home/longpm/works/projects/railway-domain-adaption/data/8/target/test
-
-charts_dir: ./charts
-records_dir: ./records
+charts_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/charts
+records_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/records
+log_dir: /media/caotulab/303A225B3A221DFA1/Nhan/data/railway/logs
 mode_name: test
 
 viz_num_samples: 6
