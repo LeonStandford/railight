@@ -12,6 +12,7 @@
 
 set -euo pipefail
 
+SCRIPT="${SCRIPT:-train.sh}"
 REPO_ROOT=/home/a00161/stacy.en14/Long/railway.caotulab
 set +u
 source /etc/profile.d/modules.sh
@@ -26,4 +27,4 @@ conda activate railight
 set -u
 
 cd "$REPO_ROOT/src/scripts"
-bash "${SCRIPT:-train.sh}"
+bash "$SCRIPT"

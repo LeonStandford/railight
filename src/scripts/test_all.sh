@@ -7,6 +7,8 @@ CONFIGS=(
     exp3.da.batch8
     exp3.da.batch8.weak_strong_augmentation
     exp3.da.batch8.weak_strong_augmentation.cat
+    exp4_dark_isp_before
+    exp4_uda_image_processing
     exp4.uda.batch8
     exp4.uda.batch8.weak_strong_augmentation
     exp4.uda.batch8.weak_strong_augmentation.cat.fix_icrm

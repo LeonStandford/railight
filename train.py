@@ -55,10 +55,10 @@ from railight.constants import (
     DEFAULT_ARCH_FROM_MODEL,
     MODEL_FROM_ARCH_BACKBONE,
 )
+from utils import detection_eval as deval
 from utils import visualize as viz
 from utils.dark_isp import build_dark_batch
 from utils.strong_aug import BatchTransform, ErasingSpec, StrongAugConfig, build_strong_augmentation
-from utils.metrics import detect_metrics_from_cm
 from utils.reporting import format_val_table, viz_config, viz_method
 from models.concal import (
     ClassThresholds,
@@ -79,7 +79,8 @@ from utils.predict import (
     infer_detections,
     infer_detections_batch,
 )
-from utils.constants import _TRAIN_DEFAULTS, _WANDB_EPOCH_KEYS
+from utils.balanced_cache import ensure_balanced_cache
+from utils.constants import EVAL_DEFAULTS, _TRAIN_DEFAULTS, _WANDB_EPOCH_KEYS
 from utils.nms import multiclass_nms
 from utils.tee import Tee
 from utils.wandb_logger import WandbLogger, load_env_file
@@ -157,6 +158,43 @@ def _records_paths(
         str(parent / f"{num_exp}_train.jsonl"),
         str(parent / f"{num_exp}_val.jsonl"),
     )
+
+def class_map50_rows(
+    title: str, per_class: Dict[str, Dict[str, float]]
+) -> List[Tuple[str, str]]:
+    total_gt = max(sum(int(s["n_gt"]) for s in per_class.values()), 1)
+    rows: List[Tuple[str, str]] = [("§", title)]
+    pooled = 0.0
+    for name, stats in per_class.items():
+        weight = stats["n_gt"] / total_gt
+        pooled += stats["ap50"] * weight
+        rows.append(
+            (
+                name,
+                f"map50={stats['ap50'] * 100:.2f} n_gt={int(stats['n_gt'])} "
+                f"({weight * 100:.1f}%) p={stats['precision']:.3f} "
+                f"r={stats['recall']:.3f} f1={stats['f1']:.3f} "
+                f"tp/fp/fn={stats['tp']}/{stats['fp']}/{stats['fn']}",
+            )
+        )
+    rows.append(("n_gt total", f"{total_gt}"))
+    rows.append(("mean of classes", f"{sum(s['ap50'] for s in per_class.values()) / max(len(per_class), 1) * 100:.2f}"))
+    rows.append(("pooled over all gt", f"{pooled * 100:.2f}"))
+    return rows
+
+
+def class_map50_record(
+    prefix: str, per_class: Dict[str, Dict[str, float]]
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {}
+    for name, stats in per_class.items():
+        row[f"{prefix}_{name}_map50"] = round(float(stats["ap50"]) * 100.0, 4)
+        row[f"{prefix}_{name}_n_gt"] = int(stats["n_gt"])
+        row[f"{prefix}_{name}_precision"] = round(float(stats["precision"]), 6)
+        row[f"{prefix}_{name}_recall"] = round(float(stats["recall"]), 6)
+        row[f"{prefix}_{name}_f1"] = round(float(stats["f1"]), 6)
+    return row
+
 
 def _append_record_row(path: str, row: Dict[str, Any]) -> None:
     with open(path, "a") as f:
@@ -304,6 +342,13 @@ def load_yaml_config(config_path: str, *, mode: str = "train") -> argparse.Names
         verbose=merged["local_rank"] == 0 and mode == "train",
     )
 
+    for _k in ("early_stop_patience",):
+        if _k in merged and isinstance(merged[_k], str):
+            try:
+                merged[_k] = int(merged[_k])
+            except ValueError:
+                pass
+
     _float_keys = (
         "lr", "momentum", "weight_decay", "gamma",
         "kl_loss_weight", "target_loss_weight", "wreg_loss_weight",
@@ -341,7 +386,9 @@ def parse_args() -> argparse.Namespace:
 def setup_logging(
     architecture: str, backbone: str, num_exp: str, args_ns: argparse.Namespace
 ) -> Optional[str]:
-    log_dir = os.path.join("logs", architecture, backbone)
+    log_dir = os.path.join(
+        str(getattr(args_ns, "log_dir", "") or "logs"), architecture, backbone
+    )
     os.makedirs(log_dir, exist_ok=True)
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(log_dir, f"{ts}_{num_exp}.log")
@@ -401,6 +448,24 @@ def _paths_from_railight_txt(*txt_files: Optional[str]) -> List[str]:
     return out
 
 
+def _balanced_list(args_ns: argparse.Namespace, list_file: str) -> str:
+    if not bool(getattr(args_ns, "balanced_paste_enabled", False)):
+        return list_file
+    if not list_file or not os.path.isfile(list_file):
+        return list_file
+    return ensure_balanced_cache(
+        list_file,
+        str(getattr(args_ns, "balanced_paste_cache",
+                    "/home/a00161/stacy.en14/models/railight/.cache")),
+        int(args_ns.nc),
+        target_ratio=float(getattr(args_ns, "balanced_paste_target_ratio", 0.4)),
+        max_paste=int(getattr(args_ns, "balanced_paste_max_paste", 6)),
+        seed=int(getattr(args_ns, "balanced_paste_seed", 0)),
+        bank_capacity=int(getattr(args_ns, "balanced_paste_bank_capacity", 2000)),
+        verbose=int(getattr(args_ns, "local_rank", 0)) == 0,
+    )
+
+
 def build_data_loaders(
     args_ns: argparse.Namespace,
 ) -> Tuple[
@@ -413,7 +478,8 @@ def build_data_loaders(
     Optional[data.DataLoader],
     Optional[data.DataLoader],
 ]:
-    train_ds = SourceDomainDetection(args_ns.source_train_file, mode="train")
+    source_train_file = _balanced_list(args_ns, args_ns.source_train_file)
+    train_ds = SourceDomainDetection(source_train_file, mode="train")
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_ds, shuffle=True
     )
@@ -448,7 +514,9 @@ def build_data_loaders(
             )
         # train split only — the unlabeled path also pools target val/test,
         # which would leak the evaluation labels into training here.
-        target_ds = SourceDomainDetection(target_train_file, mode="train")
+        target_ds = SourceDomainDetection(
+            _balanced_list(args_ns, target_train_file), mode="train"
+        )
     else:
         target_paths = _paths_from_railight_txt(
             getattr(args_ns, "target_train_file", None),
@@ -642,6 +710,16 @@ def build_optimizer(
         )
         print(f"🛠️ [optim] MuonSGD (muon={r:.2f}, sgd={1 - r:.2f}, momentum={max(mom, 0.95)})")
         return opt
+    if name in ("adam", "adamw"):
+        betas = (float(getattr(args_ns, "adam_beta1", 0.9)),
+                 float(getattr(args_ns, "adam_beta2", 0.999)))
+        cls = optim.AdamW if name == "adamw" else optim.Adam
+        opt = cls(
+            build_param_groups(dsfd_net, lr), lr=lr, betas=betas, weight_decay=wd
+        )
+        print(f"🛠️ [optim] {cls.__name__} (lr={lr:.3e}, betas={betas}, wd={wd})")
+        return opt
+    print(f"🛠️ [optim] SGD (lr={lr:.3e}, momentum={mom}, wd={wd})")
     return optim.SGD(
         build_param_groups(dsfd_net, lr), lr=lr, momentum=mom, weight_decay=wd
     )
@@ -913,6 +991,20 @@ class TrainingContext:
         self.min_loss = float("inf")
         self.best_score = -1.0
         self.best_map = -1.0
+        if getattr(args_ns, "resume", None):
+            self.best_score = self._restored_best_score(
+                str(getattr(args_ns, "best_metric", "target_f1"))
+            )
+            target_maps = [y for _x, y in self.history.get("target_map", [])]
+            self.best_map = max(target_maps) if target_maps else -1.0
+            losses = [y for _x, y in self.history.get("val_loss", [])]
+            self.min_loss = min(losses) if losses else float("inf")
+            if local_rank == 0:
+                print(
+                    f"🔄 [resume] best_score restored to {self.best_score:.4f} "
+                    f"(metric {getattr(args_ns, 'best_metric', 'target_f1')}); "
+                    f"best_model.pth is only overwritten above this"
+                )
         self.wreg_ref: Dict[str, torch.Tensor] = {}
         # mean-teacher state: created lazily on the first pseudo-label step
         self.teacher: Optional[torch.nn.Module] = None
@@ -924,16 +1016,30 @@ class TrainingContext:
         self.calibrator: Optional[PseudoLabelCalibrator] = None
         self.mixer: Optional[CrossDomainMixer] = None
         self.nan_skips: int = 0
+        self.stale_validations: int = 0
+        self.stop_early: bool = False
+
         self.wandb = WandbLogger(
             enabled=bool(getattr(args_ns, "use_wandb", False)) and local_rank == 0,
             project=str(getattr(args_ns, "wandb_project", "railight-railway")),
             run_name=f"{self.architecture}/{self.backbone}/{args_ns.num_exp}",
             config=vars(args_ns),
             entity=getattr(args_ns, "wandb_entity", None),
+            run_dir=str(getattr(args_ns, "wandb_dir", "") or "") or None,
         )
         self.wandb.log_config_file(
             str(getattr(args_ns, "config", "")), f"config-{args_ns.num_exp}"
         )
+
+    def _restored_best_score(self, metric: str) -> float:
+        has_target = bool(self.history.get("target_map"))
+        key = (
+            ("target_map" if metric == "target_map" else "target_f1")
+            if has_target
+            else "val_f1"
+        )
+        values = [y for _x, y in self.history.get(key, [])]
+        return max(values) if values else -1.0
 
     def next_target_batch(
         self,
@@ -1228,58 +1334,6 @@ def checkpoint_score(
     return target_map if metric == "target_map" else target_f1
 
 
-def _decode_per_image(
-    out_tuple: Tuple[torch.Tensor, ...],
-    targets: Sequence[torch.Tensor],
-    net: torch.nn.Module,
-    conf_thr: float = 0.05,
-) -> List[Dict[str, np.ndarray]]:
-    det = _decode_predictions(net, out_tuple).cpu().numpy()
-    out: List[Dict[str, np.ndarray]] = []
-    for b in range(det.shape[0]):
-        boxes: List[List[float]] = []
-        scores: List[float] = []
-        labels: List[int] = []
-        for cls_id in range(1, det.shape[1]):
-            for k in range(det.shape[2]):
-                s = float(det[b, cls_id, k, 0])
-                if s < conf_thr:
-                    break
-                boxes.append(det[b, cls_id, k, 1:].tolist())
-                scores.append(s)
-                labels.append(cls_id)
-        pb, ps, pl = multiclass_nms(
-            np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
-            np.asarray(scores, dtype=np.float32).reshape(-1),
-            np.asarray(labels, dtype=np.int32).reshape(-1),
-            iou_thr=0.35,
-        )
-        gt = (
-            targets[b].cpu().numpy()
-            if hasattr(targets[b], "cpu")
-            else np.asarray(targets[b])
-        )
-        if gt.size:
-            gt_boxes = gt[:, :4].astype(np.float32)
-            gt_labels = (
-                gt[:, 4].astype(np.int32)
-                if gt.shape[1] > 4
-                else np.zeros(len(gt), dtype=np.int32)
-            )
-        else:
-            gt_boxes = np.zeros((0, 4), dtype=np.float32)
-            gt_labels = np.zeros((0,), dtype=np.int32)
-        out.append(
-            {
-                "pred_boxes": pb,
-                "pred_scores": ps,
-                "pred_labels": pl,
-                "gt_boxes": gt_boxes,
-                "gt_labels": gt_labels,
-            }
-        )
-    return out
-
 def evaluate_target_map(
     ctx: TrainingContext, model: torch.nn.Module
 ) -> Tuple[float, Dict[str, Any]]:
@@ -1288,12 +1342,22 @@ def evaluate_target_map(
     with torch.no_grad():
         for images, targets, _ in ctx.target_val_loader:
             out, _ = model.test_forward(images.cuda() / 255.0)
-            per_image.extend(_decode_per_image(out, targets, model))
-    scores, matched, n_gt, cm = viz.evaluate_detections(
-        per_image, iou_thr=0.5, score_thr_cm=0.5, num_classes=ctx.args.nc
+            per_image.extend(
+                _decode_per_image(
+                    out,
+                    targets,
+                    model,
+                    EVAL_DEFAULTS["decode_conf_thr"],
+                    EVAL_DEFAULTS["nms_iou_thr"],
+                )
+            )
+    snapshot = deval.split_snapshot(
+        per_image,
+        ctx.class_names,
+        EVAL_DEFAULTS["iou_thr"],
+        EVAL_DEFAULTS["score_thr_cm"],
     )
-    _, _, _, target_map = viz._pr_from_scores(np.asarray(scores), np.asarray(matched), n_gt)
-    return float(target_map), detect_metrics_from_cm(cm)
+    return (float(snapshot["mAP"]), snapshot)
 
 
 def validate(
@@ -1371,7 +1435,15 @@ def validate(
             step += 1
             
             if is_rank0:
-                per_image.extend(_decode_per_image(out, targets, net))
+                per_image.extend(
+                    _decode_per_image(
+                        out,
+                        targets,
+                        net,
+                        EVAL_DEFAULTS["decode_conf_thr"],
+                        EVAL_DEFAULTS["nms_iou_thr"],
+                    )
+                )
                 
             if vprof_on:
                 _vlap("val_decode")
@@ -1462,11 +1534,15 @@ def validate(
         if _vcuda:
             torch.cuda.synchronize()
         _vmark[0] = time.perf_counter()
-    scores, matched, n_gt, cm = viz.evaluate_detections(
-        per_image, iou_thr=0.5, score_thr_cm=0.5, num_classes=ctx.args.nc
+    val_snapshot = deval.split_snapshot(
+        per_image,
+        ctx.class_names,
+        EVAL_DEFAULTS["iou_thr"],
+        EVAL_DEFAULTS["score_thr_cm"],
     )
-    m = detect_metrics_from_cm(cm)
-    _, _, _, mAP = viz._pr_from_scores(np.asarray(scores), np.asarray(matched), n_gt)
+    m = val_snapshot
+    mAP = float(val_snapshot["mAP"])
+    val_per_class = val_snapshot["per_class"]
 
     tr_per_image: List[Dict[str, np.ndarray]] = []
     max_train_eval = 20
@@ -1477,20 +1553,28 @@ def validate(
             timg = timg.cuda() / 255.0
             tdark = build_dark_batch(timg)
             tout, _ = test_forward(tdark)
-            tr_per_image.extend(_decode_per_image(tout, ttgt, net))
+            tr_per_image.extend(
+                _decode_per_image(
+                    tout,
+                    ttgt,
+                    net,
+                    EVAL_DEFAULTS["decode_conf_thr"],
+                    EVAL_DEFAULTS["nms_iou_thr"],
+                )
+            )
             
     if tr_per_image:
-        ts, tm_, tng, tcm = viz.evaluate_detections(
-            tr_per_image, iou_thr=0.5, score_thr_cm=0.5,
-            num_classes=ctx.args.nc,
-        )
-        tmet = detect_metrics_from_cm(tcm)
-        _, _, _, tmap = viz._pr_from_scores(
-            np.asarray(ts), np.asarray(tm_), tng
-        )
+        tsnapshot = deval.split_snapshot(
+        tr_per_image,
+        ctx.class_names,
+        EVAL_DEFAULTS["iou_thr"],
+        EVAL_DEFAULTS["score_thr_cm"],
+    )
+        tmet = tsnapshot
+        tmap = float(tsnapshot["mAP"])
         
     else:
-        tmet = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        tmet = {"precision": 0.0, "recall": 0.0, "f1": 0.0, "accuracy": 0.0}
         tmap = 0.0
         
     ctx.history["train_precision"].append((epoch, float(tmet["precision"])))
@@ -1517,7 +1601,15 @@ def validate(
                 tgt_val_conf += float(t_conf.detach().item())
                 tgt_val_loss += float((t_loc + t_conf).detach().item())
                 tgt_val_steps += 1
-                target_per_image.extend(_decode_per_image(tvout, ttgt, net))
+                target_per_image.extend(
+                    _decode_per_image(
+                        tvout,
+                        ttgt,
+                        net,
+                        EVAL_DEFAULTS["decode_conf_thr"],
+                        EVAL_DEFAULTS["nms_iou_thr"],
+                    )
+                )
     
     if tgt_val_steps > 0:
         tgt_val_loss /= tgt_val_steps
@@ -1529,16 +1621,22 @@ def validate(
             target_per_image, iou_thr=0.5, score_thr_cm=0.5,
             num_classes=ctx.args.nc,
         )
-        tgt_met = detect_metrics_from_cm(tgcm)
-        _, _, _, tgt_map = viz._pr_from_scores(
-            np.asarray(tgs), np.asarray(tgm), tgng
-        )
+        tgt_snapshot = deval.split_snapshot(
+        target_per_image,
+        ctx.class_names,
+        EVAL_DEFAULTS["iou_thr"],
+        EVAL_DEFAULTS["score_thr_cm"],
+    )
+        tgt_met = tgt_snapshot
+        tgt_map = float(tgt_snapshot["mAP"])
+        tgt_per_class = tgt_snapshot["per_class"]
         ctx._target_eval_cache = {
             "per_image": target_per_image,
             "scores": tgs, "matched": tgm, "n_gt": tgng, "cm": tgcm,
         }
         
     else:
+        tgt_per_class = {}
         ctx._target_eval_cache = None
     ctx.history.setdefault("target_precision", []).append(
         (epoch, float(tgt_met["precision"]))
@@ -1609,7 +1707,13 @@ def validate(
             ("Target detection entropy", f"{val_entropy:.4f}"),
             ("§", "Timing"),
             ("Elapsed (seconds)", f"{elapsed:.2f}"),
-        ],
+        ]
+        + class_map50_rows("Per-class mAP@50 (val)", val_per_class)
+        + (
+            class_map50_rows("Per-class mAP@50 (target val)", tgt_per_class)
+            if tgt_per_class
+            else []
+        ),
     )
     
     print(table)
@@ -1653,6 +1757,8 @@ def validate(
             "target_n": len(target_per_image),
             "elapsed_s": round(float(elapsed), 2),
             "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+            **class_map50_record("val", val_per_class),
+            **class_map50_record("target", tgt_per_class),
         },
     )
 
@@ -1674,6 +1780,17 @@ def validate(
             )
         )
     best_name, best_model, best_score = max(candidates, key=lambda c: c[2])
+    patience = int(getattr(ctx.args, "early_stop_patience", 0) or 0)
+    if best_score > ctx.best_score:
+        ctx.stale_validations = 0
+    else:
+        ctx.stale_validations += 1
+        if patience > 0 and ctx.stale_validations >= patience:
+            ctx.stop_early = True
+            print(
+                f"🛑 [early-stop] {ctx.stale_validations} validations without "
+                f"improving {metric} (best {ctx.best_score:.4f}); stopping"
+            )
     if best_score > ctx.best_score:
         print(
             f"🏆 [ckpt] saving best_model.pth from {best_name}, epoch {epoch} "
@@ -2575,22 +2692,31 @@ def evaluate_target_test(
             conf_sum += float(l_conf.item())
             loss_sum += float((l_loc + l_conf).item())
             steps += 1
-            per_image.extend(_decode_per_image(out, ttgt, net))
+            per_image.extend(
+                _decode_per_image(
+                    out,
+                    ttgt,
+                    net,
+                    EVAL_DEFAULTS["decode_conf_thr"],
+                    EVAL_DEFAULTS["nms_iou_thr"],
+                )
+            )
             
     if steps > 0:
         loss_sum /= steps
         loc_sum /= steps
         conf_sum /= steps
         
-    scores, matched, n_gt, cm = viz.evaluate_detections(
-        per_image, iou_thr=0.5, score_thr_cm=0.5, num_classes=ctx.args.nc
+    snapshot = deval.split_snapshot(
+        per_image,
+        ctx.class_names,
+        EVAL_DEFAULTS["iou_thr"],
+        EVAL_DEFAULTS["score_thr_cm"],
     )
-    
-    met = detect_metrics_from_cm(cm)
-    _, _, _, mAP = viz._pr_from_scores(
-        np.asarray(scores), np.asarray(matched), n_gt
-    )
-    
+    met = snapshot
+    mAP = float(snapshot["mAP"])
+    per_class = snapshot["per_class"]
+
     table = format_val_table(
         "Target test metrics · best_model.pth",
         [
@@ -2604,7 +2730,8 @@ def evaluate_target_test(
             ("F1 score", f"{met['f1']:.4f}"),
             ("mAP @ IoU 0.5", f"{mAP:.4f}"),
             ("TP / FP / FN", f"{met['tp']} / {met['fp']} / {met['fn']}"),
-        ],
+        ]
+        + class_map50_rows("Per-class mAP@50 from the pooled mAP", per_class),
     )
     
     print(table)
@@ -2689,12 +2816,7 @@ def train(ctx: TrainingContext) -> None:
             f"⚓ [wReg] anchored {len(ctx.wreg_ref)} VGG tensors (weight={getattr(args_ns, 'wreg_loss_weight', 0.0)})"
         )
     lr = args_ns.lr * np.round(np.sqrt(args_ns.batch_size / 4 * n_gpus), 4)
-    optimizer = optim.SGD(
-        build_param_groups(dsfd_net, lr),
-        lr=lr,
-        momentum=args_ns.momentum,
-        weight_decay=args_ns.weight_decay,
-    )
+    optimizer = build_optimizer(dsfd_net, lr, args_ns)
     multigpu = len(parse_gpu_ids(getattr(args_ns, "gpu_ids", 0))) > 1
     if args_ns.cuda:
         net = net.cuda()
@@ -2757,6 +2879,15 @@ def train(ctx: TrainingContext) -> None:
         print(
             f"🧪 [DeT] ConCal={'on' if ctx.calibrator is not None else 'off'} "
             f"CDRC={'on' if ctx.mixer is not None else 'off'}"
+        )
+    if ctx.local_rank == 0 and ctx.class_thresholds is not None:
+        delta = ctx.class_thresholds.thresholds()
+        print(
+            f"🎚️ [ConCal] delta mean={float(delta.mean()):.3f} "
+            f"min={float(delta.min()):.3f} max={float(delta.max()):.3f} "
+            f"vs pseudo_conf={float(getattr(args_ns, 'pseudo_conf', 0.0)):.3f}, "
+            f"HPD band=({float(ctx.calibrator.config.delta_min):.2f}, "
+            f"{float(delta.mean()):.2f}) tau={float(ctx.calibrator.config.tau):.2f}"
         )
     if ctx.local_rank == 0:
         print(
@@ -2874,6 +3005,8 @@ def train(ctx: TrainingContext) -> None:
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
         if iteration >= cfg.MAX_STEPS:
+            break
+        if ctx.stop_early:
             break
     epoch_pbar.close()
     if ctx.local_rank == 0:

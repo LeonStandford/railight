@@ -37,6 +37,7 @@ from losses.dfl import FocalLoss, compute_focal_alpha
 from losses.iou import build_box_loss
 from models.factory import build_net
 from railight.constants import BACKBONE_FROM_MODEL, MODEL_FROM_ARCH_BACKBONE
+from utils.constants import EVAL_DEFAULTS
 from utils import detection_eval as deval
 from utils import domain_gap as dgap
 from utils import visualize as viz
@@ -65,10 +66,7 @@ _TEST_DEFAULTS: Dict[str, Any] = {
     "mode_name": "test",
     "viz_num_samples": 6,
     "weights": None,
-    "iou_thr": 0.5,
-    "score_thr_cm": 0.5,
-    "nms_iou_thr": 0.35,
-    "decode_conf_thr": 0.05,
+    **EVAL_DEFAULTS,
     "align_source_view": "dark",
     "night_synthesis": "dark_isp",
     "export_predicted_source_path": None,
@@ -207,7 +205,18 @@ def load_state_dict(net: torch.nn.Module, weights_path: str) -> None:
     state = torch.load(weights_path, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "weight" in state:
         state = state["weight"]
-    net.load_state_dict(state)
+    missing, unexpected = net.load_state_dict(state, strict=False)
+    if missing:
+        raise RuntimeError(
+            f"{weights_path} is missing {len(missing)} key(s) the model needs, "
+            f"first ones: {sorted(missing)[:8]}"
+        )
+    if unexpected:
+        prefixes = sorted({key.split(".")[0] for key in unexpected})
+        print(
+            f"[net] ignored {len(unexpected)} checkpoint key(s) the model "
+            f"no longer defines, under: {prefixes}"
+        )
 
 
 def build_network(
@@ -780,9 +789,14 @@ def summary_table(report: Dict[str, Any]) -> str:
         rows.append(("precision", f"{section['precision']:.4f}"))
         rows.append(("recall", f"{section['recall']:.4f}"))
         rows.append(("f1", f"{section['f1']:.4f}"))
-        rows.append(("mAP", f"{section['mAP']:.4f}"))
+        rows.append(("mAP (mean of classes)", f"{section['mAP']:.4f}"))
         rows.append(("mAP@50:95", f"{section['mAP_50_95']:.4f}"))
-        rows.append(("macro_map50", f"{section['macro_map50']:.4f}"))
+        if "mAP_pooled" in section:
+            rows.append(("mAP pooled over all gt", f"{section['mAP_pooled']:.4f}"))
+        if "map50_from_classes" in section:
+            rows.append(
+                ("pooled from classes", f"{section['map50_from_classes']:.4f}")
+            )
         rows.append(("macro_f1", f"{section['macro_f1']:.4f}"))
         rows.append(
             ("TP/FP/FN", f"{section['tp']}/{section['fp']}/{section['fn']}")
@@ -814,16 +828,53 @@ def per_class_table(report: Dict[str, Any], split: str) -> str:
     section = report.get(split)
     if not section:
         return ""
-    rows: List[Tuple[str, str]] = [("§", f"Per-class ({split})")]
-    for name, stats in section["per_class"].items():
+    per_class = section["per_class"]
+    total_gt = max(sum(s["n_gt"] for s in per_class.values()), 1)
+    rows: List[Tuple[str, str]] = [
+        ("§", f"Per-class mAP@50 from the pooled mAP ({split})")
+    ]
+    pooled = 0.0
+    for name, stats in per_class.items():
+        weight = stats["n_gt"] / total_gt
+        contribution = stats["ap50"] * weight
+        pooled += contribution
         rows.append(
             (
                 name,
-                f"ap50={stats['ap50']:.3f} p={stats['precision']:.3f} "
-                f"r={stats['recall']:.3f} f1={stats['f1']:.3f} "
+                f"map50={stats['ap50'] * 100:.2f} "
+                f"n_gt={stats['n_gt']} ({weight * 100:.1f}%) "
+                f"contributes {contribution * 100:.2f}",
+            )
+        )
+    rows.append(("n_gt total", f"{total_gt}"))
+    rows.append(
+        (
+            "mAP (mean of classes)",
+            f"{section['mAP'] * 100:.2f}   pooled {pooled * 100:.2f}",
+        )
+    )
+    rows.append(("§", f"Per-class precision / recall / F1 ({split})"))
+    for name, stats in per_class.items():
+        rows.append(
+            (
+                name,
+                f"p={stats['precision']:.3f} r={stats['recall']:.3f} "
+                f"f1={stats['f1']:.3f} "
+                f"tp/fp/fn={stats['tp']}/{stats['fp']}/{stats['fn']} "
                 f"best_f1={stats['best_f1']:.3f}@{stats['best_thr']:.2f}",
             )
         )
+    rows.append(
+        (
+            "split total",
+            f"p={section['precision']:.3f} r={section['recall']:.3f} "
+            f"f1={section['f1']:.3f} "
+            f"tp/fp/fn={section['tp']}/{section['fp']}/{section['fn']}",
+        )
+    )
+    rows.append(("§", f"Per-class AP@50 measured class by class ({split})"))
+    for name, stats in per_class.items():
+        rows.append((name, f"ap50_isolated={stats['ap50_isolated'] * 100:.2f}"))
     return format_val_table(f"per-class · {split}", rows)
 
 
@@ -841,7 +892,9 @@ def write_record_csv(
     }
     metric_keys = (
         "n_images", "n_gt", "accuracy", "precision", "recall", "f1", "mAP",
-        "mAP_50_95", "macro_map50", "macro_precision", "macro_recall", "macro_f1",
+        "mAP_pooled", "mAP_50_95", "macro_map50", "macro_map50_isolated",
+        "map50_from_classes",
+        "macro_precision", "macro_recall", "macro_f1",
         "macro_best_f1", "macro_best_thr", "tp", "fp", "fn",
         "tp_norm", "fp_norm", "fn_norm",
     )
@@ -856,6 +909,16 @@ def write_record_csv(
                 row[f"{split}_{key}"] = section[key]
     for key, value in (report.get("domain_gap") or {}).items():
         row[key] = value
+    for split in _SPLITS:
+        section = report.get(split)
+        if not section:
+            continue
+        for name, stats in section["per_class"].items():
+            row[f"{split}_{name}_map50"] = round(stats["ap50"] * 100.0, 4)
+            row[f"{split}_{name}_n_gt"] = int(stats["n_gt"])
+            row[f"{split}_{name}_precision"] = round(stats["precision"], 6)
+            row[f"{split}_{name}_recall"] = round(stats["recall"], 6)
+            row[f"{split}_{name}_f1"] = round(stats["f1"], 6)
     for key in ("elapsed_s", "fps_end2end", "throughput_img_s", "latency_ms_per_img"):
         row[key] = report["speed"][key]
     row["params_total"] = report["model"]["params_total"]
@@ -865,6 +928,53 @@ def write_record_csv(
         if is_new:
             writer.writeheader()
         writer.writerow(row)
+    return rec_path
+
+
+def write_class_wise_csv(
+    report: Dict[str, Any], args_ns: argparse.Namespace, backbone_dir: str
+) -> str:
+    rec_dir = os.path.join(
+        str(args_ns.records_dir), str(args_ns.architecture), backbone_dir
+    )
+    os.makedirs(rec_dir, exist_ok=True)
+    rec_path = os.path.join(rec_dir, f"{args_ns.num_exp}_class_wise.csv")
+    class_names = list(report["setup"]["class_names"])
+    fieldnames = ["timestamp", "weights", "split", "row"] + class_names + ["mAP"]
+    stamp = dt.datetime.now().isoformat(timespec="seconds")
+    weights = os.path.basename(report["setup"]["weights"])
+    rows: List[Dict[str, Any]] = []
+    for split in _SPLITS:
+        section = report.get(split)
+        if not section:
+            continue
+        per_class = section["per_class"]
+        base = {"timestamp": stamp, "weights": weights, "split": split}
+        counts = {name: int(per_class[name]["n_gt"]) for name in class_names}
+        rows.append({**base, "row": "n_gt", **counts, "mAP": sum(counts.values())})
+        for key, total in (
+            ("ap50", "mAP"),
+            ("precision", "precision"),
+            ("recall", "recall"),
+            ("f1", "f1"),
+        ):
+            rows.append(
+                {
+                    **base,
+                    "row": "map50" if key == "ap50" else key,
+                    **{
+                        name: round(per_class[name][key] * 100.0, 2)
+                        for name in class_names
+                    },
+                    "mAP": round(section[total] * 100.0, 2),
+                }
+            )
+    is_new = not os.path.exists(rec_path)
+    with open(rec_path, "a", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        if is_new:
+            writer.writeheader()
+        writer.writerows(rows)
     return rec_path
 
 
@@ -1054,9 +1164,11 @@ def evaluate(args_ns: argparse.Namespace) -> Dict[str, Any]:
     with open(metrics_path, "w") as fh:
         json.dump(report, fh, indent=2)
     rec_path = write_record_csv(report, args_ns, backbone_dir)
+    class_path = write_class_wise_csv(report, args_ns, backbone_dir)
     print(f"[viz] charts saved to {charts_dir}")
     print(f"[metrics] report saved to {metrics_path}")
     print(f"[metrics] record row appended to {rec_path}")
+    print(f"[metrics] per-class mAP appended to {class_path}")
     return report
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 __all__ = [
+    "EVAL_DEFAULTS",
     "TRAIN_DEFAULTS",
     "TEST_DEFAULTS",
     "WANDB_EPOCH_KEYS",
@@ -10,6 +11,13 @@ __all__ = [
     "_TEST_DEFAULTS",
     "_WANDB_EPOCH_KEYS",
 ]
+
+EVAL_DEFAULTS: Dict[str, float] = {
+    "iou_thr": 0.5,
+    "score_thr_cm": 0.5,
+    "nms_iou_thr": 0.35,
+    "decode_conf_thr": 0.05,
+}
 
 TRAIN_DEFAULTS: Dict[str, Any] = {
     "batch_size": 4,
@@ -72,6 +80,13 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "viz_max_target_batches": 30,
     "box_loss": "smooth_l1",
     "epochs": 100,
+    "early_stop_patience": 0,
+    "balanced_paste_enabled": False,
+    "balanced_paste_cache": "/home/a00161/stacy.en14/models/railight/.cache",
+    "balanced_paste_target_ratio": 1.0,
+    "balanced_paste_max_paste": 6,
+    "balanced_paste_seed": 0,
+    "balanced_paste_bank_capacity": 2000,
     "max_steps": 150000,
     "lr_steps": [20000, 25000, 30000],
 }

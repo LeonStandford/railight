@@ -36,6 +36,7 @@ class WandbLogger:
         run_name: str,
         config: Dict[str, Any],
         entity: Optional[str] = None,
+        run_dir: Optional[str] = None,
     ) -> None:
         self.run = None
         self._wandb = None
@@ -50,11 +51,14 @@ class WandbLogger:
             import wandb
 
             self._wandb = wandb
+            if run_dir:
+                os.makedirs(run_dir, exist_ok=True)
             self.run = wandb.init(
                 project=project,
                 name=run_name,
                 entity=entity,
                 config=config,
+                dir=run_dir or None,
                 resume="allow",
             )
             print(f"[wandb] logging to {getattr(self.run, 'url', project)}")

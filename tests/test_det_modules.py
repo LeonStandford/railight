@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import glob
 import os
 import sys
-from typing import Callable, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -193,6 +194,44 @@ def check_icrm_target_warmup_offset() -> bool:
     )
 
 
+def check_shipped_concal_matches_pseudo_conf() -> bool:
+    root = os.path.dirname(_ROOT) if os.path.basename(_ROOT) == "tests" else _ROOT
+    pattern = os.path.join(
+        root, "configs", "train", "railight", "vgg16", "*concal*.yaml"
+    )
+    paths = glob.glob(pattern)
+    if not paths:
+        return False
+    for path in paths:
+        cfg: Dict[str, float] = {}
+        with open(path) as handle:
+            for raw in handle:
+                if ":" not in raw or raw.lstrip().startswith("#"):
+                    continue
+                key, _, value = raw.partition(":")
+                try:
+                    cfg[key.strip()] = float(value.strip())
+                except ValueError:
+                    continue
+        nc = int(cfg.get("nc", 8))
+        th = ClassThresholds(
+            nc,
+            base=cfg["concal_base"],
+            beta=cfg["concal_beta"],
+            lower=cfg["concal_lower"],
+            upper=cfg["concal_upper"],
+        )
+        th.seen[:] = True
+        delta = th.thresholds()
+        effective = delta.clamp_min(cfg["concal_delta_min"])
+        target = cfg["pseudo_conf"]
+        if abs(float(delta.mean()) - target) > 0.05:
+            return False
+        if abs(float(effective.mean()) - target) > 0.05:
+            return False
+    return True
+
+
 def check_strong_aug_range() -> bool:
     images = torch.rand(4, 3, 64, 64)
     out = build_strong_augmentation(StrongAugConfig())(images)
@@ -216,6 +255,8 @@ CHECKS: List[Check] = [
     ("CAT CALoss: weights capped and finite", check_caloss_weight_cap),
     ("CAT ICRm: empty target rows fall back to source", check_icrm_row_fallback),
     ("CAT ICRm: target warm-up starts at target_start", check_icrm_target_warmup_offset),
+    ("ConCal config: shipped delta mean tracks pseudo_conf",
+     check_shipped_concal_matches_pseudo_conf),
     ("Strong aug: shape and value range preserved", check_strong_aug_range),
 ]
 

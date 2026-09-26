@@ -2,7 +2,7 @@ architecture: railight
 backbone: vgg16
 num_exp: exp4.uda.batch8.caotulab_server.h100
 
-weights: /home/a00161/stacy.en14/data/data_exp2/railight/weights/railight/vgg16/exp4.uda.batch8.caotulab_server.h100/best_model.pth
+weights: /home/a00161/stacy.en14/models/railight/weights/railight/vgg16/exp4.uda.batch8.caotulab_server.h100/best_model.pth
 
 cuda: true
 gpu_ids: 0

@@ -1,0 +1,88 @@
+architecture: railight
+backbone: vgg16
+num_exp: exp3.da.batch8.caotulab_server.h100_adam_balanced
+
+batch_size: 8
+
+lr: 1.0e-4
+optimizer: adam
+momentum: 0.9
+weight_decay: 5.0e-4
+gamma: 0.1
+epochs: 100
+early_stop_patience: 5
+max_steps: 81600
+lr_steps: [48960, 65280]
+
+cuda: true
+gpu_ids: 0
+num_workers: 4
+local_rank: 0
+
+source_train_file: /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/source_train.txt
+source_val_file:   /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/source_val.txt
+source_test_file:  /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/source_test.txt
+target_train_file: /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/target_train.txt
+target_val_file:   /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/target_val.txt
+target_test_file:  /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/target_test.txt
+
+nc: 8
+names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
+
+save_folder: /home/a00161/stacy.en14/models/railight/weights
+charts_dir:  /home/a00161/stacy.en14/models/railight/charts
+records_dir: /home/a00161/stacy.en14/models/railight/records
+log_dir:     /home/a00161/stacy.en14/models/railight/logs
+resume: false
+
+val_every_epochs: 3
+best_metric: target_map
+grad_clip_norm: 35
+viz_num_samples: 6
+viz_every_iters: 500
+viz_full_every_epochs: 10
+viz_max_source_batches: 30
+viz_max_target_batches: 30
+
+kl_loss_weight: 1.0
+target_loss_weight: 0.1
+is_use_supervised_target_loss: true
+supervised_target_loss_weight: 1.0
+
+focal_enabled: true
+focal_gamma: 2.0
+focal_alpha_bg: 0.25
+
+box_loss: smooth_l1
+is_use_rc_loss: false
+
+use_wandb: true
+wandb_project: da-rdd-railight
+wandb_entity: null
+wandb_dir: /home/a00161/stacy.en14/models/railight/wandb
+
+pseudo_weight: 1.0
+pseudo_conf: 0.8
+pseudo_start_iters: 20000
+pseudo_neg_thr: 0.3
+ema_decay: 0.9996
+
+source_strong_weight: 0.0
+pseudo_strong_aug: false
+strong_aug_jitter_p: 0.8
+strong_aug_brightness: 0.4
+strong_aug_contrast: 0.4
+strong_aug_saturation: 0.4
+strong_aug_hue: 0.1
+strong_aug_gray_p: 0.2
+strong_aug_blur_p: 0.5
+strong_aug_blur_sigma: [0.1, 2.0]
+strong_aug_erase_p: [0.7, 0.5, 0.3]
+cat_viz_per_class: 6
+
+balanced_paste_enabled: true
+balanced_paste_cache: /home/a00161/stacy.en14/models/railight/.cache
+balanced_paste_target_ratio: 1.0
+balanced_paste_max_paste: 6
+balanced_paste_seed: 0
+balanced_paste_bank_capacity: 2000

@@ -25,10 +25,10 @@ target_test_file:  ./dataset/target_test.txt
 nc: 3
 names: ['crack', 'missing_items', 'broken_sleeper']
 
-save_folder: weights/
-charts_dir:  ./charts
-records_dir: ./records
-log_dir:     ./logs
+save_folder: /home/a00161/stacy.en14/models/railight/weights
+charts_dir:  /home/a00161/stacy.en14/models/railight/charts
+records_dir: /home/a00161/stacy.en14/models/railight/records
+log_dir:     /home/a00161/stacy.en14/models/railight/logs
 resume: true
 
 viz_num_samples: 6
@@ -48,4 +48,4 @@ is_use_rc_loss: true
 use_wandb:                     true
 wandb_project:                 da-rdd-railight
 wandb_entity:                  null
-wandb_dir:                     ./wandb
+wandb_dir: /home/a00161/stacy.en14/models/railight/wandb

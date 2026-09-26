@@ -1,0 +1,46 @@
+architecture: railight
+backbone: vgg16
+num_exp: exp4.uda.batch8.weak_strong_augmentation.cat.cra_cdrc_bidirection_mixing.caotulab_server.h100_adam_v2
+
+weights: /home/a00161/stacy.en14/models/railight/weights/railight/vgg16/exp4.uda.batch8.weak_strong_augmentation.cat.cra_cdrc_bidirection_mixing.caotulab_server.h100_adam_v2/best_model.pth
+
+cuda: true
+gpu_ids: 0
+batch_size: 32
+
+source_test_files:
+  # - /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/source_train.txt
+  # - /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/source_val.txt
+  - /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/source_test.txt
+
+target_test_files:
+  # - /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/target_train.txt
+  # - /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/target_val.txt
+  - /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/target_test.txt
+
+export_predicted_source_path: null
+export_predicted_target_path: null
+export_fp_fn_samples_path: null
+
+nc: 8
+names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
+
+charts_dir:  /home/a00161/stacy.en14/models/railight/charts
+records_dir: /home/a00161/stacy.en14/models/railight/records
+log_dir:     /home/a00161/stacy.en14/models/railight/logs
+
+viz_num_samples: 6
+
+is_run_confusion_matrix: true
+is_run_samples_grid: true
+is_run_tsne_reflectance: true
+is_run_domain_gap: true
+
+iou_thr: 0.5
+score_thr_cm: 0.5
+nms_iou_thr: 0.35
+
+cdrc_enabled: true
+cdrc_alpha: 4.0
+cdrc_max_objects: 4
+cdrc_max_iou: 0.9
