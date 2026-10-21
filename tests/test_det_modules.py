@@ -6,17 +6,17 @@ import sys
 from typing import Callable, Dict, List, Tuple
 
 import numpy as np
-import torch
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (os.path.join(_ROOT, "src"), os.path.join(_ROOT, "src", "models")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+import torch
 
-from losses.cat_icrm import ClassAwareWeighter, InterClassRelation, KeepRateSchedule
-from models.cdrc import CrossDomainMixer, InverseFrequencySampler
-from models.concal import ClassThresholds, ConCalConfig, PseudoLabelCalibrator
-from utils.strong_aug import StrongAugConfig, build_strong_augmentation
+
+from src.losses.cat_icrm import ClassAwareWeighter, InterClassRelation, KeepRateSchedule
+from src.models.cdrc import CrossDomainMixer, InverseFrequencySampler
+from src.models.concal import ClassThresholds, ConCalConfig, PseudoLabelCalibrator
+from src.utils.strong_aug import StrongAugConfig, build_strong_augmentation
 
 Check = Tuple[str, Callable[[], bool]]
 

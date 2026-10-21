@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics.functional.image import structural_similarity_index_measure as ssim
-from data.config import cfg
+from src.data.classes.config import cfg
 
 
 def gradient(input_tensor, direction):

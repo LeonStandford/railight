@@ -46,7 +46,7 @@ class PriorBox(object):
 
 
 if __name__ == "__main__":
-    from data.config import cfg
+    from src.data.classes.config import cfg
 
     p = PriorBox([640, 640], cfg)
     out = p.forward()

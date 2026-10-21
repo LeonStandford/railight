@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Dict, Tuple
 
 CHECKPOINT_LATEST: str = "last_model.pth"
+BEST_SCORE_FILE: str = "best_score.json"
 CHECKPOINT_BEST: str = "best_model.pth"
 RETINEX_WEIGHTS: str = "decomp.pth"
 PRINT_EVERY: int = 100
@@ -9,7 +10,6 @@ PBAR_EVERY: int = 20
 BACKBONE_FROM_MODEL: Dict[str, str] = {
     "dark": "vgg16",
     "dark_sppf": "vgg16_sppf",
-    "yolo26n": "yolo26n",
     "vgg": "vgg16",
     "resnet50": "resnet50",
     "resnet101": "resnet101",
@@ -18,7 +18,6 @@ BACKBONE_FROM_MODEL: Dict[str, str] = {
 DEFAULT_ARCH_FROM_MODEL: Dict[str, str] = {
     "dark": "railight",
     "dark_sppf": "railight",
-    "yolo26n": "railight",
     "vgg": "dsfd",
     "resnet50": "dsfd",
     "resnet101": "dsfd",
@@ -27,7 +26,6 @@ DEFAULT_ARCH_FROM_MODEL: Dict[str, str] = {
 MODEL_FROM_ARCH_BACKBONE: Dict[Tuple[str, str], str] = {
     ("railight", "vgg16"): "dark",
     ("railight", "vgg16_sppf"): "dark_sppf",
-    ("railight", "yolo26n"): "yolo26n",
     ("dsfd", "vgg16"): "vgg",
     ("dsfd", "resnet50"): "resnet50",
     ("dsfd", "resnet101"): "resnet101",

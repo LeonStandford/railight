@@ -6,12 +6,12 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (os.path.join(_ROOT, "src"), os.path.join(_ROOT, "src", "models")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from utils.detection_eval import (
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from src.utils.detection_eval import (
     average_precision,
     collect_matches,
     counts_to_metrics,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Optional
 
 import numpy as np
 import torch
@@ -40,6 +40,7 @@ class ClassThresholds:
         lower: float = 0.3,
         upper: float = 0.9,
         momentum: float = 0.9,
+        target_precision: float = 0.75,
     ) -> None:
         self.num_classes = int(num_classes)
         self.base = float(base)
@@ -47,29 +48,52 @@ class ClassThresholds:
         self.lower = float(lower)
         self.upper = float(upper)
         self.momentum = float(momentum)
+        self.target_precision = float(target_precision)
         self.avg_conf = torch.full((self.num_classes,), float(base))
         self.seen = torch.zeros(self.num_classes, dtype=torch.bool)
 
     @torch.no_grad()
-    def update(self, scores: torch.Tensor, labels: torch.Tensor) -> None:
+    def update(
+        self,
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        correct: Optional[torch.Tensor] = None,
+    ) -> None:
         if labels.numel() == 0:
             return
         for cls in labels.unique():
             idx = int(cls) - 1
             if not 0 <= idx < self.num_classes:
                 continue
-            mean = float(scores[labels == cls].mean())
+            sel = labels == cls
+            if correct is None:
+                target = float(scores[sel].mean())
+            else:
+                target = self._precision_threshold(scores[sel], correct[sel])
             if not bool(self.seen[idx]):
-                self.avg_conf[idx] = mean
+                self.avg_conf[idx] = target
                 self.seen[idx] = True
                 continue
             self.avg_conf[idx] = (
-                self.momentum * float(self.avg_conf[idx]) + (1.0 - self.momentum) * mean
+                self.momentum * float(self.avg_conf[idx])
+                + (1.0 - self.momentum) * target
             )
 
+    def _precision_threshold(
+        self, scores: torch.Tensor, correct: torch.Tensor
+    ) -> float:
+        order = torch.argsort(scores, descending=True)
+        hits = correct[order].to(torch.float32)
+        prec = torch.cumsum(hits, dim=0) / torch.arange(
+            1, hits.numel() + 1, device=hits.device, dtype=torch.float32
+        )
+        ok = (prec >= self.target_precision).nonzero().flatten()
+        if ok.numel() == 0:
+            return float(self.upper)
+        return float(scores[order][int(ok[-1])])
+
     def thresholds(self) -> torch.Tensor:
-        delta = self.base + self.beta * torch.softmax(self.avg_conf, dim=0)
-        return delta.clamp(self.lower, self.upper)
+        return self.avg_conf.clamp(self.lower, self.upper)
 
     def as_dict(self, class_names: Sequence[str]) -> Dict[str, float]:
         values = self.thresholds().tolist()

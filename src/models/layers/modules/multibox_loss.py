@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-from losses.cat_icrm import PriorWeighter
+from src.losses.cat_icrm import PriorWeighter
 from ..bbox_utils import match, log_sum_exp, match_ssd, decode
 
 LossPair = Tuple[torch.Tensor, torch.Tensor]

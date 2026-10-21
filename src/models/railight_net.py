@@ -7,9 +7,9 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch.autograd import Variable, Function
-from layers import *
-from data.config import cfg
-from models.blocks_ultra import SPPF, C2PSA
+from src.models.layers import *
+from src.data.classes.config import cfg
+from src.models.blocks_ultra import SPPF, C2PSA
 
 
 class Interpolate(nn.Module):
