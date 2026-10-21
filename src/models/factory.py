@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
-from .dai_net import build_net_dark
-from .dainet.constants import MODEL_FROM_ARCH_BACKBONE
+from torch import nn
+
+from .railight_net import build_net_dark
+from .railight.constants import MODEL_FROM_ARCH_BACKBONE
 from .dsfd_resnet import build_net_resnet
 from .dsfd_vgg import build_net_vgg
 
@@ -12,7 +14,7 @@ Weights = Union[str, bool, None]
 
 PHASES: Tuple[str, ...] = ("train", "test")
 VGG_BASENET: str = "vgg16_reducedfc.pth"
-DEFAULT_ARCHITECTURE: str = "dai_net"
+DEFAULT_ARCHITECTURE: str = "railight"
 DEFAULT_BACKBONE: str = "vgg16"
 AUTO_WEIGHTS: Tuple[Weights, ...] = ("auto", None)
 
@@ -56,26 +58,6 @@ def _resnet_builder(net_name: str) -> Callable[[str, int, Optional[str], Weights
     return build
 
 
-def _yolo_builder(
-    default_scale: str,
-) -> Callable[[str, int, Optional[str], Weights], Any]:
-    """Bind one YOLO26 scale to the shared IDA-YOLO builder."""
-
-    def build(
-        phase: str, num_classes: int, scale: Optional[str], weights: Weights
-    ) -> Any:
-        from .idayolo import build_idayolo
-
-        return build_idayolo(
-            phase,
-            num_classes,
-            scale=scale or default_scale,
-            weights="auto" if weights is None else weights,
-        )
-
-    return build
-
-
 MODEL_SPECS: Dict[str, ModelSpec] = {
     "vgg": ModelSpec(build=_build_vgg, basenet=VGG_BASENET),
     "dark": ModelSpec(build=_build_dark, basenet=VGG_BASENET),
@@ -83,12 +65,6 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
     "resnet50": ModelSpec(build=_resnet_builder("resnet50"), basenet="resnet50.pth"),
     "resnet101": ModelSpec(build=_resnet_builder("resnet101"), basenet="resnet101.pth"),
     "resnet152": ModelSpec(build=_resnet_builder("resnet152"), basenet="resnet152.pth"),
-    "yolo26n": ModelSpec(
-        build=_yolo_builder("n"), accepts_weights=True, accepts_scale=True
-    ),
-    "yolo26s": ModelSpec(
-        build=_yolo_builder("s"), accepts_weights=True, accepts_scale=True
-    ),
 }
 
 
@@ -128,7 +104,7 @@ def build_net(
     architecture: str = DEFAULT_ARCHITECTURE,
     scale: Optional[str] = None,
     weights: Weights = "auto",
-) -> Any:
+) -> nn.Module:
     """Build a detector from the vocabulary used in configs/ (`backbone`, `architecture`)."""
     if phase not in PHASES:
         raise ValueError(f"phase must be one of {PHASES}, got {phase!r}")
