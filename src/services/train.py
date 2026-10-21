@@ -853,11 +853,6 @@ def record_iter_losses(
         history[name].append((iteration, float(value.detach())))
 
 
-
-
-
-
-
 class TrainingContext:
 
     def __init__(self, args_ns: argparse.Namespace, local_rank: int) -> None:
