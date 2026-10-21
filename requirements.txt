@@ -38,6 +38,7 @@ httpx==0.28.1
 huggingface_hub==1.31.0
 idna==3.19
 ImageHash==4.3.2
+iniconfig==2.3.1
 invoke==3.0.3
 Jinja2==3.1.6
 joblib==1.6.0
@@ -81,6 +82,7 @@ pandas==2.3.3
 paramiko==5.0.0
 pillow==12.3.0
 platformdirs==4.11.8
+pluggy==1.7.0
 proto-plus==1.28.4
 protobuf==7.36.1
 psutil==7.2.2
@@ -97,12 +99,14 @@ pyOpenSSL==24.2.1
 pyparsing==3.3.2
 pypdf==6.19.0
 PySocks==1.7.1
+pytest==9.1.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.3
 pytz==2026.3.post1
 PyWavelets==1.8.0
 PyYAML==6.0.3
 regex==2026.9.10
+reportlab==5.0.1
 requests==2.34.2
 rich==15.0.0
 rsa==4.9.1
@@ -119,6 +123,7 @@ tabulate==0.10.0
 termcolor==3.3.0
 threadpoolctl==3.6.0
 tokenizers==0.23.2
+tomli==2.5.0
 torch==2.14.0
 torchmetrics==1.9.0
 tqdm==4.70.0
