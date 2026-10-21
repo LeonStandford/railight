@@ -1,6 +1,6 @@
-"""Loss functions for DAI-Net training."""
+"""Loss functions for RAILIGHT training."""
 
-from losses.dfl import (
+from src.losses.dfl import (
     FocalLoss,
     SigmoidFocalLoss,
     compute_focal_alpha,
@@ -8,8 +8,8 @@ from losses.dfl import (
     init_focal_bias,
     init_focal_bias_sigmoid,
 )
-from losses.weight_reg import snapshot_wreg_ref, weight_reg_loss
-from losses.iou import CIoULoss, WIoULoss, DFLoss, build_box_loss
+from src.losses.weight_reg import snapshot_wreg_ref, weight_reg_loss
+from src.losses.iou import CIoULoss, WIoULoss, DFLoss, build_box_loss
 
 __all__ = [
     "FocalLoss",

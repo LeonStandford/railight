@@ -8,9 +8,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-from data.config import cfg
-from utils.augmentations import to_chw_bgr
-from utils.nms import multiclass_nms
+from src.data.classes.config import cfg
+from src.utils.augmentations import to_chw_bgr
+from src.utils.nms import multiclass_nms
 
 __all__ = [
     "_inner_net",
@@ -83,7 +83,7 @@ def _inner_net(net: torch.nn.Module) -> torch.nn.Module:
 
 
 def _ensure_detect(net: torch.nn.Module) -> Tuple[Any, torch.nn.Module]:
-    from layers.functions.detection import Detect
+    from src.models.layers.functions.detection import Detect
 
     inner = _inner_net(net)
     if not hasattr(inner, "_eval_detect"):
@@ -99,8 +99,30 @@ def _decode_predictions(
     loc_pal2 = out_tuple[3]
     conf_pal2 = out_tuple[4]
     priors_pal2 = out_tuple[5]
-    softmax_conf = softmax(conf_pal2)
-    return detect.forward(loc_pal2, softmax_conf, priors_pal2.type_as(loc_pal2))
+    det_pal2 = detect.forward(
+        loc_pal2, softmax(conf_pal2), priors_pal2.type_as(loc_pal2)
+    )
+    if not bool(getattr(cfg, "FUSE_PAL1", False)):
+        return det_pal2
+    loc_pal1 = out_tuple[0]
+    conf_pal1 = out_tuple[1]
+    priors_pal1 = out_tuple[2]
+    det_pal1 = detect.forward(
+        loc_pal1, softmax(conf_pal1), priors_pal1.type_as(loc_pal1)
+    )
+    return fuse_detections(det_pal2, det_pal1)
+
+
+def fuse_detections(primary: torch.Tensor, extra: torch.Tensor) -> torch.Tensor:
+    if primary.shape[:2] != extra.shape[:2]:
+        raise ValueError(
+            f"shape mismatch: {tuple(primary.shape)} vs {tuple(extra.shape)}"
+        )
+    merged = torch.cat([primary, extra], dim=2)
+    order = merged[:, :, :, 0].argsort(dim=2, descending=True)
+    idx = order.unsqueeze(-1).expand(-1, -1, -1, merged.shape[3])
+    ranked = merged.gather(2, idx)
+    return ranked[:, :, : primary.shape[2], :]
 
 
 def decode_image_instances(
@@ -194,11 +216,12 @@ def _decode_per_image(
     targets: Sequence[torch.Tensor],
     net: torch.nn.Module,
     conf_thr: float = 0.05,
+    nms_iou_thr: float = 0.35,
 ) -> List[Dict[str, np.ndarray]]:
     det = _decode_predictions(net, out_tuple).cpu().numpy()
     out: List[Dict[str, np.ndarray]] = []
     for b in range(det.shape[0]):
-        pb, ps, pl = decode_image_instances(det[b], conf_thr, 0.35)
+        pb, ps, pl = decode_image_instances(det[b], conf_thr, nms_iou_thr)
         gt = (
             targets[b].cpu().numpy()
             if hasattr(targets[b], "cpu")

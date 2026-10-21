@@ -7,8 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.autograd import Variable
-from layers import *
-from data.config import cfg
+from src.models.layers import *
+from src.data.classes.config import cfg
 
 
 def conv3x3(in_planes, out_planes, stride=1, bias=False):

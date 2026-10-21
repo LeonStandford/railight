@@ -8,8 +8,8 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch.autograd import Variable
-from layers import *
-from data.config import cfg
+from src.models.layers import *
+from src.data.classes.config import cfg
 
 
 class FEM(nn.Module):

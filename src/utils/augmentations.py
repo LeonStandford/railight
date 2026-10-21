@@ -8,7 +8,7 @@ from PIL import Image, ImageEnhance
 import math
 import six
 from dataclasses import dataclass
-from data.config import cfg
+from src.data.classes.config import cfg
 import random
 
 
@@ -1065,7 +1065,7 @@ def preprocess(img, bbox_labels, mode, image_path):
     )
     
     img = np.array(img)
-    if mode == "train":
+    if mode == "train" and getattr(cfg, "HFLIP_ENABLED", False):
         mirror = int(np.random.uniform(0, 2))
         
         if mirror == 1:
@@ -1166,7 +1166,7 @@ def preprocess2(img, dark_img, bbox_labels, mode):
     )
     img = np.array(img)
     dark_img = np.array(dark_img)
-    if mode == "train":
+    if mode == "train" and getattr(cfg, "HFLIP_ENABLED", False):
         mirror = int(np.random.uniform(0, 2))
         if mirror == 1:
             img = img[:, ::-1, :]

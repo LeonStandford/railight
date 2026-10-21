@@ -1,7 +1,68 @@
+import math
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import numpy as np
 import random
 import scipy.stats as stats
+
+
+@dataclass(frozen=True)
+class DarkIspProfile:
+    darkness_lower: float = 0.01
+    darkness_upper: float = 0.1
+    darkness_mu: float = 0.1
+    darkness_sigma: float = 0.08
+    blur_sigma_min: float = 0.0
+    blur_sigma_max: float = 0.0
+
+
+_ACTIVE_PROFILE = DarkIspProfile()
+
+
+def set_active_profile(profile: DarkIspProfile) -> None:
+    global _ACTIVE_PROFILE
+    _ACTIVE_PROFILE = profile
+
+
+def active_profile() -> DarkIspProfile:
+    return _ACTIVE_PROFILE
+
+
+def _gaussian_kernel1d(sigma: float, device: torch.device) -> torch.Tensor:
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    grid = torch.arange(-radius, radius + 1, dtype=torch.float, device=device)
+    kernel = torch.exp(-0.5 * (grid / sigma) ** 2)
+    return kernel / kernel.sum()
+
+
+def _apply_optical_blur(x: torch.Tensor, profile: DarkIspProfile) -> torch.Tensor:
+    if profile.blur_sigma_max <= 0.0:
+        return x
+    import torch.nn.functional as F
+
+    out = x.clone()
+    for i in range(x.shape[0]):
+        sigma = random.uniform(profile.blur_sigma_min, profile.blur_sigma_max)
+        if sigma <= 1e-3:
+            continue
+        kernel = _gaussian_kernel1d(sigma, x.device)
+        radius = (kernel.numel() - 1) // 2
+        channels = x.shape[1]
+        plane = out[i : i + 1]
+        plane = F.conv2d(
+            F.pad(plane, (radius, radius, 0, 0), mode="reflect"),
+            kernel.view(1, 1, 1, -1).expand(channels, 1, 1, -1),
+            groups=channels,
+        )
+        plane = F.conv2d(
+            F.pad(plane, (0, 0, radius, radius), mode="reflect"),
+            kernel.view(1, 1, -1, 1).expand(channels, 1, -1, 1),
+            groups=channels,
+        )
+        out[i : i + 1] = plane
+    return out
 
 
 _XYZ2CAMS = torch.tensor(
@@ -23,13 +84,29 @@ _RGB2XYZ = torch.tensor(
 )
 
 
-def build_dark_batch(images):
+def source_training_view(
+    images: torch.Tensor,
+    raw_prob: float = 0.0,
+    profile: Optional[DarkIspProfile] = None,
+) -> torch.Tensor:
+    if raw_prob <= 0.0:
+        return build_dark_batch(images, profile)
+    if raw_prob >= 1.0 or random.random() < raw_prob:
+        return images
+    return build_dark_batch(images, profile)
+
+
+def build_dark_batch(
+    images: torch.Tensor, profile: Optional[DarkIspProfile] = None
+) -> torch.Tensor:
     """Turn a batch of daylight images into synthetic low-light ones."""
-    return run_batch_run_low_illumination_degrading(images)
+    return run_batch_run_low_illumination_degrading(images, profile)
 
 
 @torch.no_grad()
-def run_batch_run_low_illumination_degrading(imgs):
+def run_batch_run_low_illumination_degrading(
+    imgs: torch.Tensor, profile: Optional[DarkIspProfile] = None
+) -> torch.Tensor:
     """Vectorised, whole-batch equivalent of ``run_low_illumination_degrading``.
 
     ``imgs`` is ``[B, 3, H, W]`` in ``[0, 1]``; returns the degraded batch with
@@ -39,6 +116,7 @@ def run_batch_run_low_illumination_degrading(imgs):
     ``no_grad`` — the degraded image is a fixed augmented input (the ISP has no
     learnable parameters), so this changes no model gradient.
     """
+    profile = profile or _ACTIVE_PROFILE
     device = imgs.device
     B = imgs.shape[0]
     eps = 1e-8
@@ -64,7 +142,8 @@ def run_batch_run_low_illumination_degrading(imgs):
     gains1 = torch.stack([1.0 / red_gain, ones, 1.0 / blue_gain], dim=-1) * rgb_gain.unsqueeze(-1)
     x = x * gains1.view(B, 1, 1, 3)
     # (5) darkness
-    lower, upper, mu, sigma = 0.01, 0.1, 0.1, 0.08
+    lower, upper = profile.darkness_lower, profile.darkness_upper
+    mu, sigma = profile.darkness_mu, profile.darkness_sigma
     darkness = stats.truncnorm(
         (lower - mu) / sigma, (upper - mu) / sigma, loc=mu, scale=sigma
     ).rvs(size=B)
@@ -92,7 +171,7 @@ def run_batch_run_low_illumination_degrading(imgs):
     x = torch.einsum("bhwj,bij->bhwi", x, cam2rgb)
     # (10) gamma correction
     x = x.clamp_min(eps) ** (1.0 / g)
-    return x.permute(0, 3, 1, 2).contiguous()
+    return _apply_optical_blur(x.permute(0, 3, 1, 2).contiguous(), profile)
 
 
 def apply_ccm(image, ccm):

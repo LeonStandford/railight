@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 __all__ = [
+    "EVAL_DEFAULTS",
     "TRAIN_DEFAULTS",
     "TEST_DEFAULTS",
     "WANDB_EPOCH_KEYS",
@@ -10,6 +11,13 @@ __all__ = [
     "_TEST_DEFAULTS",
     "_WANDB_EPOCH_KEYS",
 ]
+
+EVAL_DEFAULTS: Dict[str, float] = {
+    "iou_thr": 0.5,
+    "score_thr_cm": 0.5,
+    "nms_iou_thr": 0.35,
+    "decode_conf_thr": 0.05,
+}
 
 TRAIN_DEFAULTS: Dict[str, Any] = {
     "batch_size": 4,
@@ -39,7 +47,6 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "wreg_loss_weight": 0.0001,
     "entropy_loss_weight": 0.01,
     "optimizer": "sgd",
-    "muon_ratio": 0.5,
     "prog_warmup_iters": 0,
     "stal_enabled": False,
     "stal_ref_area": 0.02,
@@ -49,6 +56,7 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "pseudo_conf": 0.7,
     "pseudo_start_iters": 0,
     "pseudo_nms_iou": 0.35,
+    "pseudo_min_density": 1.0,
     "ema_decay": 0.9996,
     "pseudo_strong_aug": False,
     "pseudo_ramp_iters": 1000,
@@ -65,13 +73,30 @@ TRAIN_DEFAULTS: Dict[str, Any] = {
     "backbone_weights": "auto",
     "pretrained_model": None,
     "use_wandb": False,
-    "wandb_project": "dainet-railway",
+    "wandb_project": "railight-railway",
     "wandb_entity": None,
     "val_every_epochs": 1,
     "viz_max_source_batches": 30,
     "viz_max_target_batches": 30,
     "box_loss": "smooth_l1",
     "epochs": 100,
+    "early_stop_patience": 0,
+    "balanced_paste_enabled": False,
+    "balanced_paste_cache": "/home/a00161/stacy.en14/outputs/railight/.cache",
+    "balanced_paste_target_ratio": 1.0,
+    "balanced_paste_max_paste": 6,
+    "balanced_paste_seed": 0,
+    "balanced_paste_bank_capacity": 2000,
+    "dark_isp_darkness_lower": 0.01,
+    "dark_isp_darkness_upper": 0.1,
+    "dark_isp_darkness_mu": 0.1,
+    "dark_isp_darkness_sigma": 0.08,
+    "dark_isp_blur_sigma_min": 0.0,
+    "dark_isp_blur_sigma_max": 0.0,
+    "scale_pad_enabled": False,
+    "seed": None,
+    "scale_pad_ratio_x": 1.0,
+    "scale_pad_ratio_y": 1.0,
     "max_steps": 150000,
     "lr_steps": [20000, 25000, 30000],
 }
