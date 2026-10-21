@@ -6,7 +6,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-__all__ = ["Annotation", "InstanceBank", "BalancedPaster", "parse_annotations"]
+__all__ = [
+    "Annotation",
+    "InstanceBank",
+    "BalancedPaster",
+    "PlacementPrior",
+    "parse_annotations",
+]
 
 
 @dataclass
@@ -37,6 +43,39 @@ def parse_annotations(list_file: str) -> List[Annotation]:
             ]
             out.append(Annotation(parts[0], boxes))
     return out
+
+
+class PlacementPrior:
+
+    def __init__(self, num_classes: int) -> None:
+        self.num_classes = int(num_classes)
+        self.centers: Dict[int, List[Tuple[float, float]]] = {
+            c: [] for c in range(1, self.num_classes + 1)
+        }
+
+    def observe(
+        self,
+        size: Tuple[int, int],
+        box: Tuple[int, int, int, int, int],
+    ) -> None:
+        width, height = size
+        x, y, w, h, label = box
+        if width <= 0 or height <= 0:
+            return
+        if not 1 <= label <= self.num_classes:
+            return
+        self.centers[label].append(
+            ((x + w / 2.0) / width, (y + h / 2.0) / height)
+        )
+
+    def sample(
+        self, label: int, rng: random.Random
+    ) -> Optional[Tuple[float, float]]:
+        pool = self.centers.get(label, [])
+        return rng.choice(pool) if pool else None
+
+    def sizes(self) -> Dict[int, int]:
+        return {c: len(v) for c, v in self.centers.items()}
 
 
 class InstanceBank:
@@ -76,6 +115,31 @@ class InstanceBank:
         return {c: len(v) for c, v in self.crops.items()}
 
 
+def feather_mask(height: int, width: int, band: int) -> np.ndarray:
+    span = max(1, min(int(band), height // 2, width // 2))
+    ramp = (np.arange(span, dtype=np.float32) + 0.5) / (span + 0.5)
+    ramp *= ramp
+    rows = np.ones(height, dtype=np.float32)
+    cols = np.ones(width, dtype=np.float32)
+    rows[:span] = ramp
+    rows[-span:] = ramp[::-1]
+    cols[:span] = ramp
+    cols[-span:] = ramp[::-1]
+    return np.minimum(rows[:, None], cols[None, :])[:, :, None]
+
+
+def _match_statistics(crop: np.ndarray, region: np.ndarray) -> np.ndarray:
+    src = crop.astype(np.float32)
+    dst = region.astype(np.float32)
+    axes = (0, 1)
+    src_mean = src.mean(axis=axes, keepdims=True)
+    src_std = src.std(axis=axes, keepdims=True)
+    dst_mean = dst.mean(axis=axes, keepdims=True)
+    dst_std = dst.std(axis=axes, keepdims=True)
+    scale = np.clip(dst_std / np.maximum(src_std, 1e-3), 0.6, 1.6)
+    return np.clip((src - src_mean) * scale + dst_mean, 0.0, 255.0)
+
+
 class BalancedPaster:
 
     def __init__(
@@ -85,9 +149,14 @@ class BalancedPaster:
         target_ratio: float = 0.4,
         max_paste: int = 6,
         max_iou: float = 0.2,
-        scale_jitter: Tuple[float, float] = (0.7, 1.4),
+        scale_jitter: Tuple[float, float] = (0.85, 1.2),
         min_size: int = 12,
         seed: int = 0,
+        prior: Optional[PlacementPrior] = None,
+        max_repeat: float = 4.0,
+        blend_band: int = 6,
+        placement_tries: int = 24,
+        match_statistics: bool = True,
     ) -> None:
         self.bank = bank
         self.target_ratio = float(target_ratio)
@@ -96,9 +165,19 @@ class BalancedPaster:
         self.scale_jitter = scale_jitter
         self.min_size = int(min_size)
         self.rng = random.Random(seed)
+        self.prior = prior
+        self.max_repeat = float(max_repeat)
+        self.blend_band = int(blend_band)
+        self.placement_tries = int(placement_tries)
+        self.match_statistics = bool(match_statistics)
+        available = bank.sizes()
         goal = max(counts.values()) * self.target_ratio
+        self.goal: Dict[int, int] = {
+            c: int(round(min(goal, available.get(c, 0) * self.max_repeat)))
+            for c in counts
+        }
         self.remaining: Dict[int, int] = {
-            c: max(0, int(round(goal - n))) for c, n in counts.items()
+            c: max(0, self.goal[c] - n) for c, n in counts.items()
         }
 
     def outstanding(self) -> int:
@@ -137,6 +216,40 @@ class BalancedPaster:
             best = max(best, inter / max(union, 1))
         return best
 
+    def _propose(
+        self, label: int, size: Tuple[int, int], shape: Tuple[int, int]
+    ) -> Tuple[int, int]:
+        width, height = size
+        cw, ch = shape
+        hint = self.prior.sample(label, self.rng) if self.prior else None
+        if hint is None:
+            return (
+                self.rng.randrange(0, width - cw),
+                self.rng.randrange(0, height - ch),
+            )
+        cx = hint[0] * width + self.rng.gauss(0.0, 0.02 * width)
+        cy = hint[1] * height + self.rng.gauss(0.0, 0.02 * height)
+        x = int(round(cx - cw / 2.0))
+        y = int(round(cy - ch / 2.0))
+        return (
+            min(max(x, 0), width - cw - 1),
+            min(max(y, 0), height - ch - 1),
+        )
+
+    def _place(
+        self, image: np.ndarray, crop: np.ndarray, x: int, y: int
+    ) -> None:
+        ch, cw = crop.shape[:2]
+        region = image[y : y + ch, x : x + cw]
+        source = (
+            _match_statistics(crop, region)
+            if self.match_statistics
+            else crop.astype(np.float32)
+        )
+        alpha = feather_mask(ch, cw, self.blend_band)
+        blended = alpha * source + (1.0 - alpha) * region.astype(np.float32)
+        image[y : y + ch, x : x + cw] = blended.astype(image.dtype)
+
     def paste(
         self,
         image: np.ndarray,
@@ -164,15 +277,19 @@ class BalancedPaster:
             resized = np.array(
                 _resize(crop, cw, ch), dtype=image.dtype, copy=False
             )
-            x = self.rng.randrange(0, width - cw)
-            y = self.rng.randrange(0, height - ch)
-            if self._iou((x, y, cw, ch), placed) > self.max_iou:
+            spot: Optional[Tuple[int, int]] = None
+            for _try in range(self.placement_tries):
+                x, y = self._propose(label, (width, height), (cw, ch))
+                if self._iou((x, y, cw, ch), placed) <= self.max_iou:
+                    spot = (x, y)
+                    break
+            if spot is None:
                 continue
             if out is image:
                 out = image.copy()
-            out[y : y + ch, x : x + cw] = resized
-            placed.append((x, y, cw, ch))
-            added.append((x, y, cw, ch, label))
+            self._place(out, resized, spot[0], spot[1])
+            placed.append((spot[0], spot[1], cw, ch))
+            added.append((spot[0], spot[1], cw, ch, label))
             self.remaining[label] = max(0, self.remaining[label] - 1)
         return (out, boxes + added, len(added))
 

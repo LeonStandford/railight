@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from utils import visualize as viz
+from src.utils import visualize as viz
 
 __all__ = [
     "IOU_SWEEP",

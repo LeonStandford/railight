@@ -1,158 +1,203 @@
-<p align="center">
-  <h1 align="center">RAILIGHT: A Robust Illumination-Adaptive Framework for Railway Defect Detection
-</h1>
-  <p align="center">
-    <b>Pham Minh Long</b> — National Yang Ming Chiao Tung University (NYCU), Taiwan
-  </p>
-</p>
+# RAILIGHT
 
-![overview](./assets/railight_cat.png)
+## Overview
 
-## 🚂 Introduction
+RAILIGHT detects railway defects at night while training only on labelled daytime images, so no night annotation is needed. It pairs a DSFD dual shot detector with a frozen Retinex branch and aligns the illumination invariant reflectance across a day view, a synthetic dark view and real night frames.
 
-Railway defect detectors are trained on well-lit daytime images, but real inspections often run at night. RAILIGHT closes that gap with **unsupervised domain adaptation**: it learns from labelled day images and adapts to **unlabelled** real night frames.
+![Training](assets/railight_training.png)
 
-Each training step sees three domains:
+| Figure | What it shows |
+|---|---|
+| ![Class aware target](assets/railight_class_aware_target.png) | Class aware target, matched pairs drive the per class weights and the keep rate |
+| ![Unsupervised adaptation](assets/railight_unsupervised_adaptation.png) | Unsupervised adaptation, EMA teacher, calibrated thresholds and cross domain mixing |
+| ![Inference](assets/railight_inference.png) | Inference, only the backbone, deep path, neck and head stay in the graph |
 
-| Domain | Data | Labels |
-| --- | --- | --- |
-| ☀️ Source | well-lit railway images | ✅ |
-| 🌗 Synthetic dark | source + Dark-ISP degradation | ✅ (same GT) |
-| 🌙 Target | real night video frames | ❌ |
+## Highlights
 
-The model is a DSFD-style dual-shot detector with a frozen **Retinex** branch (DAI-Net, CVPR 2024). Reflectance is illumination-invariant, so aligning it across domains makes the detector robust to lighting. Losses include supervised detection, Retinex reconstruction, cross-domain KL alignment, weight anchoring and entropy minimisation.
+- Three views per step, a labelled day image, the same image through a 10 step inverse ISP, and an unlabelled real night frame.
+- Class aware teacher with an EMA inter class relation matrix and a cubic keep rate schedule.
+- Per class confidence calibration and bidirectional cross domain instance mixing for the rare defect classes.
+- One YAML config per experiment, one Python entry point, no code edit per run.
+- Per class AP@50 reported as an unweighted mean, so a frequent class cannot carry the score.
 
-✨ Highlights:
-- 🔌 Backbones: `vgg16`, `vgg16_sppf`, `yolo26n` (`railight`), plus `vgg16`, `resnet50/101/152` (`dsfd`)
-- ⚙️ Everything driven by one YAML config — no code edits per experiment
-- 🚀 Multi-GPU training via `torchrun` (DDP)
-- 📊 Evaluation on source / target with mAP, confusion matrix, Grad-CAM, t-SNE
+## Installation
 
-## 🛠️ Setup
+Python 3.10, PyTorch built against the local CUDA driver, numpy below 2.
 
 ```bash
 conda create -n railight python=3.10 -y
 conda activate railight
-
-pip install torch torchvision          # match your CUDA driver
-pip install -r requirements.txt        # keep numpy<2
+pip install torch torchvision
+pip install -r requirements.txt
 ```
 
-Convert YOLO-format data to the list format:
+Data, outputs, logs and checkpoints live outside the repository. Set them in a `.env` file placed in this folder or in the parent workspace folder, see `.env.example`.
+
+```dotenv
+STORAGE_ROOT=/absolute/path/to/storage
+RAILIGHT_STORAGE=${STORAGE_ROOT}/outputs/railight
+RAILIGHT_DATA=${STORAGE_ROOT}/data
+WANDB_API_KEY=
+```
+
+## Dataset Preparation
+
+Start from a YOLO format dataset with one folder per domain and per split.
+
+```
+${RAILIGHT_DATA}/data_exp2/railight/8/
+├── source/
+│   ├── train/{images,labels}/
+│   ├── val/{images,labels}/
+│   └── test/{images,labels}/
+└── target/
+    ├── train/{images,labels}/
+    ├── val/{images,labels}/
+    └── test/{images,labels}/
+```
+
+Convert both domains to the RAILIGHT list format, one line per image holding pixel boxes `x y w h cls`.
 
 ```bash
-python src/utils/convert_yolo_to_railight.py \
-    --source-root /path/to/source --out-dir ./dataset \
-    --out-prefix source --max-class 3
-
-python src/utils/convert_yolo_to_railight.py \
-    --source-root /path/to/target --out-dir ./dataset \
-    --out-prefix target --max-class 3
+bash scripts/convert_dataset.sh
 ```
 
-This writes `dataset/{source,target}_{train,val,test}.txt`, one line per image with pixel boxes `x y w h cls`. See `src/scripts/convert_yolo_to_railight.sh` for the flat-folder and `--class-map` options.
+This writes `${RAILIGHT_DATA}/data_exp2/railight/8/dataset/{source,target}_{train,val,test}.txt`. Edit the paths and `MAX_CLASS` at the top of the script for the 4 class setting. Night video is cut into frames with `bash scripts/cut_frames.sh`.
 
-Pretrained weights go under `save_folder`:
-- `vgg16_reducedfc.pth` — VGG backbone init
-- `decomp.pth` — frozen Retinex DecomNet
+Two pretrained files go under `${RAILIGHT_STORAGE}/weights`, `vgg16_reducedfc.pth` for the backbone and `decomp.pth` for the frozen Retinex DecomNet.
 
-## 🚀 Usage
+The 8 class label set is `fastener_1`, `critical_crack`, `fastener_2`, `sleeper_l`, `sleeper_r`, `missing_items`, `broken_sleeper`, `minor_crack`. The 4 class set keeps `broken_sleeper`, `minor_crack`, `missing_items` and `critical_crack`.
 
-Train:
+## Training
+
+Every command goes through `main.py`. Run `python main.py --help` for the full command list and `python main.py <command> --help` for the flags of one command.
+
+| Task | Command |
+|---|---|
+| RAILIGHT, single or multi GPU | `bash scripts/train.sh` |
+| Submit to Slurm | `sbatch scripts/srun.sh` |
+
+The config path and the GPU list are assigned at the top of each script, so edit the script rather than passing environment variables. `scripts/train.sh` reads `gpu_ids` from the config and launches `torchrun` with a matching `nproc_per_node`. A direct call looks like this.
 
 ```bash
-python train.py --config configs/train/railight/vgg16/exp3.da.batch8.yaml
+python main.py train \
+    --config configs/train/railight/vgg16/exp4.uda.batch8.weak_strong_augmentation.cat.cra_cdrc_bidirection_mixing.adam.v2.yaml
 ```
 
-Multi-GPU (`nproc_per_node` **must** equal the number of GPUs in `gpu_ids`):
-
-```bash
-torchrun --standalone --nproc_per_node=2 \
-    train.py --config configs/train/railight/vgg16/exp3.da.batch8.yaml
-```
-
-Shell wrappers read `gpu_ids` from the config and set `CUDA_VISIBLE_DEVICES`; `train.sh` also takes `CONFIG=...`:
-
-```bash
-CONFIG=configs/train/railight/vgg16/exp3.da.batch8.yaml bash src/scripts/train.sh
-CONFIG=configs/test/railight/vgg16/exp3.da.batch8.yaml bash src/scripts/test.sh
-```
-
-Evaluate a checkpoint:
-
-```bash
-python test.py --config configs/test/railight/vgg16/exp3.da.batch8.yaml
-```
-
-Test configs mirror the train config they evaluate: `source_test_files` / `target_test_files`
-take a list of RAILIGHT `.txt` lists (source is scored through the `night_synthesis` ISP when
-`align_source_view: dark`, target is scored as-is), and `is_run_confusion_matrix`,
-`is_run_samples_grid`, `is_run_tsne_reflectance`, `is_run_domain_gap` switch the chart groups on
-and off. `export_fp_fn_samples_path` writes every image holding a false positive (red) or a false
-negative (blue).
-
-🔑 Config keys worth knowing:
+Configs are grouped as `configs/train/<architecture>/<backbone>/<experiment>.<variant>.yaml`. The keys that decide an experiment:
 
 | Key | Meaning |
-| --- | --- |
-| `architecture` / `backbone` | `railight` or `dsfd` + backbone name |
-| `gpu_ids` | GPUs to use, e.g. `0` or `0,1` |
-| `kl_loss_weight` | strength of source↔target reflectance alignment |
-| `target_loss_weight` | unsupervised Retinex loss on night frames |
-| `is_use_supervised_target_loss` | also train on target labels (no longer pure UDA) |
-| `is_use_rc_loss` | redecomposition cohering loss on/off |
-| `focal_enabled` / `focal_class_weights` | focal loss for class imbalance |
+|---|---|
+| `architecture` and `backbone` | `railight` or `dsfd`, plus the backbone name |
+| `gpu_ids` | GPUs to use, for example `0` or `0,1` |
+| `kl_loss_weight` | strength of the source and target reflectance alignment |
+| `target_loss_weight` | unsupervised Retinex loss on the night frames |
+| `is_use_supervised_target_loss` | also train on target labels, which leaves the unsupervised setting |
+| `cat_enabled`, `cat_warmup_iters`, `cat_max_weight` | class aware teacher and the cap on its weights |
+| `pseudo_weight`, `pseudo_start_iters` | mean teacher pseudo label loss and when it starts |
+| `focal_enabled`, `focal_class_weights` | focal loss for the class imbalance |
 | `box_loss` | `smooth_l1`, `ciou` or `wiou` |
-| `val_every_epochs` / `viz_full_every_epochs` | validation / full-chart frequency |
-| `resume` | `true` resumes `last_model.pth` of the same `num_exp` |
-| `use_wandb` | log to Weights & Biases |
+| `val_every_epochs` | validation frequency, which also sets the early stop clock |
+| `best_metric` | checkpoint selection metric, `target_map` uses target validation labels |
 
-`RAILIGHT_PROFILE=0` turns off per-stage timing.
+Outputs land under the storage root, never in the repository.
 
-📦 Outputs:
-- `<save_folder>/<arch>/<backbone>/<num_exp>/best_model.pth`, `last_model.pth`
-- `<charts_dir>/<mode>/<arch>/<backbone>/<num_exp>/` — `losses.png`, `confusion_matrix_*.png`, `samples_day.png`, `samples_real_night.png`, `cat_aug_*.png`
-- `<records_dir>/` — per-epoch train / val JSONL, `<num_exp>_test.csv` per evaluation
-- `metrics.json` (test) — `combined` / `source` / `target` sections (accuracy, P/R/F1, mAP,
-  mAP@50:95 with the per-IoU sweep, TP/FP/FN, per-class AP + best-F1 threshold, macro averages)
-  plus `setup`, `model` (parameter breakdown), `speed` and `domain_gap` (KL / CE / MMD / AUC)
+| Output | Path under `${RAILIGHT_STORAGE}` |
+|---|---|
+| Checkpoints | `weights/<arch>/<backbone>/<num_exp>/{best_model.pth,last_model.pth}` |
+| Charts | `charts/<mode>/<arch>/<backbone>/<num_exp>/` |
+| Per epoch records | `records/` |
+| Run logs | `logs/` |
 
-## 🧮 New: CAT + weak/strong augmentation
+## Evaluation / Inference
 
-Ported from CAT ([Kennerley et al., CVPR 2024](https://arxiv.org/abs/2403.19278)) to the dense-prior DSFD head:
+A test config mirrors the train config it scores. `source_test_files` and `target_test_files` take RAILIGHT list files, the source split is scored through the dark ISP when `align_source_view: dark` and the target split is scored as captured.
 
-- **ICRm**: EMA inter-class relation matrix (source/target) from positive priors — `src/losses/cat_icrm.py`
-- **CALoss**: relation-weighted classification loss in `MultiBoxLoss`, weights capped by `cat_max_weight`
-- **Weak/strong aug**: teacher labels weak target, student learns on strong target, plus a supervised strong source view — `src/utils/strong_aug.py`
-- **Viz**: `cat_aug_<class>.png` per minority class; the YAML config is uploaded to wandb as an artifact
-- **Fixes**: source loader `drop_last`, unlabelled target frames now RGB
-- Not ported yet: CRA mixup, soft labels
+| Task | Command |
+|---|---|
+| RAILIGHT evaluation | `bash scripts/test.sh` |
+| Grad-CAM pairs | `bash scripts/visualize.sh` |
 
-Ablation configs (`configs/train/railight/vgg16/`):
+Both scripts assign the config path at the top, so edit the script to point at another experiment.
 
-| Step | exp3 (labelled target) | exp4 (UDA) |
-| --- | --- | --- |
-| Baseline | `exp3.da.batch8` | `exp4.uda.batch8` |
-| + weak/strong | `exp3.da.batch8.weak_strong_augmentation` | `exp4.uda.batch8.weak_strong_augmentation` |
-| + CAT | `exp3.da.batch8.weak_strong_augmentation.cat` | `exp4.uda.batch8.weak_strong_augmentation.cat` |
-
-Submit on Slurm (from `src/scripts/`):
+Each evaluation writes `metrics.json` next to its charts. The number to read is `target.macro_map50_isolated`, the unweighted mean of the per class AP@50 on the night test split. The sibling `macro_map50` pools precision over the ground truth and is not comparable with published mAP.
 
 ```bash
-CONFIG=configs/train/railight/vgg16/<name>.yaml sbatch -J <name> srun.sh
+python main.py test \
+    --config configs/test/railight/vgg16/exp4.uda.batch8.weak_strong_augmentation.cat.cra_cdrc_bidirection_mixing.adam.v2.yaml
 ```
 
-| Key | Meaning |
-| --- | --- |
-| `cat_enabled` | ICRm + CALoss on/off |
-| `cat_warmup_iters` | CALoss starts after this many iterations |
-| `cat_max_weight` | cap on CALoss weights |
-| `pseudo_weight` / `pseudo_start_iters` | mean-teacher pseudo-label loss and its start |
-| `source_strong_weight` / `pseudo_strong_aug` | strong view for source / target |
-| `strong_aug_erase_p` | random-erasing probabilities (`[]` = off) |
+## Results
 
-## 🎯 Conclusion
+mAP@50 on the night test split, no night label used during training. Baselines are source only models scored with the same evaluator.
 
-RAILIGHT shows that a railway defect detector can be trained with day labels only and still work at night 🌙. Synthetic Dark-ISP images provide supervision under night statistics, and reflectance alignment bridges the remaining gap to real footage — no target annotations needed.
+| Setting | Night test images | Best baseline | RAILIGHT |
+|---|---|---|---|
+| 8 classes | 2193 | 58.14, YOLO26n | **74.83** |
+| 4 classes | 1776 | 32.09, YOLO26x | **41.64** |
 
-🙏 Built on DAI-Net (Du et al., CVPR 2024), DSFD, Ultralytics YOLO, and the model-adaptation regularisers of Li et al., CVPR 2020.
+The baseline numbers were measured with the shared evaluator. Neither the YOLO code nor the table generators are part of this repository.
+
+Operating point on the 8 class split, read from the confusion matrix at a fixed confidence.
+
+| Metric | RAILIGHT |
+|---|---|
+| Accuracy | 75.44 |
+| Precision | 87.57 |
+| Recall | 84.49 |
+| F1 | 86.00 |
+
+The 4 class setting is the harder one. RAILIGHT leads on mAP@50 and is second on recall, while YOLO26s leads accuracy, precision and F1. mAP integrates over every confidence level, the other four are read at one fixed threshold.
+
+## Acknowledgements / License
+
+```bibtex
+@inproceedings{du2024dainet,
+  title     = {Boosting Object Detection with Zero-Shot Day-Night Domain Adaptation},
+  author    = {Zhipeng Du and Miaojing Shi and Jiankang Deng},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2024}
+}
+
+@inproceedings{kennerley2024cat,
+  title     = {CAT: Exploiting Inter-Class Dynamics for Domain Adaptive Object Detection},
+  author    = {Mikhail Kennerley and Jian-Gang Wang and Bharadwaj Veeravalli and Robby T. Tan},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2024}
+}
+
+@inproceedings{li2019dsfd,
+  title     = {DSFD: Dual Shot Face Detector},
+  author    = {Jian Li and Yabiao Wang and Changan Wang and Ying Tai and Jianjun Qian and Jian Yang and Chengjie Wang and Jilin Li and Feiyue Huang},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2019}
+}
+
+@inproceedings{wei2018retinexnet,
+  title     = {Deep Retinex Decomposition for Low-Light Enhancement},
+  author    = {Chen Wei and Wenjing Wang and Wenhan Yang and Jiaying Liu},
+  booktitle = {British Machine Vision Conference (BMVC)},
+  year      = {2018}
+}
+
+@inproceedings{li2020modeladaptation,
+  title     = {Model Adaptation: Unsupervised Domain Adaptation without Source Data},
+  author    = {Rui Li and Qianfen Jiao and Wenming Cao and Hau-San Wong and Si Wu},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2020}
+}
+
+@inproceedings{simonyan2015vgg,
+  title     = {Very Deep Convolutional Networks for Large-Scale Image Recognition},
+  author    = {Karen Simonyan and Andrew Zisserman},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2015}
+}
+
+@misc{ultralytics,
+  title        = {Ultralytics YOLO},
+  author       = {Glenn Jocher and Jing Qiu and Ayush Chaurasia},
+  year         = {2024},
+  howpublished = {\url{https://github.com/ultralytics/ultralytics}}
+}
+```

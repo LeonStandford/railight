@@ -29,10 +29,10 @@ target_test_file:  /home/a00161/stacy.en14/data/data_exp2/railight/8/dataset/tar
 nc: 8
 names: ['fastener_1', 'critical_crack', 'fastener_2', 'sleeper_l', 'sleeper_r', 'missing_items', 'broken_sleeper', 'minor_crack']
 
-save_folder: /home/a00161/stacy.en14/models/railight/weights
-charts_dir:  /home/a00161/stacy.en14/models/railight/charts
-records_dir: /home/a00161/stacy.en14/models/railight/records
-log_dir:     /home/a00161/stacy.en14/models/railight/logs
+save_folder: /home/a00161/stacy.en14/outputs/railight/weights
+charts_dir:  /home/a00161/stacy.en14/outputs/railight/charts
+records_dir: /home/a00161/stacy.en14/outputs/railight/records
+log_dir:     /home/a00161/stacy.en14/outputs/railight/logs
 resume: false
 
 val_every_epochs: 3
@@ -59,7 +59,7 @@ is_use_rc_loss: false
 use_wandb: true
 wandb_project: da-rdd-railight
 wandb_entity: null
-wandb_dir: /home/a00161/stacy.en14/models/railight/wandb
+wandb_dir: /home/a00161/stacy.en14/outputs/railight/wandb
 
 pseudo_weight: 1.0
 pseudo_conf: 0.8
@@ -81,8 +81,10 @@ strong_aug_erase_p: [0.7, 0.5, 0.3]
 cat_viz_per_class: 6
 
 balanced_paste_enabled: true
-balanced_paste_cache: /home/a00161/stacy.en14/models/railight/.cache
+balanced_paste_cache: /home/a00161/stacy.en14/outputs/railight/.cache
 balanced_paste_target_ratio: 1.0
 balanced_paste_max_paste: 6
 balanced_paste_seed: 0
 balanced_paste_bank_capacity: 2000
+balanced_paste_max_repeat: 4.0
+balanced_paste_blend_band: 6

@@ -1600,7 +1600,7 @@ def _parse_main_args(argv: Optional[Sequence[str]] = None) -> Any:
         default="vgg16",
         type=str,
         choices=[
-            "vgg16", "vgg16_sppf", "yolo26n", "yolo26s",
+            "vgg16", "vgg16_sppf",
             "dark", "dark_sppf", "vgg", "resnet50", "resnet101", "resnet152",
         ],
         help="Backbone as written in configs/ (legacy model names still accepted).",
@@ -1639,7 +1639,7 @@ def _load_day_from_wider(max_n: int, size: int) -> List[Tuple[np.ndarray, str]]:
     from PIL import Image
 
     try:
-        from data.config import cfg as _cfg
+        from src.data.classes.config import cfg as _cfg
     except Exception as e:
         print("[main] cannot import data.config:", e)
         return []
@@ -1671,8 +1671,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = _parse_main_args(argv)
     import torch
     import torch.backends.cudnn as cudnn
-    from data.config import cfg as dcfg
-    from models.factory import build_net
+    from src.data.classes.config import cfg as dcfg
+    from src.models.factory import build_net
 
     use_cuda = torch.cuda.is_available()
     if use_cuda:

@@ -6,19 +6,22 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from utils.balanced_paste import (
+from src.utils.balanced_paste import (
     Annotation,
     BalancedPaster,
     InstanceBank,
+    PlacementPrior,
     parse_annotations,
 )
 
 __all__ = ["ensure_balanced_cache", "cache_tag"]
 
 
-def cache_tag(list_file: str, ratio: float, max_paste: int, seed: int) -> str:
+def cache_tag(
+    list_file: str, ratio: float, max_paste: int, seed: int, max_repeat: float
+) -> str:
     stem = os.path.splitext(os.path.basename(list_file))[0]
-    return f"{stem}_r{ratio:g}_m{max_paste}_s{seed}"
+    return f"{stem}_r{ratio:g}_m{max_paste}_s{seed}_k{max_repeat:g}_blend"
 
 
 def _class_counts(items: List[Annotation], num_classes: int) -> Dict[int, int]:
@@ -33,6 +36,24 @@ def _class_counts(items: List[Annotation], num_classes: int) -> Dict[int, int]:
 def _format(path: str, boxes: List[Tuple[int, int, int, int, int]]) -> str:
     flat = " ".join(f"{x} {y} {w} {h} {c}" for x, y, w, h, c in boxes)
     return f"{path} {len(boxes)} {flat}\n"
+
+
+def _build_prior(
+    items: List[Annotation], num_classes: int, verbose: bool
+) -> PlacementPrior:
+    from PIL import Image
+
+    prior = PlacementPrior(num_classes)
+    for n, item in enumerate(items):
+        if not os.path.isfile(item.path):
+            continue
+        with Image.open(item.path) as handle:
+            size = handle.size
+        for box in item.boxes:
+            prior.observe(size, box)
+        if verbose and n % 2000 == 0:
+            print(f"   [prior] {n}/{len(items)} images")
+    return prior
 
 
 def _build_bank(
@@ -60,7 +81,7 @@ def _build_bank(
         if all(len(v) >= capacity for v in bank.crops.values()):
             break
         if verbose and n % 500 == 0:
-            print(f"   [bank] {n}/{len(order)} ảnh, {bank.sizes()}")
+            print(f"   [bank] {n}/{len(order)} images, {bank.sizes()}")
     return bank
 
 
@@ -73,9 +94,11 @@ def ensure_balanced_cache(
     seed: int = 0,
     bank_capacity: int = 2000,
     max_passes: int = 12,
+    max_repeat: float = 4.0,
+    blend_band: int = 6,
     verbose: bool = True,
 ) -> str:
-    tag = cache_tag(list_file, target_ratio, max_paste, seed)
+    tag = cache_tag(list_file, target_ratio, max_paste, seed, max_repeat)
     root = os.path.join(cache_dir, "balanced", tag)
     manifest_path = os.path.join(root, "manifest.json")
     out_list = os.path.join(root, "annotations.txt")
@@ -84,8 +107,8 @@ def ensure_balanced_cache(
         if manifest.get("complete"):
             if verbose:
                 print(
-                    f"♻️ [balanced] dùng lại cache {tag} "
-                    f"({manifest['images']} ảnh, +{manifest['pasted']} instance)"
+                    f"♻️ [balanced] reusing cache {tag} "
+                    f"({manifest['images']} images, +{manifest['pasted']} instances)"
                 )
             return out_list
     from PIL import Image
@@ -94,15 +117,24 @@ def ensure_balanced_cache(
     items = parse_annotations(list_file)
     counts = _class_counts(items, num_classes)
     if verbose:
-        print(f"🧩 [balanced] dựng cache {tag} từ {len(items)} ảnh")
-        print(f"   phân bố gốc: {counts}")
+        print(f"🧩 [balanced] building cache {tag} from {len(items)} images")
+        print(f"   original distribution: {counts}")
     bank = _build_bank(items, num_classes, bank_capacity, verbose)
+    prior = _build_prior(items, num_classes, verbose)
     paster = BalancedPaster(
-        bank, counts, target_ratio=target_ratio, max_paste=max_paste, seed=seed
+        bank,
+        counts,
+        target_ratio=target_ratio,
+        max_paste=max_paste,
+        seed=seed,
+        prior=prior,
+        max_repeat=max_repeat,
+        blend_band=blend_band,
     )
     if verbose:
         print(f"   bank: {bank.sizes()}")
-        print(f"   cần thêm: {paster.remaining} (tổng {paster.outstanding()})")
+        print(f"   repeat cap {max_repeat:g} times, target {paster.goal}")
+        print(f"   still needed: {paster.remaining} (total {paster.outstanding()})")
     work: List[Tuple[str, List[Tuple[int, int, int, int, int]]]] = [
         (item.path, list(item.boxes)) for item in items
     ]
@@ -130,12 +162,12 @@ def ensure_balanced_cache(
         gained = before - paster.outstanding()
         if verbose:
             print(
-                f"   [lượt {step + 1}] budget {budget}/ảnh, thêm {gained:,}, "
-                f"còn thiếu {paster.outstanding():,}, {len(cached):,} ảnh đã ghi"
+                f"   [round {step + 1}] budget {budget} per image, added {gained:,}, "
+                f"missing {paster.outstanding():,}, {len(cached):,} images written"
             )
         if gained == 0:
             if verbose:
-                print("   dừng: không đặt thêm được vật thể nào (ảnh đã quá chật)")
+                print("   stopping: no further object fits, the images are already crowded")
             break
     lines = [_format(path, boxes) for path, boxes in work]
     written = len(cached)
@@ -149,6 +181,10 @@ def ensure_balanced_cache(
             "target_ratio": target_ratio,
             "max_paste": max_paste,
             "seed": seed,
+            "max_repeat": max_repeat,
+            "blend_band": blend_band,
+            "goal": paster.goal,
+            "bank": bank.sizes(),
             "images": len(items),
             "images_written": written,
             "pasted": pasted,
@@ -159,9 +195,12 @@ def ensure_balanced_cache(
         indent=2,
     )
     if verbose:
-        goal = max(final.values())
-        gap = {c: goal - n for c, n in final.items() if goal - n > 0}
-        print(f"✅ [balanced] xong: +{pasted:,} instance, {written:,} ảnh mới")
-        print(f"   phân bố sau: {final}")
-        print("   đã cân bằng hoàn toàn" if not gap else f"   còn lệch: {gap}")
+        gap = {
+            c: paster.goal[c] - n
+            for c, n in final.items()
+            if paster.goal.get(c, 0) - n > 0
+        }
+        print(f"✅ [balanced] done: +{pasted:,} instances, {written:,} new images")
+        print(f"   distribution after: {final}")
+        print("   target reached" if not gap else f"   remaining gap: {gap}")
     return out_list
